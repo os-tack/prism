@@ -1,0 +1,19 @@
+# Build artifacts
+/agents
+/agents.exe
+/dist/
+
+# Go test artifacts
+/coverage.out
+/coverage.html
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local agents lockfile in this repo (for dogfooding only; real projects
+# should commit their own .agents/.lock).
+/.agents/.lock
