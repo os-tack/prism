@@ -92,9 +92,9 @@ func TestParseLayered_ScopesMergeByPath(t *testing.T) {
 	project := t.TempDir()
 	global := t.TempDir()
 	writeTree(t, project, map[string]string{
-		".agents/context.md":              "P\n",
-		".agents/src/auth/context.md":     "project-auth",
-		".agents/src/shared/context.md":   "project-shared",
+		".agents/context.md":            "P\n",
+		".agents/src/auth/context.md":   "project-auth",
+		".agents/src/shared/context.md": "project-shared",
 	})
 	writeTree(t, global, map[string]string{
 		".agents/context.md":              "G\n",
@@ -126,9 +126,9 @@ func TestParseLayered_SkillsAndCommandsMergeByName(t *testing.T) {
 	project := t.TempDir()
 	global := t.TempDir()
 	writeTree(t, project, map[string]string{
-		".agents/context.md":            "P\n",
-		".agents/skills/pdf/SKILL.md":   "project-pdf",   // collision
-		".agents/commands/review.md":    "project-review",
+		".agents/context.md":          "P\n",
+		".agents/skills/pdf/SKILL.md": "project-pdf", // collision
+		".agents/commands/review.md":  "project-review",
 	})
 	writeTree(t, global, map[string]string{
 		".agents/context.md":            "G\n",
@@ -164,11 +164,11 @@ func TestParseLayered_PermissionsUnion(t *testing.T) {
 	project := t.TempDir()
 	global := t.TempDir()
 	writeTree(t, project, map[string]string{
-		".agents/context.md":      "P\n",
+		".agents/context.md":       "P\n",
 		".agents/permissions.yaml": "allow:\n  - 'Bash(go test:*)'\n  - 'Bash(go build:*)'\ndeny:\n  - 'Bash(rm -rf:*)'\n",
 	})
 	writeTree(t, global, map[string]string{
-		".agents/context.md":      "G\n",
+		".agents/context.md":       "G\n",
 		".agents/permissions.yaml": "allow:\n  - 'Bash(go build:*)'\n  - 'Bash(ls:*)'\nask:\n  - 'Bash(curl:*)'\n",
 	})
 

@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"agents.dev/agents/internal/model"
+	"agents.dev/agents/internal/registry"
 
 	"gopkg.in/yaml.v3"
 )
@@ -63,6 +64,15 @@ func parseCapabilities(agentsDir string, proj *model.Project) error {
 	}
 	proj.MCP = mcp
 
+	// Load .agents/packages.yaml bookkeeping (see internal/registry).
+	// projectRoot is the parent of agentsDir.
+	projectRoot := filepath.Dir(agentsDir)
+	packages, err := registry.Load(projectRoot)
+	if err != nil {
+		return err
+	}
+	proj.Packages = packages
+
 	return nil
 }
 
@@ -82,7 +92,7 @@ func parseSkills(skillsDir string) ([]*model.Skill, error) {
 		}
 		skillDir := filepath.Join(skillsDir, e.Name())
 		skillMD := filepath.Join(skillDir, "SKILL.md")
-		doc, err := readDocument(skillMD, skillMD)
+		doc, err := readDocumentNoExpand(skillMD, skillMD)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -174,7 +184,7 @@ func parseCommands(commandsDir string) ([]*model.Command, error) {
 			continue
 		}
 		path := filepath.Join(commandsDir, e.Name())
-		doc, err := readDocument(path, path)
+		doc, err := readDocumentNoExpand(path, path)
 		if err != nil {
 			return nil, err
 		}
@@ -209,7 +219,7 @@ func parseAgents(agentsSubdir string) ([]*model.Agent, error) {
 			continue
 		}
 		path := filepath.Join(agentsSubdir, e.Name())
-		doc, err := readDocument(path, path)
+		doc, err := readDocumentNoExpand(path, path)
 		if err != nil {
 			return nil, err
 		}

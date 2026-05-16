@@ -29,6 +29,6 @@ func newInitCmd(state *cliState) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&from, "from", "", "import from existing tool config (e.g., claude)")
+	cmd.Flags().StringVar(&from, "from", "", "import from existing tool config: claude,cursor,gemini,cline,continue,windsurf,copilot,agents-md (comma-separated for multi-source merge; \"auto\" detects all)")
 	return cmd
 }

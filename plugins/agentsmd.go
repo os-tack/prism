@@ -161,10 +161,11 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		})
 	}
 
-	// 3. Skills. Sorted by Name.
+	// 3. Skills (global only — scoped skills go under their per-scope
+	// capability section below). Sorted by Name.
 	skills := make([]*model.Skill, 0, len(proj.Skills))
 	for _, s := range proj.Skills {
-		if s == nil {
+		if s == nil || s.ScopePath != "" {
 			continue
 		}
 		skills = append(skills, s)
@@ -224,10 +225,11 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 	}
 
-	// 4. Slash commands. Sorted by Name.
+	// 4. Slash commands (global only — scoped commands go under their
+	// per-scope capability section below). Sorted by Name.
 	commands := make([]*model.Command, 0, len(proj.Commands))
 	for _, c := range proj.Commands {
-		if c == nil {
+		if c == nil || c.ScopePath != "" {
 			continue
 		}
 		commands = append(commands, c)
@@ -273,10 +275,11 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 	}
 
-	// 5. Subagents. Sorted by Name.
+	// 5. Subagents (global only — scoped agents go under their per-scope
+	// capability section below). Sorted by Name.
 	agents := make([]*model.Agent, 0, len(proj.Agents))
 	for _, a := range proj.Agents {
-		if a == nil {
+		if a == nil || a.ScopePath != "" {
 			continue
 		}
 		agents = append(agents, a)
@@ -322,11 +325,12 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 	}
 
-	// 6. Hooks. Preserve declaration order — events fire in event-order, not
-	// alphabetical, and reshuffling would mislead readers.
+	// 6. Hooks (global only — scoped hooks go under their per-scope
+	// capability section below). Preserve declaration order — events fire in
+	// event-order, not alphabetical, and reshuffling would mislead readers.
 	hooks := make([]*model.Hook, 0, len(proj.Hooks))
 	for _, h := range proj.Hooks {
-		if h == nil {
+		if h == nil || h.ScopePath != "" {
 			continue
 		}
 		hooks = append(hooks, h)
@@ -393,10 +397,11 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		})
 	}
 
-	// 8. MCP servers. Sorted by Name for stable output.
+	// 8. MCP servers (global only — scoped MCP servers go under their
+	// per-scope capability section below). Sorted by Name for stable output.
 	mcps := make([]*model.MCPServer, 0, len(proj.MCP))
 	for _, m := range proj.MCP {
-		if m == nil {
+		if m == nil || m.ScopePath != "" {
 			continue
 		}
 		mcps = append(mcps, m)
@@ -437,6 +442,16 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		sources = append(sources, "mcp.yaml")
 	}
 
+	// 9. Scoped capabilities. For each scope that has at least one scoped
+	// capability (skill / command / agent / hook / permission / MCP server),
+	// emit a "## Capabilities for scope: <path>" section after the existing
+	// capability sections. AGENTS.md has no native scope enforcement, so each
+	// scoped entry also carries an info warning so users know the capability
+	// is loaded always at the consumer side.
+	scopedSrcs, scopedWarns := renderAgentsMDScopedCapabilities(&b, proj)
+	sources = append(sources, scopedSrcs...)
+	warnings = append(warnings, scopedWarns...)
+
 	op := plugin.Operation{
 		Kind:     plugin.OpWrite,
 		Path:     "AGENTS.md",
@@ -448,6 +463,301 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	return []plugin.Operation{op}, nil
+}
+
+// scopedCapsBundle groups every scoped capability that targets the same
+// ScopePath. Used internally by renderAgentsMDScopedCapabilities.
+type scopedCapsBundle struct {
+	Skills   []*model.Skill
+	Commands []*model.Command
+	Agents   []*model.Agent
+	Hooks    []*model.Hook
+	Perms    *model.Permissions
+	MCP      []*model.MCPServer
+}
+
+// renderAgentsMDScopedCapabilities groups every scoped capability by ScopePath
+// and emits a `## Capabilities for scope: <path>` section per non-empty
+// bundle. The section header is followed by a `> Triggers: <globs>` line when
+// the project has a *Scope with matching Path (so users can see the glob
+// definition without leaving AGENTS.md), then subsection headers (### Skills,
+// ### Commands, ### Subagents, ### Hooks, ### Permissions, ### MCP servers)
+// for the categories that actually have entries.
+//
+// Returns the .agents/-relative source paths and per-entry info warnings to
+// merge into the parent op.
+func renderAgentsMDScopedCapabilities(b *strings.Builder, proj *model.Project) ([]string, []plugin.Warning) {
+	bundles := map[string]*scopedCapsBundle{}
+	get := func(scopePath string) *scopedCapsBundle {
+		bn, ok := bundles[scopePath]
+		if !ok {
+			bn = &scopedCapsBundle{}
+			bundles[scopePath] = bn
+		}
+		return bn
+	}
+
+	for _, s := range proj.Skills {
+		if s == nil || s.ScopePath == "" {
+			continue
+		}
+		get(s.ScopePath).Skills = append(get(s.ScopePath).Skills, s)
+	}
+	for _, c := range proj.Commands {
+		if c == nil || c.ScopePath == "" {
+			continue
+		}
+		get(c.ScopePath).Commands = append(get(c.ScopePath).Commands, c)
+	}
+	for _, a := range proj.Agents {
+		if a == nil || a.ScopePath == "" {
+			continue
+		}
+		get(a.ScopePath).Agents = append(get(a.ScopePath).Agents, a)
+	}
+	for _, h := range proj.Hooks {
+		if h == nil || h.ScopePath == "" {
+			continue
+		}
+		get(h.ScopePath).Hooks = append(get(h.ScopePath).Hooks, h)
+	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil || sp.ScopePath == "" {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		// At most one per scope; later entries (if any) overwrite. Parser is
+		// expected to produce one block per scope path.
+		get(sp.ScopePath).Perms = sp
+	}
+	for _, m := range proj.MCP {
+		if m == nil || m.ScopePath == "" {
+			continue
+		}
+		get(m.ScopePath).MCP = append(get(m.ScopePath).MCP, m)
+	}
+
+	if len(bundles) == 0 {
+		return nil, nil
+	}
+
+	// Build a map from scope path → *Scope so we can read globs for the
+	// "> Triggers:" line. Missing entries are fine; we just omit the line.
+	scopeIdx := map[string]*model.Scope{}
+	for _, sc := range proj.Scopes {
+		if sc == nil {
+			continue
+		}
+		scopeIdx[sc.Path] = sc
+	}
+
+	paths := make([]string, 0, len(bundles))
+	for p := range bundles {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var sources []string
+	var warnings []plugin.Warning
+
+	for _, scopePath := range paths {
+		bn := bundles[scopePath]
+		b.WriteString("\n---\n\n")
+		b.WriteString("## Capabilities for scope: ")
+		b.WriteString(scopePath)
+		b.WriteString("\n\n")
+
+		if sc, ok := scopeIdx[scopePath]; ok && len(sc.Globs) > 0 {
+			b.WriteString("> Triggers: ")
+			b.WriteString(strings.Join(sc.Globs, ", "))
+			b.WriteString("\n\n")
+		}
+
+		// ### Skills
+		if len(bn.Skills) > 0 {
+			sks := append([]*model.Skill(nil), bn.Skills...)
+			sort.SliceStable(sks, func(i, j int) bool { return sks[i].Name < sks[j].Name })
+			b.WriteString("### Skills\n\n")
+			for _, s := range sks {
+				b.WriteString("- ")
+				b.WriteString(s.Name)
+				if desc := strings.TrimSpace(s.Description); desc != "" {
+					b.WriteString(": ")
+					b.WriteString(desc)
+				}
+				b.WriteString("\n")
+
+				src := ""
+				if s.Document != nil {
+					src = relAgentsMDSource(proj, s.Document.SourcePath)
+					if src != "" {
+						sources = append(sources, src)
+					}
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   src,
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped skill %q (scope: %s) listed as documentation only.", s.Name, scopePath),
+					Severity: "info",
+				})
+			}
+			b.WriteString("\n")
+		}
+
+		// ### Commands
+		if len(bn.Commands) > 0 {
+			cmds := append([]*model.Command(nil), bn.Commands...)
+			sort.SliceStable(cmds, func(i, j int) bool { return cmds[i].Name < cmds[j].Name })
+			b.WriteString("### Commands\n\n")
+			for _, c := range cmds {
+				b.WriteString("- /")
+				b.WriteString(c.Name)
+				if desc := strings.TrimSpace(c.Description); desc != "" {
+					b.WriteString(": ")
+					b.WriteString(desc)
+				}
+				b.WriteString("\n")
+
+				src := ""
+				if c.Document != nil {
+					src = relAgentsMDSource(proj, c.Document.SourcePath)
+					if src != "" {
+						sources = append(sources, src)
+					}
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   src,
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped command /%s (scope: %s) listed as documentation only.", c.Name, scopePath),
+					Severity: "info",
+				})
+			}
+			b.WriteString("\n")
+		}
+
+		// ### Subagents
+		if len(bn.Agents) > 0 {
+			ags := append([]*model.Agent(nil), bn.Agents...)
+			sort.SliceStable(ags, func(i, j int) bool { return ags[i].Name < ags[j].Name })
+			b.WriteString("### Subagents\n\n")
+			for _, a := range ags {
+				b.WriteString("- @")
+				b.WriteString(a.Name)
+				if desc := strings.TrimSpace(a.Description); desc != "" {
+					b.WriteString(": ")
+					b.WriteString(desc)
+				}
+				b.WriteString("\n")
+
+				src := ""
+				if a.Document != nil {
+					src = relAgentsMDSource(proj, a.Document.SourcePath)
+					if src != "" {
+						sources = append(sources, src)
+					}
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   src,
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped agent @%s (scope: %s) listed as documentation only.", a.Name, scopePath),
+					Severity: "info",
+				})
+			}
+			b.WriteString("\n")
+		}
+
+		// ### Hooks (preserve declaration order, same rationale as global section)
+		if len(bn.Hooks) > 0 {
+			b.WriteString("### Hooks\n\n")
+			for _, h := range bn.Hooks {
+				b.WriteString("- **")
+				b.WriteString(h.Event)
+				b.WriteString("**")
+				if m := strings.TrimSpace(h.Matcher); m != "" {
+					b.WriteString(" matcher `")
+					b.WriteString(m)
+					b.WriteString("`")
+				}
+				b.WriteString(": ")
+				b.WriteString(h.ScriptPath)
+				b.WriteString("\n")
+
+				if src := relAgentsMDSource(proj, h.ScriptPath); src != "" {
+					sources = append(sources, src)
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   h.ScriptPath,
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md cannot execute hooks; scoped hook %s (scope: %s) listed as documentation only.", h.Event, scopePath),
+					Severity: "info",
+				})
+			}
+			b.WriteString("\n")
+		}
+
+		// ### Permissions
+		if bn.Perms != nil {
+			b.WriteString("### Permissions\n\n")
+			if len(bn.Perms.Allow) > 0 {
+				b.WriteString("- Allow: ")
+				b.WriteString(strings.Join(bn.Perms.Allow, ", "))
+				b.WriteString("\n")
+			}
+			if len(bn.Perms.Deny) > 0 {
+				b.WriteString("- Deny: ")
+				b.WriteString(strings.Join(bn.Perms.Deny, ", "))
+				b.WriteString("\n")
+			}
+			if len(bn.Perms.Ask) > 0 {
+				b.WriteString("- Ask: ")
+				b.WriteString(strings.Join(bn.Perms.Ask, ", "))
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+
+			permSrc := scopePath + "/permissions.yaml"
+			sources = append(sources, permSrc)
+			warnings = append(warnings, plugin.Warning{
+				Source:   permSrc,
+				Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md cannot enforce permissions; scoped permissions (scope: %s) listed as documentation only.", scopePath),
+				Severity: "info",
+			})
+		}
+
+		// ### MCP servers
+		if len(bn.MCP) > 0 {
+			servers := append([]*model.MCPServer(nil), bn.MCP...)
+			sort.SliceStable(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
+			b.WriteString("### MCP servers\n\n")
+			for _, m := range servers {
+				b.WriteString("- **")
+				b.WriteString(m.Name)
+				b.WriteString("**: ")
+				if u := strings.TrimSpace(m.URL); u != "" {
+					b.WriteString("`")
+					b.WriteString(u)
+					b.WriteString("`")
+				} else {
+					b.WriteString("`")
+					b.WriteString(m.Command)
+					if len(m.Args) > 0 {
+						b.WriteString(" ")
+						b.WriteString(strings.Join(m.Args, " "))
+					}
+					b.WriteString("`")
+				}
+				b.WriteString("\n")
+
+				warnings = append(warnings, plugin.Warning{
+					Source:   scopePath + "/mcp.yaml",
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md must configure MCP separately; scoped MCP server %q (scope: %s) listed as documentation only.", m.Name, scopePath),
+					Severity: "info",
+				})
+			}
+			sources = append(sources, scopePath+"/mcp.yaml")
+			b.WriteString("\n")
+		}
+	}
+
+	return sources, warnings
 }
 
 // relAgentsMDSource returns the tagged source path for abs (project: or global:),

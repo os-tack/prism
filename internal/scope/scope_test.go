@@ -61,3 +61,26 @@ func TestSlug_Idempotent(t *testing.T) {
 		}
 	}
 }
+
+func TestSafePath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"src/billing", true},
+		{"src/billing/api", true},
+		{"/abs/path", false},
+		{"../../etc", false},
+		{"src/../escape", false},
+		{"src/billing/../../etc", false},
+		{".", true},
+		{"./src/billing", true},
+		{"src/./billing", true},
+	}
+	for _, tc := range cases {
+		if got := SafePath(tc.in); got != tc.want {
+			t.Errorf("SafePath(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

@@ -264,3 +264,186 @@ func TestWindsurf_DetectMarkers(t *testing.T) {
 		t.Errorf("Detect(withFile) = false, want true")
 	}
 }
+
+// TestWindsurf_ScopedSkill verifies that a Skill with ScopePath produces a
+// scoped rule file with the scope slug as a filename prefix, trigger: glob
+// (because Skill.Globs is populated by the parser), and the source path in
+// the lockfile tag.
+func TestWindsurf_ScopedSkill(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "Audit Trail",
+				Description: "Track billing changes",
+				ScopePath:   "src/billing",
+				Globs:       []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "Body of audit trail skill.",
+				},
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".windsurf/rules/skill-src-billing-audit-trail.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if !strings.Contains(op.Content, "trigger: glob") {
+		t.Errorf("missing trigger: glob\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, `globs: ["src/billing/**"]`) {
+		t.Errorf("missing globs frontmatter\n---\n%s", op.Content)
+	}
+	if len(op.Sources) != 1 || !strings.Contains(op.Sources[0], "src/billing/skills/audit-trail/SKILL.md") {
+		t.Errorf("Sources = %v, want path containing src/billing/skills/audit-trail/SKILL.md", op.Sources)
+	}
+}
+
+// TestWindsurf_ScopedSkillCollision verifies that the same skill name in two
+// different scopes produces two distinct files, one per scope, with
+// different filename prefixes.
+func TestWindsurf_ScopedSkillCollision(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:      "Validator",
+				ScopePath: "src/billing",
+				Globs:     []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/billing/skills/validator/SKILL.md",
+					Body:       "billing validator",
+				},
+			},
+			{
+				Name:      "Validator",
+				ScopePath: "src/auth",
+				Globs:     []string{"src/auth/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/auth/skills/validator/SKILL.md",
+					Body:       "auth validator",
+				},
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 ops, got %d", len(ops))
+	}
+	paths := map[string]bool{}
+	for _, op := range ops {
+		paths[op.Path] = true
+	}
+	if !paths[".windsurf/rules/skill-src-billing-validator.md"] {
+		t.Errorf("missing billing-validator op, got paths: %v", paths)
+	}
+	if !paths[".windsurf/rules/skill-src-auth-validator.md"] {
+		t.Errorf("missing auth-validator op, got paths: %v", paths)
+	}
+}
+
+// TestWindsurf_ScopedCommand_Warning verifies that a scoped command produces
+// a rule file with scope slug prefix and an info warning naming the scope.
+func TestWindsurf_ScopedCommand_Warning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Commands: []*model.Command{
+			{
+				Name:        "deploy",
+				Description: "Deploy billing service",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/billing/commands/deploy.md",
+					Body:       "deploy steps",
+				},
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".windsurf/rules/command-src-billing-deploy.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if !strings.Contains(op.Content, "trigger: model_decision") {
+		t.Errorf("missing trigger: model_decision\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "src/billing") {
+		t.Errorf("description should mention scope path\n---\n%s", op.Content)
+	}
+	found := false
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "no slash-command mechanism") && strings.Contains(w.Message, "src/billing") {
+			found = true
+			if w.Severity != "info" {
+				t.Errorf("warning severity = %q, want info", w.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected scoped-command warning, got %#v", op.Warnings)
+	}
+}
+
+// TestWindsurf_ScopedHook_Warning verifies that a scoped hook produces no
+// file but emits an info warning naming the scope.
+func TestWindsurf_ScopedHook_Warning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/proj/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "hooks") {
+			t.Errorf("unexpected hook file: %s", op.Path)
+		}
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
+	}
+}

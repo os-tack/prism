@@ -306,3 +306,173 @@ func TestGemini_DetectMarkers(t *testing.T) {
 		t.Errorf("Detect(dir with GEMINI.md) = false, want true")
 	}
 }
+
+// TestGemini_ScopedSkill: a scoped Skill is dropped (no file produced) and
+// a per-skill info warning is emitted naming the skill and scope path.
+func TestGemini_ScopedSkill(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Skills: []*model.Skill{
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "audit",
+				},
+			},
+		},
+	}
+
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "audit-trail") || strings.Contains(op.Path, "SKILL") {
+			t.Errorf("unexpected skill file projected: %s", op.Path)
+		}
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "Gemini has no skills primitive") &&
+				strings.Contains(w.Message, `"audit-trail"`) &&
+				strings.Contains(w.Message, "src/billing") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected scoped-skill drop warning naming skill and scope, got ops: %+v", ops)
+	}
+}
+
+// TestGemini_ScopedSkillCollision: two scoped skills sharing a Name but at
+// different ScopePaths each emit their own info warning and neither
+// projects a file.
+func TestGemini_ScopedSkillCollision(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Skills: []*model.Skill{
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+				},
+			},
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/payments",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/payments/skills/audit-trail/SKILL.md",
+				},
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	for _, op := range ops {
+		if strings.Contains(op.Path, "audit-trail") {
+			t.Errorf("unexpected skill file projected: %s", op.Path)
+		}
+	}
+
+	wantScopes := map[string]bool{"src/billing": false, "src/payments": false}
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if !strings.Contains(w.Message, "Gemini has no skills primitive") {
+				continue
+			}
+			for sp := range wantScopes {
+				if strings.Contains(w.Message, sp) {
+					wantScopes[sp] = true
+				}
+			}
+		}
+	}
+	for sp, seen := range wantScopes {
+		if !seen {
+			t.Errorf("missing warning for scope %q", sp)
+		}
+	}
+}
+
+// TestGemini_ScopedCommandAgentHookMCP: verifies scoped command, agent,
+// hook, scoped-permission, and scoped MCP each emit their own per-item
+// info warning that mentions the scope path.
+func TestGemini_ScopedCommandAgentHookMCP(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Commands: []*model.Command{
+			{Name: "deploy", ScopePath: "src/billing"},
+		},
+		Agents: []*model.Agent{
+			{Name: "reviewer", ScopePath: "src/billing"},
+		},
+		Hooks: []*model.Hook{
+			{Event: "PostToolUse", Matcher: "Edit", ScopePath: "src/billing", ScriptPath: "/tmp/.agents/src/billing/hooks/verify.sh"},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{ScopePath: "src/billing", Allow: []string{"Read(*)"}},
+		},
+		MCP: []*model.MCPServer{
+			{Name: "linear", Command: "npx", ScopePath: "src/billing"},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	matchers := []struct {
+		needle string
+		kind   string
+	}{
+		{`scoped command "deploy"`, "command"},
+		{`scoped agent "reviewer"`, "agent"},
+		{`scoped hook PostToolUse:Edit`, "hook"},
+		{"scoped permissions", "perm"},
+		{`scoped MCP server "linear"`, "mcp"},
+	}
+	found := map[string]bool{}
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if !strings.Contains(w.Message, "src/billing") {
+				continue
+			}
+			for _, m := range matchers {
+				if strings.Contains(w.Message, m.needle) {
+					found[m.kind] = true
+				}
+			}
+		}
+	}
+	for _, m := range matchers {
+		if !found[m.kind] {
+			t.Errorf("missing %s scoped warning containing %q", m.kind, m.needle)
+		}
+	}
+}

@@ -13,6 +13,15 @@ package plugins
 // Skill has multiple globs we use the first and emit a degradation warning
 // naming the dropped patterns. Copilot has no subagent, hook, permission, or
 // project-local MCP primitive — those emit warnings only and produce no files.
+//
+// Scoped skills include the scope slug as a filename prefix (skill-<scopeSlug>-<name>)
+// so same-named skills across scopes don't collide; the parser populates
+// Skill.Globs from frontmatter override or the scope's default, so the
+// applyTo value comes out correctly without extra plumbing.
+//
+// Scoped commands are projected as scoped prompt files; Copilot prompts have
+// no path scoping mechanism (no applyTo on prompts) so a warning notes the
+// degradation alongside the filename-only disambiguation.
 
 import (
 	"fmt"
@@ -101,15 +110,31 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 
 	// 1. Root context → .github/copilot-instructions.md. Plain markdown, no
 	// frontmatter required, so symlink mode is honored when possible.
+	//
+	// When the document had @include directives expanded into its body
+	// (Context.NeedsWrite() is true), symlink mode is downgraded to write
+	// mode and an info warning is attached. Included source tags are
+	// appended to op.Sources for lockfile / `agents which` traces.
 	if proj.Context != nil {
 		const path = ".github/copilot-instructions.md"
+		ctxMode := mode
+		downgraded := false
+		if proj.Context.NeedsWrite() && ctxMode == plugin.ModeSymlink {
+			ctxMode = plugin.ModeWrite
+			downgraded = true
+		}
+		srcRel := proj.SourceTag(proj.Context.SourcePath)
+		sources := []string{srcRel}
+		for _, inc := range proj.Context.Includes {
+			sources = append(sources, proj.SourceTag(inc))
+		}
 		op := plugin.Operation{
 			Path:    path,
-			Mode:    mode,
+			Mode:    ctxMode,
 			Plugin:  p.Name(),
-			Sources: []string{proj.SourceTag(proj.Context.SourcePath)},
+			Sources: sources,
 		}
-		if mode == plugin.ModeSymlink && proj.Root != "" && proj.Context.SourcePath != "" {
+		if ctxMode == plugin.ModeSymlink && proj.Root != "" && proj.Context.SourcePath != "" {
 			targetDir := filepath.Join(proj.Root, filepath.Dir(path))
 			linkTarget, err := filepath.Rel(targetDir, proj.Context.SourcePath)
 			if err != nil {
@@ -121,22 +146,32 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			op.Kind = plugin.OpWrite
 			op.Content = proj.Context.Body
 		}
+		if downgraded {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcRel,
+				Message:  "downgraded to write mode: contains @include directives",
+				Severity: "info",
+			})
+		}
 		ops = append(ops, op)
 	}
 
 	// 2. Per-scope instruction files. ALWAYS write mode (frontmatter injection).
-	for _, scope := range proj.Scopes {
-		if scope == nil {
+	for _, sc := range proj.Scopes {
+		if sc == nil {
 			continue
 		}
 		body := ""
 		var sources []string
-		if scope.Document != nil {
-			body = scope.Document.Body
-			sources = []string{proj.SourceTag(scope.Document.SourcePath)}
+		if sc.Document != nil {
+			body = sc.Document.Body
+			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
+			for _, inc := range sc.Document.Includes {
+				sources = append(sources, proj.SourceTag(inc))
+			}
 		}
-		applyTo, scopeWarn := pickApplyTo(scope.Globs, scope.Document)
-		path := filepath.ToSlash(filepath.Join(".github", "instructions", slugify(scope.Path)+".instructions.md"))
+		applyTo, scopeWarn := pickApplyTo(sc.Globs, sc.Document)
+		path := filepath.ToSlash(filepath.Join(".github", "instructions", slugify(sc.Path)+".instructions.md"))
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    path,
@@ -153,6 +188,9 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 
 	// 3. Skills → degraded scoped instruction files under .github/instructions.
 	// Filename prefix `skill-` keeps them distinguishable from canonical scopes.
+	// Scoped skills include the scope slug as part of the filename to avoid
+	// collisions; Skill.Globs is populated by the parser (frontmatter override
+	// or scope default) so applyTo lands on the right path.
 	for _, skill := range proj.Skills {
 		if skill == nil {
 			continue
@@ -164,7 +202,8 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
 		applyTo, globWarn := pickApplyTo(skill.Globs, skill.Document)
-		path := filepath.ToSlash(filepath.Join(".github", "instructions", "skill-"+skillSlug(skill.Name)+".instructions.md"))
+		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".instructions.md"
+		path := filepath.ToSlash(filepath.Join(".github", "instructions", fname))
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    path,
@@ -191,6 +230,10 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 	}
 
 	// 4. Commands → .github/prompts/<name>.prompt.md.
+	//
+	// Scoped commands get the scope slug in the prompt filename so same-named
+	// commands across scopes don't collide. Copilot prompts have no applyTo
+	// equivalent, so the scope path is purely a filename + warning concern.
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
 			continue
@@ -201,7 +244,13 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			body = cmd.Document.Body
 			sources = []string{proj.SourceTag(cmd.Document.SourcePath)}
 		}
-		path := filepath.ToSlash(filepath.Join(".github", "prompts", cmd.Name+".prompt.md"))
+		var fname string
+		if cmd.ScopePath != "" {
+			fname = scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".prompt.md"
+		} else {
+			fname = cmd.Name + ".prompt.md"
+		}
+		path := filepath.ToSlash(filepath.Join(".github", "prompts", fname))
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    path,
@@ -209,6 +258,17 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
+		}
+		if cmd.ScopePath != "" {
+			src := ""
+			if len(sources) > 0 {
+				src = sources[0]
+			}
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Copilot prompts have no path scoping; scoped command %q (scope: %s) projected without applyTo", cmd.Name, cmd.ScopePath),
+				Severity: "info",
+			})
 		}
 		ops = append(ops, op)
 	}
@@ -223,9 +283,13 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		if agent.Document != nil {
 			src = proj.SourceTag(agent.Document.SourcePath)
 		}
+		msg := fmt.Sprintf("Copilot has no subagent primitive; %s not projected.", agent.Name)
+		if agent.ScopePath != "" {
+			msg = fmt.Sprintf("Copilot has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
-			Message:  fmt.Sprintf("Copilot has no subagent primitive; %s not projected.", agent.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -233,9 +297,13 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		if hook == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Copilot has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher)
+		if hook.ScopePath != "" {
+			msg = fmt.Sprintf("Copilot has no hook primitive; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   hook.ScriptPath,
-			Message:  fmt.Sprintf("Copilot has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -248,13 +316,30 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			})
 		}
 	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "permissions.yaml",
+			Message:  fmt.Sprintf("Copilot has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
+			Severity: "info",
+		})
+	}
 	for _, srv := range proj.MCP {
 		if srv == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Copilot does not read project-local MCP config; %s not projected", srv.Name)
+		if srv.ScopePath != "" {
+			msg = fmt.Sprintf("Copilot does not read project-local MCP config; scoped server %q (scope: %s) not projected", srv.Name, srv.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   "mcp.yaml",
-			Message:  fmt.Sprintf("Copilot does not read project-local MCP config; %s not projected", srv.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}

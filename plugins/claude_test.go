@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"agents.dev/agents/internal/model"
@@ -457,5 +458,432 @@ func TestClaude_MCP(t *testing.T) {
 	remote, _ := servers["remote"].(map[string]any)
 	if got, want := remote["url"], "https://example.com/mcp"; got != want {
 		t.Errorf("remote.url = %v, want %v", got, want)
+	}
+}
+
+// --- v0.5 scoped capability tests ------------------------------------------
+
+func TestClaude_ScopedSkill(t *testing.T) {
+	root := "/tmp/fake"
+	agentsDir := "/tmp/fake/.agents"
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Skills: []*model.Skill{
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/billing",
+				Globs:     []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "audit trail body",
+				},
+				Scripts: []string{
+					"/tmp/fake/.agents/src/billing/skills/audit-trail/scripts/run.sh",
+				},
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	wantSkillPath := filepath.Join(".claude", "skills", "src-billing-audit-trail", "SKILL.md")
+	wantScriptPath := filepath.Join(".claude", "skills", "src-billing-audit-trail", "scripts", "run.sh")
+	wantSource := "src/billing/skills/audit-trail/SKILL.md"
+
+	var skillOp *plugin.Operation
+	var scriptOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == wantSkillPath {
+			skillOp = &ops[i]
+		}
+		if ops[i].Path == wantScriptPath {
+			scriptOp = &ops[i]
+		}
+	}
+	if skillOp == nil {
+		t.Fatalf("missing scoped skill op at %q; got: %+v", wantSkillPath, ops)
+	}
+	if scriptOp == nil {
+		t.Fatalf("missing scoped skill script op at %q; got: %+v", wantScriptPath, ops)
+	}
+	if skillOp.Kind != plugin.OpSymlink {
+		t.Errorf("scoped skill Kind = %q, want %q", skillOp.Kind, plugin.OpSymlink)
+	}
+	if len(skillOp.Sources) == 0 || skillOp.Sources[0] != wantSource {
+		t.Errorf("scoped skill Sources = %v, want first entry = %q", skillOp.Sources, wantSource)
+	}
+	// LinkTarget should resolve to the scoped source under .agents/.
+	wantLink, _ := filepath.Rel(filepath.Join(root, filepath.Dir(wantSkillPath)), proj.Skills[0].Document.SourcePath)
+	if skillOp.LinkTarget != wantLink {
+		t.Errorf("scoped skill LinkTarget = %q, want %q", skillOp.LinkTarget, wantLink)
+	}
+}
+
+func TestClaude_ScopedCommand_Degrade(t *testing.T) {
+	root := "/tmp/fake"
+	agentsDir := "/tmp/fake/.agents"
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Commands: []*model.Command{
+			{
+				Name:      "build",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/commands/build.md",
+					Body:       "scoped build body",
+				},
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	wantPath := filepath.Join(".claude", "commands", "src-billing-build.md")
+
+	var cmdOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == wantPath {
+			cmdOp = &ops[i]
+		}
+	}
+	if cmdOp == nil {
+		t.Fatalf("missing scoped command op at %q; got: %+v", wantPath, ops)
+	}
+	if len(cmdOp.Warnings) == 0 {
+		t.Fatalf("scoped command op missing degrade warning; got: %+v", cmdOp.Warnings)
+	}
+	foundDegrade := false
+	for _, w := range cmdOp.Warnings {
+		if w.Severity == "info" && strings.Contains(w.Message, "Claude commands are global") {
+			foundDegrade = true
+		}
+	}
+	if !foundDegrade {
+		t.Errorf("scoped command op warnings missing degrade message; got: %+v", cmdOp.Warnings)
+	}
+}
+
+func TestClaude_ScopedAgent_Degrade(t *testing.T) {
+	root := "/tmp/fake"
+	agentsDir := "/tmp/fake/.agents"
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Agents: []*model.Agent{
+			{
+				Name:      "reviewer",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/agents/reviewer.md",
+					Body:       "scoped reviewer body",
+				},
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	wantPath := filepath.Join(".claude", "agents", "src-billing-reviewer.md")
+
+	var agOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == wantPath {
+			agOp = &ops[i]
+		}
+	}
+	if agOp == nil {
+		t.Fatalf("missing scoped agent op at %q; got: %+v", wantPath, ops)
+	}
+	foundDegrade := false
+	for _, w := range agOp.Warnings {
+		if w.Severity == "info" && strings.Contains(w.Message, "Claude agents are global") {
+			foundDegrade = true
+		}
+	}
+	if !foundDegrade {
+		t.Errorf("scoped agent op missing degrade warning; got: %+v", agOp.Warnings)
+	}
+}
+
+func TestClaude_ScopedHook_Wrapper(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+
+	sourceScript := filepath.Join(agentsDir, "src", "billing", "hooks", "guard.sh")
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Edit",
+				ScriptPath: sourceScript,
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	wantWrapperRel := filepath.Join(".claude", "hooks", "__scope-guard__", "src-billing-guard.sh")
+	wantWrapperAbs := filepath.Join(root, wantWrapperRel)
+
+	var wrapperOp *plugin.Operation
+	var settingsOp *plugin.Operation
+	for i := range ops {
+		switch ops[i].Path {
+		case wantWrapperRel:
+			wrapperOp = &ops[i]
+		case filepath.Join(".claude", "settings.json"):
+			settingsOp = &ops[i]
+		}
+	}
+	if wrapperOp == nil {
+		t.Fatalf("missing wrapper script op at %q; got paths:\n%s", wantWrapperRel, opsPaths(ops))
+	}
+	if wrapperOp.Kind != plugin.OpWrite {
+		t.Errorf("wrapper op Kind = %q, want %q", wrapperOp.Kind, plugin.OpWrite)
+	}
+	if wrapperOp.FileMode != 0o755 {
+		t.Errorf("wrapper FileMode = %o, want 0755", wrapperOp.FileMode)
+	}
+	// Wrapper body must reference the scope path in the case statement.
+	// Wrapper invokes `prism scope-guard` with the scope and source script.
+	if !strings.Contains(wrapperOp.Content, "prism scope-guard") {
+		t.Errorf("wrapper body missing scope-guard invocation; got:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "--scope 'src/billing'") {
+		t.Errorf("wrapper body missing --scope flag; got:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "--script '"+sourceScript+"'") {
+		t.Errorf("wrapper body missing --script for source; got:\n%s", wrapperOp.Content)
+	}
+
+	// Settings hook command should point at the wrapper's absolute path,
+	// not the raw source script.
+	if settingsOp == nil {
+		t.Fatalf("missing settings.json op")
+	}
+	var merged map[string]any
+	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
+		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, settingsOp.Content)
+	}
+	hooks, _ := merged["hooks"].(map[string]any)
+	pre, _ := hooks["PreToolUse"].([]any)
+	if len(pre) != 1 {
+		t.Fatalf("PreToolUse groups = %d, want 1; merged: %+v", len(pre), merged)
+	}
+	group, _ := pre[0].(map[string]any)
+	inner, _ := group["hooks"].([]any)
+	if len(inner) != 1 {
+		t.Fatalf("inner hooks = %d, want 1", len(inner))
+	}
+	entry, _ := inner[0].(map[string]any)
+	if got, want := entry["command"], wantWrapperAbs; got != want {
+		t.Errorf("hook command = %v, want wrapper absolute path %v", got, want)
+	}
+}
+
+func TestClaude_ScopedPermissions_Merge(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Permissions: &model.Permissions{
+			Allow: []string{"Read"},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{
+				ScopePath: "src/billing",
+				Allow:     []string{"Bash(go test ./billing/...)"},
+				Deny:      []string{"Bash(rm -rf /)"},
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	var settingsOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == filepath.Join(".claude", "settings.json") {
+			settingsOp = &ops[i]
+		}
+	}
+	if settingsOp == nil {
+		t.Fatalf("missing settings.json op; got: %+v", ops)
+	}
+
+	var merged map[string]any
+	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	perms, _ := merged["permissions"].(map[string]any)
+	if perms == nil {
+		t.Fatalf("permissions missing: %v", merged)
+	}
+	allow, _ := perms["allow"].([]any)
+	if len(allow) != 2 {
+		t.Errorf("allow = %v, want union of global + scoped (2 entries)", allow)
+	}
+	deny, _ := perms["deny"].([]any)
+	if len(deny) != 1 {
+		t.Errorf("deny = %v, want 1 (from scoped)", deny)
+	}
+
+	// Verify the degrade warning was emitted on the settings op.
+	foundDegrade := false
+	for _, w := range settingsOp.Warnings {
+		if w.Severity == "info" && strings.Contains(w.Message, "src/billing/permissions.yaml") && strings.Contains(w.Message, "Claude Code has no per-scope permissions") {
+			foundDegrade = true
+		}
+	}
+	if !foundDegrade {
+		t.Errorf("missing scoped-permissions degrade warning; got: %+v", settingsOp.Warnings)
+	}
+}
+
+func TestClaude_ScopedMCP_Merge(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		MCP: []*model.MCPServer{
+			{
+				Name:      "billing-db",
+				Command:   "uvx",
+				Args:      []string{"billing-mcp"},
+				ScopePath: "src/billing",
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	var mcpOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".mcp.json" {
+			mcpOp = &ops[i]
+		}
+	}
+	if mcpOp == nil {
+		t.Fatalf("missing .mcp.json op; got: %+v", ops)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(mcpOp.Content), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	servers, _ := doc["mcpServers"].(map[string]any)
+	if _, ok := servers["billing-db"]; !ok {
+		t.Errorf("scoped MCP server missing under mcpServers; got: %v", servers)
+	}
+
+	foundDegrade := false
+	for _, w := range mcpOp.Warnings {
+		if w.Severity == "info" && strings.Contains(w.Message, "billing-db") && strings.Contains(w.Message, "src/billing") {
+			foundDegrade = true
+		}
+	}
+	if !foundDegrade {
+		t.Errorf("missing scoped-MCP degrade warning; got: %+v", mcpOp.Warnings)
+	}
+}
+
+func TestClaude_NoCollision(t *testing.T) {
+	root := "/tmp/fake"
+	agentsDir := "/tmp/fake/.agents"
+
+	// Same skill name "audit-trail" under two different scope paths must
+	// not collide on disk; the scope-slug prefix differentiates them.
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Skills: []*model.Skill{
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "billing audit",
+				},
+			},
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/orders",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/orders/skills/audit-trail/SKILL.md",
+					Body:       "orders audit",
+				},
+			},
+		},
+	}
+
+	p := NewClaude()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	wantBilling := filepath.Join(".claude", "skills", "src-billing-audit-trail", "SKILL.md")
+	wantOrders := filepath.Join(".claude", "skills", "src-orders-audit-trail", "SKILL.md")
+
+	var billingOp, ordersOp *plugin.Operation
+	for i := range ops {
+		switch ops[i].Path {
+		case wantBilling:
+			billingOp = &ops[i]
+		case wantOrders:
+			ordersOp = &ops[i]
+		}
+	}
+	if billingOp == nil {
+		t.Fatalf("missing billing-scoped skill at %q; ops:\n%s", wantBilling, opsPaths(ops))
+	}
+	if ordersOp == nil {
+		t.Fatalf("missing orders-scoped skill at %q; ops:\n%s", wantOrders, opsPaths(ops))
+	}
+	if billingOp.Path == ordersOp.Path {
+		t.Fatalf("collision: both skills landed at %q", billingOp.Path)
+	}
+
+	// Lockfile sources should reflect each scope's real source path.
+	wantBillingSrc := "src/billing/skills/audit-trail/SKILL.md"
+	wantOrdersSrc := "src/orders/skills/audit-trail/SKILL.md"
+	if len(billingOp.Sources) == 0 || billingOp.Sources[0] != wantBillingSrc {
+		t.Errorf("billing skill Sources = %v, want first entry %q", billingOp.Sources, wantBillingSrc)
+	}
+	if len(ordersOp.Sources) == 0 || ordersOp.Sources[0] != wantOrdersSrc {
+		t.Errorf("orders skill Sources = %v, want first entry %q", ordersOp.Sources, wantOrdersSrc)
 	}
 }

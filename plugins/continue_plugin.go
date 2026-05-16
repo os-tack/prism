@@ -12,7 +12,11 @@
 //
 // Continue has no native primitive for slash-commands, sub-agents, hooks, or
 // permissions, so those degrade to warnings. Skills are projected as scoped
-// rule files (no script execution).
+// rule files (no script execution). Scoped skills include their scope slug as
+// a filename prefix to avoid collisions when same-named skills live in two
+// scopes; their globs come from the parser (frontmatter override or the
+// scope's default). Scoped commands degrade to scoped rule files with the
+// scope's default globs plus an info warning.
 package plugins
 
 import (
@@ -26,6 +30,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/scope"
 )
 
 // ContinuePlugin projects Project state into `.continue/rules/*.md` and
@@ -105,24 +110,24 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	// Per-scope rule files.
-	for _, scope := range proj.Scopes {
-		if scope == nil {
+	for _, sc := range proj.Scopes {
+		if sc == nil {
 			continue
 		}
-		desc := scope.Description
+		desc := sc.Description
 		if desc == "" {
-			desc = fmt.Sprintf("Context for %s", scope.Path)
+			desc = fmt.Sprintf("Context for %s", sc.Path)
 		}
 		body := ""
 		var sources []string
-		if scope.Document != nil {
-			body = scope.Document.Body
-			sources = []string{proj.SourceTag(scope.Document.SourcePath)}
+		if sc.Document != nil {
+			body = sc.Document.Body
+			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
-		content := renderContinueRule(desc, scope.Globs, false, body)
+		content := renderContinueRule(desc, sc.Globs, false, body)
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", slugify(scope.Path)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", slugify(sc.Path)+".md")),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -131,6 +136,10 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	// Skills → degraded scoped rule files at .continue/rules/skill-<slug>.md.
+	// Scoped skills include the scope slug as a filename prefix so same-named
+	// skills across scopes do not collide. Skill.Globs is already populated by
+	// the parser (frontmatter override or scope default) so we just pass it
+	// through.
 	for _, skill := range proj.Skills {
 		if skill == nil {
 			continue
@@ -146,9 +155,10 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
 		content := renderContinueRule(desc, skill.Globs, false, body)
+		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".md"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", "skill-"+skillSlug(skill.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", fname)),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -171,6 +181,10 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	// Commands → degraded rule files at .continue/rules/command-<slug>.md.
 	// The body documents the command; Continue has no slash-command mechanism
 	// so each command also gets an info warning attached to its own op.
+	//
+	// Scoped commands (ScopePath != "") get the scope slug prefixed and use
+	// the scope's default globs in the rule frontmatter; the warning notes
+	// the scope and explains the degradation.
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
 			continue
@@ -181,11 +195,19 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = cmd.Document.Body
 			sources = []string{proj.SourceTag(cmd.Document.SourcePath)}
 		}
+		var globs []string
 		desc := fmt.Sprintf("Command /%s: %s", cmd.Name, cmd.Description)
-		content := renderContinueRule(desc, nil, false, body)
+		warningMsg := "Continue has no slash-command mechanism; documented as a rule"
+		if cmd.ScopePath != "" {
+			globs = scope.DefaultGlobs(cmd.ScopePath)
+			desc = fmt.Sprintf("Command /%s (scoped to %s): %s", cmd.Name, cmd.ScopePath, cmd.Description)
+			warningMsg = fmt.Sprintf("Continue has no slash-command mechanism; scoped command %q projected as a rule (scope: %s)", cmd.Name, cmd.ScopePath)
+		}
+		content := renderContinueRule(desc, globs, false, body)
+		fname := "command-" + scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".md"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", "command-"+skillSlug(cmd.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", fname)),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -193,7 +215,7 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 		op.Warnings = append(op.Warnings, plugin.Warning{
 			Source:   "",
-			Message:  "Continue has no slash-command mechanism; documented as a rule",
+			Message:  warningMsg,
 			Severity: "info",
 		})
 		// Attach the source path to the warning if available.
@@ -214,9 +236,13 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if ag.Document != nil {
 			src = proj.SourceTag(ag.Document.SourcePath)
 		}
+		msg := fmt.Sprintf("Continue has no subagent primitive; %s not projected", ag.Name)
+		if ag.ScopePath != "" {
+			msg = fmt.Sprintf("Continue has no subagent primitive; scoped agent %s (scope: %s) not projected", ag.Name, ag.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
-			Message:  fmt.Sprintf("Continue has no subagent primitive; %s not projected", ag.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -224,9 +250,13 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if h == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Continue has no hook primitive; %s:%s not projected", h.Event, h.Matcher)
+		if h.ScopePath != "" {
+			msg = fmt.Sprintf("Continue has no hook primitive; scoped hook %s:%s (scope: %s) not projected", h.Event, h.Matcher, h.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   h.ScriptPath,
-			Message:  fmt.Sprintf("Continue has no hook primitive; %s:%s not projected", h.Event, h.Matcher),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -239,8 +269,23 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			})
 		}
 	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  fmt.Sprintf("Continue has no permissions primitive; scoped permissions (scope: %s) not projected", sp.ScopePath),
+			Severity: "info",
+		})
+	}
 
 	// MCP servers → one .continue/mcpServers/<slug>.yaml per server.
+	// Scoped MCP servers project to the same global file set with an info
+	// warning per server (Continue has no per-scope MCP).
 	for _, srv := range proj.MCP {
 		if srv == nil || srv.Name == "" {
 			continue
@@ -250,6 +295,16 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			return nil, err
 		}
 		ops = append(ops, op)
+	}
+	for _, srv := range proj.MCP {
+		if srv == nil || srv.ScopePath == "" {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  fmt.Sprintf("Continue has no per-scope MCP; scoped server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
+			Severity: "info",
+		})
 	}
 
 	// Attach orphan warnings to the first available op.

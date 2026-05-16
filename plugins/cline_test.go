@@ -413,3 +413,221 @@ func TestCline_MCPWarning(t *testing.T) {
 		t.Errorf("expected mcp warning, got %#v", ops[0].Warnings)
 	}
 }
+
+// TestCline_ScopedSkill: a Skill with a non-empty ScopePath projects to
+// .clinerules/20-skill-<scopeSlug>-<name>.md with a "When working in
+// <scopePath>" preamble before the Skill header, and emits the
+// "no scope enforcement" info warning naming the scope.
+func TestCline_ScopedSkill(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "audit-trail",
+				Description: "Tamper-evident audit log",
+				ScopePath:   "src/billing",
+				Globs:       []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "Append hash-chain entries to ledger.",
+				},
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".clinerules/20-skill-src-billing-audit-trail.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if !strings.Contains(op.Content, "## When working in src/billing") {
+		t.Errorf("content missing scope preamble\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "## Skill: audit-trail") {
+		t.Errorf("content missing skill header\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "Append hash-chain entries to ledger.") {
+		t.Errorf("content missing body\n---\n%s", op.Content)
+	}
+	// Scope must appear before the Skill header.
+	idxScope := strings.Index(op.Content, "## When working in src/billing")
+	idxSkill := strings.Index(op.Content, "## Skill: audit-trail")
+	if idxScope < 0 || idxSkill < 0 || idxScope >= idxSkill {
+		t.Errorf("preamble must precede skill header: scope=%d skill=%d\n%s", idxScope, idxSkill, op.Content)
+	}
+	if len(op.Sources) != 1 || op.Sources[0] != "src/billing/skills/audit-trail/SKILL.md" {
+		t.Errorf("sources = %v, want [src/billing/skills/audit-trail/SKILL.md]", op.Sources)
+	}
+	found := false
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "no scope enforcement at runtime") &&
+			strings.Contains(w.Message, "src/billing") &&
+			w.Severity == "info" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected scoped-skill warning naming scope, got %#v", op.Warnings)
+	}
+}
+
+// TestCline_ScopedSkillCollision: same Skill.Name under two different
+// scopes must produce two distinct files (different filenames) without
+// either overwriting the other, both carrying the appropriate preamble.
+func TestCline_ScopedSkillCollision(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "billing audit",
+				},
+			},
+			{
+				Name:      "audit-trail",
+				ScopePath: "src/payments",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/payments/skills/audit-trail/SKILL.md",
+					Body:       "payments audit",
+				},
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 ops (one per scope), got %d", len(ops))
+	}
+
+	seenPaths := map[string]bool{}
+	for _, op := range ops {
+		if seenPaths[op.Path] {
+			t.Errorf("duplicate filename projected: %s", op.Path)
+		}
+		seenPaths[op.Path] = true
+	}
+	want := map[string]string{
+		".clinerules/20-skill-src-billing-audit-trail.md":  "billing audit",
+		".clinerules/20-skill-src-payments-audit-trail.md": "payments audit",
+	}
+	for path, body := range want {
+		if !seenPaths[path] {
+			t.Errorf("missing expected path %q (got %v)", path, seenPaths)
+			continue
+		}
+		var op *plugin.Operation
+		for i := range ops {
+			if ops[i].Path == path {
+				op = &ops[i]
+				break
+			}
+		}
+		if op == nil {
+			continue
+		}
+		if !strings.Contains(op.Content, body) {
+			t.Errorf("op %q missing body %q", path, body)
+		}
+	}
+}
+
+// TestCline_ScopedCommand: a Command with a non-empty ScopePath projects
+// to .clinerules/30-command-<scopeSlug>-<name>.md with the scope preamble
+// and emits both the "no slash-command" and "no scope enforcement" warnings.
+func TestCline_ScopedCommand(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Commands: []*model.Command{
+			{
+				Name:        "deploy",
+				Description: "Deploy this scope",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/billing/commands/deploy.md",
+					Body:       "Run billing deploy script.",
+				},
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".clinerules/30-command-src-billing-deploy.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if !strings.Contains(op.Content, "## When working in src/billing") {
+		t.Errorf("content missing scope preamble\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "## Command /deploy") {
+		t.Errorf("content missing command header\n---\n%s", op.Content)
+	}
+	hasScopeWarn := false
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "no scope enforcement at runtime") &&
+			strings.Contains(w.Message, "src/billing") {
+			hasScopeWarn = true
+		}
+	}
+	if !hasScopeWarn {
+		t.Errorf("expected scoped-command warning, got %#v", op.Warnings)
+	}
+}
+
+// TestCline_ScopedAgentWarning: a scoped Agent emits no file and produces
+// a warning that includes the scope path.
+func TestCline_ScopedAgentWarning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/.agents/context.md",
+			Body:       "ctx",
+		},
+		Agents: []*model.Agent{
+			{
+				Name:      "billing-reviewer",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/billing/agents/billing-reviewer.md",
+				},
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	found := false
+	for _, w := range ops[0].Warnings {
+		if strings.Contains(w.Message, "scoped agent billing-reviewer") &&
+			strings.Contains(w.Message, "src/billing") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected scoped agent warning naming scope, got %#v", ops[0].Warnings)
+	}
+}

@@ -17,3 +17,12 @@
 # Local agents lockfile in this repo (for dogfooding only; real projects
 # should commit their own .agents/.lock).
 /.agents/.lock
+.ostk/
+Agentfile
+ostk.toml
+anchor.json
+registers-dump.md
+
+# Generated dev artifacts
+/dist/
+/coverage.out

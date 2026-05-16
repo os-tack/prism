@@ -11,20 +11,20 @@ import (
 
 // mockPlugin is a configurable plugin.Plugin implementation for tests.
 type mockPlugin struct {
-	name     string
-	detect   bool
-	ops      []plugin.Operation
-	caps     plugin.Capabilities
-	planErr  error
+	name    string
+	detect  bool
+	ops     []plugin.Operation
+	caps    plugin.Capabilities
+	planErr error
 	// receivedOpt captures whatever TargetOption the engine handed in.
 	mu          sync.Mutex
 	called      int
 	receivedOpt model.TargetOption
 }
 
-func (m *mockPlugin) Name() string                       { return m.name }
-func (m *mockPlugin) Detect(root string) bool            { return m.detect }
-func (m *mockPlugin) Capabilities() plugin.Capabilities  { return m.caps }
+func (m *mockPlugin) Name() string                      { return m.name }
+func (m *mockPlugin) Detect(root string) bool           { return m.detect }
+func (m *mockPlugin) Capabilities() plugin.Capabilities { return m.caps }
 func (m *mockPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plugin.Operation, error) {
 	m.mu.Lock()
 	m.called++

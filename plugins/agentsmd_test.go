@@ -568,3 +568,383 @@ func TestAgentsMD_UnknownModeErrors(t *testing.T) {
 		t.Errorf("expected error to mention 'unknown mode', got %v", err)
 	}
 }
+
+// TestAgentsMD_ScopedSkill: a single scoped skill produces a new
+// "## Capabilities for scope: <path>" section (the existing flat
+// `## Skills` section is omitted because there are no global skills),
+// and a per-entry info warning is attached.
+func TestAgentsMD_ScopedSkill(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:  "src/billing",
+				Globs: []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/context.md",
+					Body:       "billing ctx",
+				},
+			},
+		},
+		Skills: []*model.Skill{
+			{
+				Name:        "audit-trail",
+				Description: "Tamper-evident audit log",
+				ScopePath:   "src/billing",
+				Globs:       []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+					Body:       "skill body",
+				},
+			},
+		},
+	}
+
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	content := ops[0].Content
+
+	// New per-scope capability section.
+	if !strings.Contains(content, "## Capabilities for scope: src/billing") {
+		t.Errorf("missing per-scope capability header\n---\n%s", content)
+	}
+	if !strings.Contains(content, "### Skills") {
+		t.Errorf("missing ### Skills subsection\n---\n%s", content)
+	}
+	if !strings.Contains(content, "- audit-trail: Tamper-evident audit log") {
+		t.Errorf("missing skill bullet line\n---\n%s", content)
+	}
+
+	// Flat global Skills section MUST NOT appear (no global skills present).
+	// Use leading newline so we don't false-match `### Skills` inside the
+	// scoped section.
+	if strings.Contains(content, "\n## Skills\n") {
+		t.Errorf("did not expect flat ## Skills section when only scoped skills present\n---\n%s", content)
+	}
+
+	// Source path included.
+	wantSrc := "src/billing/skills/audit-trail/SKILL.md"
+	hasSrc := false
+	for _, s := range ops[0].Sources {
+		if s == wantSrc {
+			hasSrc = true
+		}
+	}
+	if !hasSrc {
+		t.Errorf("sources missing %q (got %v)", wantSrc, ops[0].Sources)
+	}
+
+	// Info warning mentioning scope.
+	found := false
+	for _, w := range ops[0].Warnings {
+		if w.Severity == "info" &&
+			strings.Contains(w.Message, "no scope enforcement") &&
+			strings.Contains(w.Message, "audit-trail") &&
+			strings.Contains(w.Message, "src/billing") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected info warning for scoped skill, got %#v", ops[0].Warnings)
+	}
+}
+
+// TestAgentsMD_ScopedSkillCollision: same skill name under two different
+// scopes produces two distinct "## Capabilities for scope: <path>" sections
+// each listing the skill, and a warning per entry.
+func TestAgentsMD_ScopedSkillCollision(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "audit-trail",
+				Description: "Billing audit",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+				},
+			},
+			{
+				Name:        "audit-trail",
+				Description: "Payments audit",
+				ScopePath:   "src/payments",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/payments/skills/audit-trail/SKILL.md",
+				},
+			},
+		},
+	}
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	content := ops[0].Content
+
+	if !strings.Contains(content, "## Capabilities for scope: src/billing") {
+		t.Errorf("missing billing section\n---\n%s", content)
+	}
+	if !strings.Contains(content, "## Capabilities for scope: src/payments") {
+		t.Errorf("missing payments section\n---\n%s", content)
+	}
+	// Both skill bullets listed under their respective sections.
+	if !strings.Contains(content, "- audit-trail: Billing audit") {
+		t.Errorf("missing billing skill bullet")
+	}
+	if !strings.Contains(content, "- audit-trail: Payments audit") {
+		t.Errorf("missing payments skill bullet")
+	}
+	// Lexicographic order: billing before payments.
+	idxBill := strings.Index(content, "## Capabilities for scope: src/billing")
+	idxPay := strings.Index(content, "## Capabilities for scope: src/payments")
+	if idxBill < 0 || idxPay < 0 || idxBill >= idxPay {
+		t.Errorf("scoped sections out of order: billing=%d payments=%d", idxBill, idxPay)
+	}
+
+	// One warning per scoped skill (= 2).
+	count := 0
+	for _, w := range ops[0].Warnings {
+		if w.Severity == "info" &&
+			strings.Contains(w.Message, "audit-trail") &&
+			strings.Contains(w.Message, "no scope enforcement") {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 scoped-skill warnings, got %d", count)
+	}
+}
+
+// TestAgentsMD_ScopedSection: a scope that has scoped skill + command +
+// agent + hook + scoped-permissions + scoped MCP renders a single
+// "## Capabilities for scope: <path>" section with each non-empty
+// subsection (### Skills, ### Commands, ### Subagents, ### Hooks,
+// ### Permissions, ### MCP servers) in that order.
+func TestAgentsMD_ScopedSection(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:  "src/billing",
+				Globs: []string{"src/billing/**", "src/billing/**/*.go"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/context.md",
+					Body:       "billing ctx",
+				},
+			},
+		},
+		Skills: []*model.Skill{
+			{
+				Name:        "audit-trail",
+				Description: "Hash-chain audit",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+				},
+			},
+		},
+		Commands: []*model.Command{
+			{
+				Name:        "ship-billing",
+				Description: "Deploy billing",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/commands/ship-billing.md",
+				},
+			},
+		},
+		Agents: []*model.Agent{
+			{
+				Name:        "pci-reviewer",
+				Description: "Reviews PCI compliance",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/agents/pci-reviewer.md",
+				},
+			},
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Edit",
+				ScriptPath: "/tmp/fake/.agents/src/billing/hooks/verify.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{
+				ScopePath: "src/billing",
+				Allow:     []string{"Read(src/billing/**)"},
+				Deny:      []string{"Bash(rm)"},
+			},
+		},
+		MCP: []*model.MCPServer{
+			{
+				Name:      "stripe",
+				Command:   "npx",
+				Args:      []string{"@stripe/mcp"},
+				ScopePath: "src/billing",
+			},
+		},
+	}
+
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	content := ops[0].Content
+
+	required := []string{
+		"## Capabilities for scope: src/billing",
+		"> Triggers: src/billing/**, src/billing/**/*.go",
+		"### Skills",
+		"- audit-trail: Hash-chain audit",
+		"### Commands",
+		"- /ship-billing: Deploy billing",
+		"### Subagents",
+		"- @pci-reviewer: Reviews PCI compliance",
+		"### Hooks",
+		"- **PreToolUse** matcher `Edit`",
+		"### Permissions",
+		"- Allow: Read(src/billing/**)",
+		"- Deny: Bash(rm)",
+		"### MCP servers",
+		"- **stripe**: `npx @stripe/mcp`",
+	}
+	for _, want := range required {
+		if !strings.Contains(content, want) {
+			t.Errorf("content missing %q\n---\n%s", want, content)
+		}
+	}
+
+	// Subsection ordering inside the scope section.
+	order := []string{
+		"## Capabilities for scope: src/billing",
+		"### Skills",
+		"### Commands",
+		"### Subagents",
+		"### Hooks",
+		"### Permissions",
+		"### MCP servers",
+	}
+	last := -1
+	for _, h := range order {
+		idx := strings.Index(content, h)
+		if idx < 0 {
+			t.Errorf("missing header %q", h)
+			continue
+		}
+		if idx < last {
+			t.Errorf("header %q out of order (at %d, prev at %d)", h, idx, last)
+		}
+		last = idx
+	}
+
+	// Global flat sections must NOT appear (no global capabilities present).
+	// Use the section's content cue (the trailing description sentence that
+	// every flat section emits) so we don't false-match the H3 forms inside
+	// the scoped section.
+	mustNot := []string{
+		"\n## Skills\n\n###", // flat ## Skills always has ### name entries
+		"\n## Slash commands\n",
+		"\n## Subagents\n",
+		"\n## Hooks\n\nDocumented",
+		"\n## MCP servers\n\nDocumented",
+	}
+	for _, h := range mustNot {
+		if strings.Contains(content, h) {
+			t.Errorf("did not expect flat %q section\n---\n%s", h, content)
+		}
+	}
+
+	// One warning per scoped capability (6 total).
+	scopedWarns := 0
+	for _, w := range ops[0].Warnings {
+		if strings.Contains(w.Message, "src/billing") &&
+			(strings.Contains(w.Message, "scoped skill") ||
+				strings.Contains(w.Message, "scoped command") ||
+				strings.Contains(w.Message, "scoped agent") ||
+				strings.Contains(w.Message, "scoped hook") ||
+				strings.Contains(w.Message, "scoped permissions") ||
+				strings.Contains(w.Message, "scoped MCP")) {
+			scopedWarns++
+		}
+	}
+	if scopedWarns != 6 {
+		t.Errorf("expected 6 per-entry scoped warnings, got %d (warnings=%+v)", scopedWarns, ops[0].Warnings)
+	}
+}
+
+// TestAgentsMD_ScopedAndGlobalMix: when a project has BOTH global and
+// scoped skills, the flat global `## Skills` section lists only the
+// global skill, and a separate "## Capabilities for scope: <path>"
+// section lists the scoped skill — neither leaks into the other.
+func TestAgentsMD_ScopedAndGlobalMix(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "format-go",
+				Description: "Run gofmt",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/skills/format-go/SKILL.md",
+					Body:       "global skill body",
+				},
+			},
+			{
+				Name:        "audit-trail",
+				Description: "Hash-chain audit",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/skills/audit-trail/SKILL.md",
+				},
+			},
+		},
+	}
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	content := ops[0].Content
+
+	// Flat ## Skills section exists with the global skill only.
+	if !strings.Contains(content, "## Skills") {
+		t.Errorf("expected flat ## Skills section for global skill")
+	}
+	if !strings.Contains(content, "### format-go") {
+		t.Errorf("expected ### format-go in flat section")
+	}
+	// audit-trail should NOT appear as a "### audit-trail" heading
+	// (that's the flat-section form); it must only appear as a bullet
+	// inside the per-scope section.
+	if strings.Contains(content, "### audit-trail") {
+		t.Errorf("scoped skill leaked into flat ### audit-trail heading\n---\n%s", content)
+	}
+	// Per-scope section exists with the scoped skill listed as bullet.
+	if !strings.Contains(content, "## Capabilities for scope: src/billing") {
+		t.Errorf("expected per-scope section for src/billing")
+	}
+	if !strings.Contains(content, "- audit-trail: Hash-chain audit") {
+		t.Errorf("expected scoped audit-trail bullet")
+	}
+	// Per-scope section should NOT list the global skill.
+	scopeHeaderIdx := strings.Index(content, "## Capabilities for scope: src/billing")
+	if scopeHeaderIdx >= 0 {
+		tail := content[scopeHeaderIdx:]
+		if strings.Contains(tail, "format-go") {
+			t.Errorf("global skill leaked into per-scope section\n---\n%s", tail)
+		}
+	}
+}

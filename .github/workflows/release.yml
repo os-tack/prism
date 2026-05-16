@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          name="prism-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${ext}"
+          go build -trimpath -ldflags "-s -w" -o "dist/${name}" ./cmd/agents
+          (cd dist && shasum -a 256 "${name}" > "${name}.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prism-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: list artifacts
+        run: ls -la dist/
+      - name: extract release notes
+        id: notes
+        run: |
+          set -e
+          notes=$(mktemp)
+          # Literal-string scan: walk CHANGELOG until we hit "## <tag>", then
+          # capture lines until the next "## " header. Escaping the tag in awk
+          # would be hazardous because the tag is interpolated into a regex
+          # context; use index() for literal compare instead.
+          if [ -f CHANGELOG.md ]; then
+            tag="${GITHUB_REF_NAME}"
+            awk -v tag="## $tag" '
+              index($0, tag) == 1 { capturing = 1; next }
+              capturing && /^## / { exit }
+              capturing { print }
+            ' CHANGELOG.md > "$notes"
+          fi
+          if [ -s "$notes" ]; then
+            echo "found=yes" >> "$GITHUB_OUTPUT"
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ "${{ steps.notes.outputs.found }}" = "yes" ]; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file "${{ steps.notes.outputs.path }}" \
+              dist/*
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              dist/*
+          fi

@@ -132,7 +132,8 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 		ops = append(ops, op)
 	}
 
-	// Skills → .clinerules/20-skill-<slug>.md.
+	// Skills → .clinerules/20-skill-<slug>.md (global) or
+	// .clinerules/20-skill-<scopeSlug>-<name>.md (scoped, degraded).
 	for _, skill := range proj.Skills {
 		if skill == nil {
 			continue
@@ -143,13 +144,24 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			body = skill.Document.Body
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
+		fileName := "20-skill-" + skillSlug(skill.Name) + ".md"
+		if skill.ScopePath != "" {
+			fileName = "20-skill-" + scopeSlug(skill.ScopePath) + "-" + skillSlug(skill.Name) + ".md"
+		}
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".clinerules", "20-skill-"+skillSlug(skill.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".clinerules", fileName)),
 			Content: renderClineSkill(skill, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
+		}
+		if skill.ScopePath != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   sourceOrEmpty(sources),
+				Message:  fmt.Sprintf("Cline has no scope enforcement at runtime; scoped skill projected as a rule loaded always (scope: %s).", skill.ScopePath),
+				Severity: "info",
+			})
 		}
 		if len(skill.Scripts) > 0 {
 			op.Warnings = append(op.Warnings, plugin.Warning{
@@ -161,7 +173,8 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 		ops = append(ops, op)
 	}
 
-	// Commands → .clinerules/30-command-<slug>.md.
+	// Commands → .clinerules/30-command-<slug>.md (global) or
+	// .clinerules/30-command-<scopeSlug>-<name>.md (scoped, degraded).
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
 			continue
@@ -172,9 +185,13 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			body = cmd.Document.Body
 			sources = []string{proj.SourceTag(cmd.Document.SourcePath)}
 		}
+		fileName := "30-command-" + skillSlug(cmd.Name) + ".md"
+		if cmd.ScopePath != "" {
+			fileName = "30-command-" + scopeSlug(cmd.ScopePath) + "-" + skillSlug(cmd.Name) + ".md"
+		}
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".clinerules", "30-command-"+skillSlug(cmd.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".clinerules", fileName)),
 			Content: renderClineCommand(cmd, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -186,6 +203,13 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 					Severity: "info",
 				},
 			},
+		}
+		if cmd.ScopePath != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   sourceOrEmpty(sources),
+				Message:  fmt.Sprintf("Cline has no scope enforcement at runtime; scoped command projected as a rule loaded always (scope: %s).", cmd.ScopePath),
+				Severity: "info",
+			})
 		}
 		ops = append(ops, op)
 	}
@@ -201,9 +225,13 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 		if agent.Document != nil {
 			src = proj.SourceTag(agent.Document.SourcePath)
 		}
+		msg := fmt.Sprintf("Cline has no subagent primitive; %s not projected.", agent.Name)
+		if agent.ScopePath != "" {
+			msg = fmt.Sprintf("Cline has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+		}
 		orphanWarnings = append(orphanWarnings, plugin.Warning{
 			Source:   src,
-			Message:  fmt.Sprintf("Cline has no subagent primitive; %s not projected.", agent.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -211,9 +239,13 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 		if hook == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Cline has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher)
+		if hook.ScopePath != "" {
+			msg = fmt.Sprintf("Cline has no hook primitive; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
+		}
 		orphanWarnings = append(orphanWarnings, plugin.Warning{
 			Source:   hook.ScriptPath,
-			Message:  fmt.Sprintf("Cline has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -265,9 +297,15 @@ func renderClineScope(scope *model.Scope, body string) string {
 	return b.String()
 }
 
-// renderClineSkill builds the markdown body for a skill rule file.
+// renderClineSkill builds the markdown body for a skill rule file. When
+// skill.ScopePath is non-empty, a `## When working in <scopePath>` preamble is
+// prepended so Cline (which has no scope enforcement) surfaces the intended
+// applicability to the model.
 func renderClineSkill(skill *model.Skill, body string) string {
 	var b strings.Builder
+	if skill.ScopePath != "" {
+		fmt.Fprintf(&b, "## When working in %s\n\n", skill.ScopePath)
+	}
 	fmt.Fprintf(&b, "## Skill: %s\n\n", skill.Name)
 	hint := skill.Description
 	if hint == "" {
@@ -286,9 +324,15 @@ func renderClineSkill(skill *model.Skill, body string) string {
 	return b.String()
 }
 
-// renderClineCommand builds the markdown body for a command rule file.
+// renderClineCommand builds the markdown body for a command rule file. When
+// cmd.ScopePath is non-empty, a `## When working in <scopePath>` preamble is
+// prepended so Cline (which has no scope enforcement) surfaces the intended
+// applicability to the model.
 func renderClineCommand(cmd *model.Command, body string) string {
 	var b strings.Builder
+	if cmd.ScopePath != "" {
+		fmt.Fprintf(&b, "## When working in %s\n\n", cmd.ScopePath)
+	}
 	fmt.Fprintf(&b, "## Command /%s\n\n", cmd.Name)
 	if cmd.Description != "" {
 		fmt.Fprintf(&b, "> %s\n", cmd.Description)

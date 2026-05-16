@@ -10,7 +10,7 @@ import (
 // ParseLayered parses a global .agents/ root (typically ~/.agents/) and a
 // project .agents/ root, then merges the two into a single Project. The
 // project's content takes precedence on collisions (by Path for Scopes; by
-// Name for Skills, Commands, Agents, MCP servers; Project.Context wins if
+// ScopePath+"/"+Name for Skills, Commands, Agents, MCP servers; Project.Context wins if
 // non-nil). Hooks are concatenated (project first). Permissions are merged
 // field-by-field as deduped unions.
 //
@@ -24,22 +24,30 @@ import (
 // of each source file, so global-source docs have paths under globalRoot
 // and project-source docs have paths under projectRoot.
 func ParseLayered(globalRoot, projectRoot string) (*model.Project, error) {
-	proj, err := Parse(projectRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	if globalRoot == "" {
-		return proj, nil
-	}
-
-	// Skip global layer silently if it has no .agents/ subdir.
-	global, err := Parse(globalRoot)
-	if err != nil {
-		if errors.Is(err, ErrNoAgentsDir) || errors.Is(err, os.ErrNotExist) {
-			return proj, nil
+	// Determine globalAgentsDir up front so the project parse knows it
+	// during include resolution. If the global layer is missing or has
+	// no .agents/, the project parse runs with no global knowledge.
+	globalAgentsDir := ""
+	var global *model.Project
+	if globalRoot != "" {
+		g, gerr := Parse(globalRoot)
+		if gerr != nil {
+			if !(errors.Is(gerr, ErrNoAgentsDir) || errors.Is(gerr, os.ErrNotExist)) {
+				return nil, gerr
+			}
+		} else {
+			global = g
+			globalAgentsDir = g.AgentsDir
 		}
+	}
+
+	proj, err := parseWithGlobal(projectRoot, globalAgentsDir)
+	if err != nil {
 		return nil, err
+	}
+
+	if global == nil {
+		return proj, nil
 	}
 
 	return mergeProjects(proj, global), nil
@@ -71,16 +79,16 @@ func mergeProjects(project, global *model.Project) *model.Project {
 
 	// Skills/Commands/Agents/MCP: merge by Name.
 	out.Skills = mergeByKey(global.Skills, project.Skills, func(s *model.Skill) string {
-		return s.Name
+		return s.ScopePath + "/" + s.Name
 	})
 	out.Commands = mergeByKey(global.Commands, project.Commands, func(c *model.Command) string {
-		return c.Name
+		return c.ScopePath + "/" + c.Name
 	})
 	out.Agents = mergeByKey(global.Agents, project.Agents, func(a *model.Agent) string {
-		return a.Name
+		return a.ScopePath + "/" + a.Name
 	})
 	out.MCP = mergeByKey(global.MCP, project.MCP, func(m *model.MCPServer) string {
-		return m.Name
+		return m.ScopePath + "/" + m.Name
 	})
 
 	// Hooks: project first, then global. Hooks lack a stable key; we don't
@@ -91,6 +99,14 @@ func mergeProjects(project, global *model.Project) *model.Project {
 
 	// Permissions: union of slices, deduped.
 	out.Permissions = mergePermissions(project.Permissions, global.Permissions)
+
+	// ScopedPermissions: merge by ScopePath, project wins. Global-layer
+	// scoped permissions are preserved even when the project lacks a
+	// matching scope (v0.5 "load broad with warning" policy; warning is
+	// deferred until the parser grows a warnings channel).
+	out.ScopedPermissions = mergeByKey(global.ScopedPermissions, project.ScopedPermissions, func(p *model.Permissions) string {
+		return p.ScopePath
+	})
 
 	return out
 }

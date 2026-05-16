@@ -12,7 +12,7 @@
 // configuration (merged with any pre-existing file at the project root).
 // Skills are projected as degraded scoped rules (no script execution).
 // Commands, Agents, Hooks, and Permissions have no Cursor analog and only
-// emit informational warnings.
+// emit informational warnings. Scoped commands degrade to scoped rules.
 package plugins
 
 import (
@@ -25,6 +25,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/scope"
 )
 
 // CursorPlugin projects Project state into `.cursor/rules/*.mdc` files and
@@ -112,24 +113,24 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	}
 
 	// Per-scope rule files.
-	for _, scope := range proj.Scopes {
-		if scope == nil {
+	for _, sc := range proj.Scopes {
+		if sc == nil {
 			continue
 		}
-		desc := scope.Description
+		desc := sc.Description
 		if desc == "" {
-			desc = fmt.Sprintf("Context for %s", scope.Path)
+			desc = fmt.Sprintf("Context for %s", sc.Path)
 		}
 		body := ""
 		var sources []string
-		if scope.Document != nil {
-			body = scope.Document.Body
-			sources = []string{proj.SourceTag(scope.Document.SourcePath)}
+		if sc.Document != nil {
+			body = sc.Document.Body
+			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
-		content := renderMDC(desc, scope.Globs, false, body)
+		content := renderMDC(desc, sc.Globs, false, body)
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", slugify(scope.Path)+".mdc")),
+			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", slugify(sc.Path)+".mdc")),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -138,10 +139,13 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		ops = append(ops, op)
 	}
 
-	// Skills → degraded scoped rule files at .cursor/rules/skill-<slug>.mdc.
+	// Skills → scoped rule files at .cursor/rules/skill-<slug>.mdc.
 	// Each skill becomes a rule that loads when description matches user
 	// intent or files match globs. Scripts are dropped with a warning.
-	var skillWarnings []plugin.Warning
+	// Scoped skills include their scope slug as a filename prefix to
+	// disambiguate same-named skills across scopes; Skill.Globs comes
+	// already populated from the parser (frontmatter override or scope
+	// default), so we just pass it through.
 	for _, skill := range proj.Skills {
 		if skill == nil {
 			continue
@@ -157,9 +161,10 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
 		content := renderMDC(desc, skill.Globs, false, body)
+		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".mdc"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", "skill-"+skillSlug(skill.Name)+".mdc")),
+			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", fname)),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -175,16 +180,18 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 				Message:  fmt.Sprintf("Cursor has no skill primitive — projected as a scoped rule with no script execution. Scripts ignored: %s", strings.Join(skill.Scripts, ", ")),
 				Severity: "info",
 			})
-			// Track the warning for the aggregate fallback too — but it's
-			// already attached to the skill op itself, so don't duplicate.
-			_ = skillWarnings
 		}
 		ops = append(ops, op)
 	}
 
-	// Collect degradation/unsupported warnings for capability types we
-	// do not project. Each warning is severity=info — these are not
-	// errors, just transparency about what got dropped.
+	// Commands.
+	//
+	// Scoped commands (ScopePath != "") degrade to scoped rule files with
+	// the scope's default globs in frontmatter, alongside an info warning
+	// noting Cursor has no slash-command primitive.
+	//
+	// Unscoped commands have no Cursor analog at all — they emit only an
+	// info warning (attached to the first op below).
 	var warnings []plugin.Warning
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
@@ -193,6 +200,39 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		src := ""
 		if cmd.Document != nil {
 			src = proj.SourceTag(cmd.Document.SourcePath)
+		}
+		if cmd.ScopePath != "" {
+			body := ""
+			if cmd.Document != nil {
+				body = cmd.Document.Body
+			}
+			desc := cmd.Description
+			if desc == "" {
+				desc = fmt.Sprintf("Command /%s (scoped to %s)", cmd.Name, cmd.ScopePath)
+			}
+			globs := scope.DefaultGlobs(cmd.ScopePath)
+			content := renderMDC(desc, globs, false, body)
+			fname := "command-" + scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".mdc"
+			op := plugin.Operation{
+				Kind:    plugin.OpWrite,
+				Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", fname)),
+				Content: content,
+				Mode:    plugin.ModeWrite,
+				Plugin:  p.Name(),
+				Sources: func() []string {
+					if src != "" {
+						return []string{src}
+					}
+					return nil
+				}(),
+			}
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Cursor has no slash-command primitive; scoped command %q projected as a rule (scope: %s)", cmd.Name, cmd.ScopePath),
+				Severity: "info",
+			})
+			ops = append(ops, op)
+			continue
 		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
@@ -208,9 +248,13 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if agent.Document != nil {
 			src = proj.SourceTag(agent.Document.SourcePath)
 		}
+		msg := fmt.Sprintf("Cursor has no subagent primitive; %s not projected.", agent.Name)
+		if agent.ScopePath != "" {
+			msg = fmt.Sprintf("Cursor has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
-			Message:  fmt.Sprintf("Cursor has no subagent primitive; %s not projected.", agent.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -218,9 +262,13 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if hook == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Cursor has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher)
+		if hook.ScopePath != "" {
+			msg = fmt.Sprintf("Cursor has no hook primitive; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   hook.ScriptPath,
-			Message:  fmt.Sprintf("Cursor has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -233,15 +281,40 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			})
 		}
 	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  fmt.Sprintf("Cursor has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
+			Severity: "info",
+		})
+	}
 
 	// MCP → `.cursor/mcp.json` (native). Merge with any existing file at
-	// proj.Root/.cursor/mcp.json so user-managed keys survive.
+	// proj.Root/.cursor/mcp.json so user-managed keys survive. Scoped MCP
+	// servers (ScopePath != "") are silently merged into the global block
+	// (Cursor has no per-scope MCP) with an info warning per server.
 	if len(proj.MCP) > 0 {
 		mcpOp, err := p.buildMCPOp(proj)
 		if err != nil {
 			return nil, err
 		}
 		ops = append(ops, mcpOp)
+	}
+	for _, srv := range proj.MCP {
+		if srv == nil || srv.ScopePath == "" {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  fmt.Sprintf("Cursor has no per-scope MCP; scoped server %q (scope: %s) merged into global block.", srv.Name, srv.ScopePath),
+			Severity: "info",
+		})
 	}
 
 	// Attach unsupported-type warnings to the first available op.
@@ -398,3 +471,15 @@ func skillSlug(name string) string {
 	return s
 }
 
+// scopedSkillSlug produces the filename slug component for a capability
+// (skill, command, etc.). When scopePath is empty, this is just the
+// capability's name slug. When non-empty, the scope slug is prepended with
+// a dash separator: "<scopeSlug>-<nameSlug>". This keeps same-named
+// capabilities across different scopes from colliding on disk.
+func scopedSkillSlug(scopePath, name string) string {
+	n := skillSlug(name)
+	if scopePath == "" {
+		return n
+	}
+	return slugify(scopePath) + "-" + n
+}

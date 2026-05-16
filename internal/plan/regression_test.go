@@ -72,9 +72,9 @@ type recordingPlugin struct {
 	called bool
 }
 
-func (p *recordingPlugin) Name() string                                  { return p.name }
-func (p *recordingPlugin) Detect(root string) bool                       { return p.detect }
-func (p *recordingPlugin) Capabilities() plugin.Capabilities             { return plugin.Capabilities{} }
+func (p *recordingPlugin) Name() string                      { return p.name }
+func (p *recordingPlugin) Detect(root string) bool           { return p.detect }
+func (p *recordingPlugin) Capabilities() plugin.Capabilities { return plugin.Capabilities{} }
 func (p *recordingPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plugin.Operation, error) {
 	p.called = true
 	return nil, nil

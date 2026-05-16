@@ -12,7 +12,10 @@
 // primitives. Skills and Commands degrade to rules (with a description so the
 // model can decide when to surface them); Agents, Hooks, Permissions, and MCP
 // only emit informational warnings — Windsurf configures MCP separately and
-// has no equivalent for the rest.
+// has no equivalent for the rest. Scoped skills/commands include the scope
+// slug as a filename prefix; scoped skills are projected natively via
+// trigger: glob whenever Skill.Globs is populated (which the parser handles
+// from frontmatter override or scope default).
 
 package plugins
 
@@ -104,24 +107,24 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	// Per-scope rule files.
-	for _, scope := range proj.Scopes {
-		if scope == nil {
+	for _, sc := range proj.Scopes {
+		if sc == nil {
 			continue
 		}
 		body := ""
 		var sources []string
-		if scope.Document != nil {
-			body = scope.Document.Body
-			sources = []string{proj.SourceTag(scope.Document.SourcePath)}
+		if sc.Document != nil {
+			body = sc.Document.Body
+			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
 		fm := windsurfFrontmatter{
 			Trigger:     "glob",
-			Globs:       scope.Globs,
-			Description: scope.Description,
+			Globs:       sc.Globs,
+			Description: sc.Description,
 		}
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", slugify(scope.Path)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", slugify(sc.Path)+".md")),
 			Content: renderWindsurfRule(fm, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -131,6 +134,10 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 
 	// Skills → degraded rule files. Globbed skills become trigger: glob,
 	// otherwise trigger: model_decision (which requires a description).
+	// Scoped skills include the scope slug as a filename prefix to avoid
+	// collisions across scopes. Skill.Globs is already populated by the
+	// parser (frontmatter override or scope default) so a scoped skill
+	// naturally lands on trigger: glob.
 	for _, skill := range proj.Skills {
 		if skill == nil {
 			continue
@@ -158,9 +165,10 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 				Description: desc,
 			}
 		}
+		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".md"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", "skill-"+skillSlug(skill.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", fname)),
 			Content: renderWindsurfRule(fm, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -183,6 +191,10 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	// Commands → degraded rule files with trigger: model_decision and a
 	// description prefixed with "Command /<name>: ". Each command also emits
 	// an info warning on its own op.
+	//
+	// Scoped commands get the scope slug as a filename prefix, the scope path
+	// surfaced in the description (so the model_decision trigger knows about
+	// it), and a warning naming the scope.
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
 			continue
@@ -194,13 +206,19 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			sources = []string{proj.SourceTag(cmd.Document.SourcePath)}
 		}
 		desc := fmt.Sprintf("Command /%s: %s", cmd.Name, cmd.Description)
+		warningMsg := fmt.Sprintf("Windsurf has no slash-command mechanism; %s documented as a rule.", cmd.Name)
+		if cmd.ScopePath != "" {
+			desc = fmt.Sprintf("Command /%s (scoped to %s): %s", cmd.Name, cmd.ScopePath, cmd.Description)
+			warningMsg = fmt.Sprintf("Windsurf has no slash-command mechanism; scoped command %q (scope: %s) documented as a rule.", cmd.Name, cmd.ScopePath)
+		}
 		fm := windsurfFrontmatter{
 			Trigger:     "model_decision",
 			Description: desc,
 		}
+		fname := "command-" + scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".md"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", "command-"+skillSlug(cmd.Name)+".md")),
+			Path:    filepath.ToSlash(filepath.Join(".windsurf", "rules", fname)),
 			Content: renderWindsurfRule(fm, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
@@ -208,7 +226,7 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 		op.Warnings = append(op.Warnings, plugin.Warning{
 			Source:   sourceFromCommand(proj, cmd),
-			Message:  fmt.Sprintf("Windsurf has no slash-command mechanism; %s documented as a rule.", cmd.Name),
+			Message:  warningMsg,
 			Severity: "info",
 		})
 		ops = append(ops, op)
@@ -225,9 +243,13 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if agent.Document != nil {
 			src = proj.SourceTag(agent.Document.SourcePath)
 		}
+		msg := fmt.Sprintf("Windsurf has no subagent primitive; %s not projected.", agent.Name)
+		if agent.ScopePath != "" {
+			msg = fmt.Sprintf("Windsurf has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
-			Message:  fmt.Sprintf("Windsurf has no subagent primitive; %s not projected.", agent.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -235,9 +257,13 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if hook == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Windsurf has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher)
+		if hook.ScopePath != "" {
+			msg = fmt.Sprintf("Windsurf has no hook primitive; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   hook.ScriptPath,
-			Message:  fmt.Sprintf("Windsurf has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -250,13 +276,30 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			})
 		}
 	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  fmt.Sprintf("Windsurf has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
+			Severity: "info",
+		})
+	}
 	for _, srv := range proj.MCP {
 		if srv == nil || srv.Name == "" {
 			continue
 		}
+		msg := fmt.Sprintf("Windsurf configures MCP separately; %s not projected.", srv.Name)
+		if srv.ScopePath != "" {
+			msg = fmt.Sprintf("Windsurf configures MCP separately; scoped server %q (scope: %s) not projected.", srv.Name, srv.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   "mcp.yaml",
-			Message:  fmt.Sprintf("Windsurf configures MCP separately; %s not projected.", srv.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}

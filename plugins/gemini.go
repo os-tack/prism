@@ -110,15 +110,21 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		ops = append(ops, settingsOp)
 	}
 
-	// Degradation warnings for primitives Gemini CLI cannot express.
+	// Degradation warnings for primitives Gemini CLI cannot express. Scoped
+	// variants get a slightly different message so users can grep their logs
+	// for unfulfilled scoped expectations specifically.
 	var warnings []plugin.Warning
 	for _, sk := range proj.Skills {
 		if sk == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Gemini has no skills primitive; %s not projected.", sk.Name)
+		if sk.ScopePath != "" {
+			msg = fmt.Sprintf("Gemini has no skills primitive; scoped skill %q (scope: %s) not projected.", sk.Name, sk.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   filepath.Join("skills", sk.Name),
-			Message:  fmt.Sprintf("Gemini CLI has no skills primitive; %s not projected.", sk.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -126,9 +132,13 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if cmd == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Gemini has no commands primitive; %s not projected.", cmd.Name)
+		if cmd.ScopePath != "" {
+			msg = fmt.Sprintf("Gemini has no commands primitive; scoped command %q (scope: %s) not projected.", cmd.Name, cmd.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   filepath.Join("commands", cmd.Name+".md"),
-			Message:  fmt.Sprintf("Gemini CLI has no commands primitive; %s not projected.", cmd.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -136,9 +146,13 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if ag == nil {
 			continue
 		}
+		msg := fmt.Sprintf("Gemini has no agents primitive; %s not projected.", ag.Name)
+		if ag.ScopePath != "" {
+			msg = fmt.Sprintf("Gemini has no agents primitive; scoped agent %q (scope: %s) not projected.", ag.Name, ag.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   filepath.Join("agents", ag.Name+".md"),
-			Message:  fmt.Sprintf("Gemini CLI has no agents primitive; %s not projected.", ag.Name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
@@ -150,16 +164,43 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if h.Matcher != "" {
 			name = h.Event + ":" + h.Matcher
 		}
+		msg := fmt.Sprintf("Gemini has no hooks primitive; %s not projected.", name)
+		if h.ScopePath != "" {
+			msg = fmt.Sprintf("Gemini has no hooks primitive; scoped hook %s (scope: %s) not projected.", name, h.ScopePath)
+		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   "hooks.yaml",
-			Message:  fmt.Sprintf("Gemini CLI has no hooks primitive; %s not projected.", name),
+			Message:  msg,
 			Severity: "info",
 		})
 	}
 	if proj.Permissions != nil && (len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0) {
 		warnings = append(warnings, plugin.Warning{
 			Source:   "permissions.yaml",
-			Message:  "Gemini CLI has no permissions primitive; permissions not projected.",
+			Message:  "Gemini has no permissions primitive; permissions not projected.",
+			Severity: "info",
+		})
+	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   filepath.Join(sp.ScopePath, "permissions.yaml"),
+			Message:  fmt.Sprintf("Gemini has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
+			Severity: "info",
+		})
+	}
+	for _, srv := range proj.MCP {
+		if srv == nil || srv.Name == "" || srv.ScopePath == "" {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   filepath.Join(srv.ScopePath, "mcp.yaml"),
+			Message:  fmt.Sprintf("Gemini has no per-scope MCP; scoped MCP server %q (scope: %s) not projected.", srv.Name, srv.ScopePath),
 			Severity: "info",
 		})
 	}
@@ -174,13 +215,29 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 // buildGeminiContextOp constructs a single Operation for a Document being
 // projected to the given target path (relative to project root) in the given
 // Mode. Mirrors the Claude plugin's buildOp shape but stamps Plugin="gemini".
+//
+// When doc.NeedsWrite() is true (the document had @include directives
+// expanded into its body) symlink mode is downgraded to write mode and
+// an info-severity warning is attached describing the reason. Every
+// included file's source tag is appended to op.Sources so lockfile /
+// `agents which` traces flow back to the included content too.
 func buildGeminiContextOp(proj *model.Project, doc *model.Document, targetPath string, mode plugin.Mode) (plugin.Operation, error) {
+	downgraded := false
+	if doc.NeedsWrite() && mode == plugin.ModeSymlink {
+		mode = plugin.ModeWrite
+		downgraded = true
+	}
+
 	srcRel := proj.SourceTag(doc.SourcePath)
+	sources := []string{srcRel}
+	for _, inc := range doc.Includes {
+		sources = append(sources, proj.SourceTag(inc))
+	}
 
 	op := plugin.Operation{
 		Path:    targetPath,
 		Mode:    mode,
-		Sources: []string{srcRel},
+		Sources: sources,
 		Plugin:  "gemini",
 	}
 
@@ -195,6 +252,14 @@ func buildGeminiContextOp(proj *model.Project, doc *model.Document, targetPath s
 	} else {
 		op.Kind = plugin.OpWrite
 		op.Content = doc.Body
+	}
+
+	if downgraded {
+		op.Warnings = append(op.Warnings, plugin.Warning{
+			Source:   srcRel,
+			Message:  "downgraded to write mode: contains @include directives",
+			Severity: "info",
+		})
 	}
 
 	return op, nil

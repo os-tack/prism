@@ -3,15 +3,23 @@ package engine
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"agents.dev/agents/internal/importer"
+	"agents.dev/agents/internal/model"
 )
 
 const defaultContext = "# Project context\n\nDescribe your project here.\n"
 
+// initProject scaffolds .agents/. With importFrom == "", writes default
+// content. With importFrom set to a known importer name (or comma-separated
+// list), runs each named importer in order, merging their *model.Project
+// outputs (first wins on collisions), and serializes the merged result.
+//
+// importFrom == "auto" runs every importer whose Detect returns true.
 func initProject(opts Options, importFrom string) error {
 	if opts.Root == "" {
 		return fmt.Errorf("engine: Options.Root is required")
@@ -27,70 +35,29 @@ func initProject(opts Options, importFrom string) error {
 		return fmt.Errorf("engine: stat .agents/: %w", err)
 	}
 
-	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
-		return fmt.Errorf("engine: mkdir %s: %w", agentsDir, err)
-	}
+	var (
+		project  *model.Project
+		warnings []importer.Warning
+		err      error
+	)
 
-	var created []string
-	createFile := func(rel string, content []byte) error {
-		full := filepath.Join(agentsDir, rel)
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(full, content, 0o644); err != nil {
-			return err
-		}
-		created = append(created, filepath.Join(".agents", rel))
-		return nil
-	}
-
-	// 1. Root context.md (possibly imported).
-	rootBody := []byte(defaultContext)
-	if importFrom == "claude" {
-		claudePath := filepath.Join(opts.Root, "CLAUDE.md")
-		if data, err := os.ReadFile(claudePath); err == nil {
-			rootBody = data
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("engine: read CLAUDE.md: %w", err)
-		}
-	}
-	if err := createFile("context.md", rootBody); err != nil {
-		return err
-	}
-
-	// 2. Nested imports from CLAUDE.md files (skip root, which we already did).
-	if importFrom == "claude" {
-		err := filepath.WalkDir(opts.Root, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if d.IsDir() {
-				name := d.Name()
-				// Skip vendored / hidden directories that shouldn't contain context.
-				if path != opts.Root && (name == ".git" || name == ".agents" || name == "node_modules" || name == "vendor") {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.Name() != "CLAUDE.md" {
-				return nil
-			}
-			if filepath.Dir(path) == opts.Root {
-				return nil
-			}
-			rel, err := filepath.Rel(opts.Root, filepath.Dir(path))
-			if err != nil {
-				return err
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("engine: read %s: %w", path, err)
-			}
-			return createFile(filepath.Join(rel, "context.md"), data)
-		})
+	if importFrom == "" {
+		project = defaultProject()
+	} else {
+		project, warnings, err = runImporters(opts.Root, importFrom)
 		if err != nil {
 			return err
 		}
+		if project.Context == nil {
+			// Importer produced no root context: scaffold a default so the
+			// project tree is still useful.
+			project.Context = &model.Document{Body: defaultContext}
+		}
+	}
+
+	created, err := serializeProject(opts.Root, project)
+	if err != nil {
+		return err
 	}
 
 	// 3. agents.config.yaml with autodetected targets.
@@ -102,9 +69,11 @@ func initProject(opts Options, importFrom string) error {
 	}
 	sort.Strings(targets)
 	cfg := buildConfigYAML(targets)
-	if err := createFile("agents.config.yaml", []byte(cfg)); err != nil {
+	cfgFull := filepath.Join(agentsDir, "agents.config.yaml")
+	if err := os.WriteFile(cfgFull, []byte(cfg), 0o644); err != nil {
 		return err
 	}
+	created = append(created, filepath.Join(".agents", "agents.config.yaml"))
 
 	if !opts.Quiet {
 		fmt.Println("Initialized .agents/:")
@@ -112,8 +81,178 @@ func initProject(opts Options, importFrom string) error {
 		for _, c := range created {
 			fmt.Printf("  created %s\n", c)
 		}
+		for _, w := range warnings {
+			fmt.Printf("  ⚠ [%s] %s: %s\n", w.Severity, w.SourcePath, w.Heuristic)
+		}
 	}
 	return nil
+}
+
+func defaultProject() *model.Project {
+	return &model.Project{
+		Context: &model.Document{Body: defaultContext},
+	}
+}
+
+// runImporters resolves importFrom (comma-separated list or "auto") into
+// a merged Project. Single-name calls run that one importer; multi-name
+// runs them in order with first-wins-on-collision semantics.
+func runImporters(root, importFrom string) (*model.Project, []importer.Warning, error) {
+	reg := defaultImporterRegistry()
+
+	var names []string
+	if importFrom == "auto" {
+		for _, imp := range reg.All() {
+			if imp.Detect(root) {
+				names = append(names, imp.Name())
+			}
+		}
+		sort.Strings(names)
+		if len(names) == 0 {
+			return nil, nil, fmt.Errorf("engine: --from auto found no recognized tool config in %s", root)
+		}
+	} else {
+		for _, n := range strings.Split(importFrom, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if reg.Get(n) == nil {
+				return nil, nil, fmt.Errorf("engine: unknown importer %q (known: %s)", n, strings.Join(reg.Names(), ", "))
+			}
+			names = append(names, n)
+		}
+	}
+
+	var (
+		merged   *model.Project
+		warnings []importer.Warning
+	)
+	for _, name := range names {
+		imp := reg.Get(name)
+		proj, ws, err := imp.Import(root)
+		if err != nil {
+			if errors.Is(err, importer.ErrSourceNotPresent) {
+				continue
+			}
+			return nil, warnings, fmt.Errorf("engine: importer %s: %w", name, err)
+		}
+		warnings = append(warnings, ws...)
+		if merged == nil {
+			merged = proj
+		} else {
+			merged = mergeImported(merged, proj)
+		}
+	}
+	if merged == nil {
+		return nil, warnings, fmt.Errorf("engine: no importers produced content for %s", root)
+	}
+	return merged, warnings, nil
+}
+
+// mergeImported merges b into a with first-wins semantics: a's content
+// wins on collision (by Scope.Path, Skill.Name, Command.Name, etc.).
+// Used by `agents init --from cursor,gemini` to combine multiple sources.
+func mergeImported(a, b *model.Project) *model.Project {
+	if a.Context == nil && b.Context != nil {
+		a.Context = b.Context
+	}
+	// Scopes
+	seenScope := make(map[string]struct{}, len(a.Scopes))
+	for _, s := range a.Scopes {
+		seenScope[s.Path] = struct{}{}
+	}
+	for _, s := range b.Scopes {
+		if _, dup := seenScope[s.Path]; dup {
+			continue
+		}
+		a.Scopes = append(a.Scopes, s)
+	}
+	// Skills/Commands/Agents by name
+	seenSkill := make(map[string]struct{})
+	for _, s := range a.Skills {
+		seenSkill[s.ScopePath+"/"+s.Name] = struct{}{}
+	}
+	for _, s := range b.Skills {
+		if _, dup := seenSkill[s.ScopePath+"/"+s.Name]; dup {
+			continue
+		}
+		a.Skills = append(a.Skills, s)
+	}
+	seenCmd := make(map[string]struct{})
+	for _, c := range a.Commands {
+		seenCmd[c.ScopePath+"/"+c.Name] = struct{}{}
+	}
+	for _, c := range b.Commands {
+		if _, dup := seenCmd[c.ScopePath+"/"+c.Name]; dup {
+			continue
+		}
+		a.Commands = append(a.Commands, c)
+	}
+	seenAgent := make(map[string]struct{})
+	for _, ag := range a.Agents {
+		seenAgent[ag.ScopePath+"/"+ag.Name] = struct{}{}
+	}
+	for _, ag := range b.Agents {
+		if _, dup := seenAgent[ag.ScopePath+"/"+ag.Name]; dup {
+			continue
+		}
+		a.Agents = append(a.Agents, ag)
+	}
+	// Hooks: concatenate (no stable key)
+	a.Hooks = append(a.Hooks, b.Hooks...)
+	// Permissions: union
+	if b.Permissions != nil {
+		if a.Permissions == nil {
+			a.Permissions = b.Permissions
+		} else {
+			a.Permissions.Allow = unionStrings(a.Permissions.Allow, b.Permissions.Allow)
+			a.Permissions.Deny = unionStrings(a.Permissions.Deny, b.Permissions.Deny)
+			a.Permissions.Ask = unionStrings(a.Permissions.Ask, b.Permissions.Ask)
+		}
+	}
+	// MCP by name
+	seenMCP := make(map[string]struct{})
+	for _, m := range a.MCP {
+		seenMCP[m.ScopePath+"/"+m.Name] = struct{}{}
+	}
+	for _, m := range b.MCP {
+		if _, dup := seenMCP[m.ScopePath+"/"+m.Name]; dup {
+			continue
+		}
+		a.MCP = append(a.MCP, m)
+	}
+	return a
+}
+
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		seen[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		a = append(a, s)
+		seen[s] = struct{}{}
+	}
+	return a
+}
+
+// defaultImporterRegistry is wired into engine.Init for v0.5. A future
+// version may push this into Options so callers can override / mock.
+func defaultImporterRegistry() *importer.Registry {
+	r := importer.NewRegistry()
+	r.Register(importer.NewClaude())
+	r.Register(importer.NewCursor())
+	r.Register(importer.NewGemini())
+	r.Register(importer.NewCline())
+	r.Register(importer.NewContinue())
+	r.Register(importer.NewWindsurf())
+	r.Register(importer.NewCopilot())
+	r.Register(importer.NewAgentsMD())
+	return r
 }
 
 func buildConfigYAML(targets []string) string {

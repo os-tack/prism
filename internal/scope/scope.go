@@ -20,3 +20,24 @@ func Slug(path string) string {
 	}
 	return strings.ReplaceAll(path, "/", "-")
 }
+
+// SafePath reports whether path is a safe relative scope path: not empty,
+// not absolute, and contains no ".." traversal segments after cleaning.
+// Used by importers and serializers to reject malicious or malformed scope
+// paths that would escape .agents/ on disk.
+func SafePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if strings.HasPrefix(path, "/") {
+		return false
+	}
+	// Normalize separators and check for ..
+	parts := strings.Split(strings.ReplaceAll(path, "\\", "/"), "/")
+	for _, p := range parts {
+		if p == ".." {
+			return false
+		}
+	}
+	return true
+}

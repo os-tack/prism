@@ -297,8 +297,8 @@ func TestWhich_TracksSources(t *testing.T) {
 		t.Fatalf("Which AGENTS.md: %v", err)
 	}
 	want := map[string]bool{
-		"context.md":              false,
-		"src/billing/context.md":  false,
+		"context.md":             false,
+		"src/billing/context.md": false,
 	}
 	for _, s := range srcs {
 		s = filepath.ToSlash(s)

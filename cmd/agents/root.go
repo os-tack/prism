@@ -67,6 +67,10 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newWhichCmd(state))
 	root.AddCommand(newWatchCmd(state))
 	root.AddCommand(newCapabilitiesCmd(state))
+	root.AddCommand(newScopeGuardCmd())
+	root.AddCommand(newAddCmd(state))
+	root.AddCommand(newRemoveCmd(state))
+	root.AddCommand(newListCmd(state))
 
 	return root
 }
