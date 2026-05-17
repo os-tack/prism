@@ -3,6 +3,11 @@ package registry
 // packages_file.go: read/write of `.agents/packages.yaml`, the bookkeeping
 // ledger of installed registry packages. Schema is documented at the top of
 // registry.go.
+//
+// v0.6 introduces per-file hashes. The on-disk `files:` sequence is a list
+// of `{path, hash}` maps; the v0.5 list-of-strings form is still parsed for
+// back-compat (each string becomes a FileEntry with empty Hash, which the
+// remove path interprets as "use the aggregate SHA fallback").
 
 import (
 	"errors"
@@ -24,23 +29,60 @@ func PackagesFilePath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".agents", PackagesFileName)
 }
 
-// packagesFileShape is the YAML envelope. It exists as a separate type so we
-// can keep the on-disk representation independent of model.Package internals.
+// packagesFileShape is the YAML envelope. Files is yaml.Node so we can
+// decode either the modern []{path, hash} form or the legacy []string form
+// without two passes over the whole document.
 type packagesFileShape struct {
 	Packages map[string]packageEntry `yaml:"packages"`
 }
 
 type packageEntry struct {
-	Source      string   `yaml:"source"`
-	Ref         string   `yaml:"ref,omitempty"`
-	SHA         string   `yaml:"sha,omitempty"`
-	InstalledAt string   `yaml:"installed_at,omitempty"`
-	Target      string   `yaml:"target,omitempty"`
-	Files       []string `yaml:"files,omitempty"`
+	Source      string    `yaml:"source"`
+	Ref         string    `yaml:"ref,omitempty"`
+	SHA         string    `yaml:"sha,omitempty"`
+	InstalledAt string    `yaml:"installed_at,omitempty"`
+	Target      string    `yaml:"target,omitempty"`
+	Files       yaml.Node `yaml:"files,omitempty"`
+}
+
+// decodeFiles handles both v0.6 modern ({path, hash} maps) and v0.5 legacy
+// (plain strings) shapes for the `files:` sequence. Returns FileEntries
+// sorted by Path for determinism.
+func decodeFiles(n *yaml.Node) ([]model.FileEntry, error) {
+	if n == nil || n.Kind == 0 {
+		return nil, nil
+	}
+	if n.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("expected sequence for files, got kind %d", n.Kind)
+	}
+	out := make([]model.FileEntry, 0, len(n.Content))
+	for _, item := range n.Content {
+		switch item.Kind {
+		case yaml.ScalarNode:
+			// v0.5 legacy: plain string path, no hash.
+			out = append(out, model.FileEntry{Path: item.Value})
+		case yaml.MappingNode:
+			// v0.6 modern: {path, hash}.
+			var fe struct {
+				Path string `yaml:"path"`
+				Hash string `yaml:"hash"`
+			}
+			if err := item.Decode(&fe); err != nil {
+				return nil, fmt.Errorf("decode file entry: %w", err)
+			}
+			out = append(out, model.FileEntry{Path: fe.Path, Hash: fe.Hash})
+		default:
+			return nil, fmt.Errorf("unexpected node kind %d in files sequence", item.Kind)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
 }
 
 // Load reads .agents/packages.yaml. Missing file → empty slice, no error.
 // Returned slice is sorted by Name for deterministic downstream output.
+// Both v0.6 (per-file-hash) and v0.5 (path-only) `files:` shapes are
+// accepted; v0.5 entries yield FileEntries with empty Hash.
 func Load(projectRoot string) ([]*model.Package, error) {
 	path := PackagesFilePath(projectRoot)
 	data, err := os.ReadFile(path)
@@ -56,8 +98,10 @@ func Load(projectRoot string) ([]*model.Package, error) {
 	}
 	out := make([]*model.Package, 0, len(raw.Packages))
 	for name, e := range raw.Packages {
-		files := append([]string(nil), e.Files...)
-		sort.Strings(files)
+		files, err := decodeFiles(&e.Files)
+		if err != nil {
+			return nil, fmt.Errorf("registry: parse %s: files for %q: %w", path, name, err)
+		}
 		out = append(out, &model.Package{
 			Name:        name,
 			Source:      e.Source,
@@ -73,7 +117,8 @@ func Load(projectRoot string) ([]*model.Package, error) {
 }
 
 // Save writes .agents/packages.yaml. The output is deterministic: packages
-// are emitted in Name order, and files within each package are sorted.
+// are emitted in Name order, and files within each package are sorted by
+// path. The modern v0.6 `{path, hash}` map shape is always emitted.
 // Creates .agents/ if missing.
 func Save(projectRoot string, packages []*model.Package) error {
 	dir := filepath.Dir(PackagesFilePath(projectRoot))
@@ -107,12 +152,22 @@ func Save(projectRoot string, packages []*model.Package) error {
 		addStr("target", p.Target)
 
 		if len(p.Files) > 0 {
-			files := append([]string(nil), p.Files...)
-			sort.Strings(files)
+			files := append([]model.FileEntry(nil), p.Files...)
+			sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 			seq := &yaml.Node{Kind: yaml.SequenceNode}
 			for _, f := range files {
-				seq.Content = append(seq.Content,
-					&yaml.Node{Kind: yaml.ScalarNode, Value: f})
+				fileMap := &yaml.Node{Kind: yaml.MappingNode}
+				fileMap.Content = append(fileMap.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Value: "path"},
+					&yaml.Node{Kind: yaml.ScalarNode, Value: f.Path},
+				)
+				if f.Hash != "" {
+					fileMap.Content = append(fileMap.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "hash"},
+						&yaml.Node{Kind: yaml.ScalarNode, Value: f.Hash},
+					)
+				}
+				seq.Content = append(seq.Content, fileMap)
 			}
 			entry.Content = append(entry.Content,
 				&yaml.Node{Kind: yaml.ScalarNode, Value: "files"},

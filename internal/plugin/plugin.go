@@ -122,6 +122,11 @@ func NewRegistry() *Registry {
 }
 
 // Register adds a plugin. Panics on duplicate name (programming error).
+//
+// TODO(v0.7): mirror importer.Registry.Register and return error instead of
+// panicking. Deferred for v0.6 because plugin.Registry.Register has many
+// call sites across internal/plan/plan_test.go and engine tests; threading
+// the error return is a larger refactor.
 func (r *Registry) Register(p Plugin) {
 	if _, exists := r.plugins[p.Name()]; exists {
 		panic("plugin already registered: " + p.Name())

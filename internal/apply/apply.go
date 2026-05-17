@@ -9,10 +9,21 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"agents.dev/agents/internal/diff"
 	"agents.dev/agents/internal/plugin"
 )
+
+// shouldDowngradeSymlink reports whether OpSymlink should be downgraded to
+// OpWrite on the current platform. Windows symlinks require either admin
+// rights or Developer Mode, so silently degrade to a content copy.
+//
+// Indirected through a package-level var so tests on any OS can exercise
+// the downgrade path; production callers see runtime.GOOS.
+var shouldDowngradeSymlink = func() bool {
+	return runtime.GOOS == "windows"
+}
 
 // Apply executes ops at root. If dryRun is true, it tallies changes
 // without touching the filesystem.
@@ -52,6 +63,39 @@ func applyOne(root string, op plugin.Operation, dryRun bool) (bool, error) {
 		return true, nil
 
 	case plugin.OpSymlink:
+		// Windows fallback: read the symlink target's contents and treat
+		// the op as OpWrite. os.Symlink usually fails on Windows without
+		// admin/dev mode; a content copy keeps projection working at the
+		// cost of decoupling from upstream edits (documented in CHANGELOG).
+		if shouldDowngradeSymlink() {
+			targetDir := filepath.Dir(abs)
+			targetAbs := op.LinkTarget
+			if !filepath.IsAbs(targetAbs) {
+				targetAbs = filepath.Join(targetDir, op.LinkTarget)
+			}
+			data, rerr := os.ReadFile(targetAbs)
+			if rerr != nil {
+				return false, fmt.Errorf("apply: symlink fallback read %s: %w", targetAbs, rerr)
+			}
+			// If abs is itself an existing symlink (e.g. project was synced
+			// from a Unix prism install before the user opened it on Windows),
+			// remove it first. os.WriteFile follows symlinks and would
+			// silently overwrite the canonical .agents/ source through the
+			// link. Skip-on-dryRun so the dry-run preview stays side-effect-
+			// free.
+			if fi, statErr := os.Lstat(abs); statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if !dryRun {
+					if rmErr := os.Remove(abs); rmErr != nil {
+						return false, fmt.Errorf("apply: symlink fallback remove stale link %s: %w", abs, rmErr)
+					}
+				}
+			}
+			downgrade := op
+			downgrade.Kind = plugin.OpWrite
+			downgrade.Content = string(data)
+			downgrade.LinkTarget = ""
+			return applyOne(root, downgrade, dryRun)
+		}
 		fi, err := os.Lstat(abs)
 		if err == nil {
 			if fi.Mode()&os.ModeSymlink != 0 {

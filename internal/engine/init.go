@@ -244,14 +244,17 @@ func unionStrings(a, b []string) []string {
 // version may push this into Options so callers can override / mock.
 func defaultImporterRegistry() *importer.Registry {
 	r := importer.NewRegistry()
-	r.Register(importer.NewClaude())
-	r.Register(importer.NewCursor())
-	r.Register(importer.NewGemini())
-	r.Register(importer.NewCline())
-	r.Register(importer.NewContinue())
-	r.Register(importer.NewWindsurf())
-	r.Register(importer.NewCopilot())
-	r.Register(importer.NewAgentsMD())
+	// Registrations are static and known-good at compile time; the only
+	// failure mode is a duplicate Name(), which would be a programming
+	// error caught by tests. Discard the error.
+	_ = r.Register(importer.NewClaude())
+	_ = r.Register(importer.NewCursor())
+	_ = r.Register(importer.NewGemini())
+	_ = r.Register(importer.NewCline())
+	_ = r.Register(importer.NewContinue())
+	_ = r.Register(importer.NewWindsurf())
+	_ = r.Register(importer.NewCopilot())
+	_ = r.Register(importer.NewAgentsMD())
 	return r
 }
 

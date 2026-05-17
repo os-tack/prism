@@ -16,7 +16,11 @@ func TestAgentsMD_Empty(t *testing.T) {
 	}
 }
 
-// TestAgentsMD_Detect: root or nested AGENTS.md → true; absent → false.
+// TestAgentsMD_Detect verifies the v0.6 O(1) Detect contract: only root
+// AGENTS.md and .github/AGENTS.md are recognized; nested-only layouts no
+// longer auto-detect (users with that shape must pass --from agents-md
+// explicitly). The old behavior walked the entire tree on every Detect
+// call, which dominated `agents init --from auto` in large monorepos.
 func TestAgentsMD_Detect(t *testing.T) {
 	imp := NewAgentsMD()
 
@@ -30,10 +34,17 @@ func TestAgentsMD_Detect(t *testing.T) {
 		t.Errorf("Detect with root AGENTS.md returned false")
 	}
 
+	githubRoot := t.TempDir()
+	mustWrite(t, filepath.Join(githubRoot, ".github", "AGENTS.md"), "github body")
+	if !imp.Detect(githubRoot) {
+		t.Errorf("Detect with .github/AGENTS.md returned false")
+	}
+
+	// v0.6: nested-only is intentionally NOT detected to keep Detect O(1).
 	nestedOnly := t.TempDir()
 	mustWrite(t, filepath.Join(nestedOnly, "pkg", "AGENTS.md"), "nested")
-	if !imp.Detect(nestedOnly) {
-		t.Errorf("Detect with nested-only AGENTS.md returned false")
+	if imp.Detect(nestedOnly) {
+		t.Errorf("Detect with nested-only AGENTS.md returned true; v0.6 Detect is O(1) and should not walk the tree")
 	}
 }
 

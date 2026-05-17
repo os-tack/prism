@@ -19,7 +19,6 @@
 package importer
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -297,7 +296,3 @@ func stringFromFM(fm map[string]any, key string) (string, bool) {
 
 // Compile-time interface check.
 var _ Importer = (*ClineImporter)(nil)
-
-// Keep the errors import alive (used implicitly via fmt.Errorf %w in
-// future revisions; explicit reference avoids breakage if it's added).
-var _ = errors.New

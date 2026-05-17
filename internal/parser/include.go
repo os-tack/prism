@@ -143,8 +143,13 @@ func (s *includeState) expand(body, sourcePath string, stack []string, depth int
 			s.includes = append(s.includes, resolved)
 		}
 
-		// Recurse: push onto stack, expand, then pop.
-		nestedStack := append(stack, resolved)
+		// Recurse: push onto stack, expand, then pop. Explicit copy to
+		// avoid aliasing on recursive expansion — `append(stack, …)` may
+		// mutate the caller's backing array when cap allows, which can
+		// silently corrupt sibling expansions higher in the call stack.
+		nestedStack := make([]string, len(stack), len(stack)+1)
+		copy(nestedStack, stack)
+		nestedStack = append(nestedStack, resolved)
 		nestedExpanded, err := s.expand(includedBody, resolved, nestedStack, depth+1)
 		if err != nil {
 			return "", err

@@ -248,7 +248,7 @@ func buildGeminiContextOp(proj *model.Project, doc *model.Document, targetPath s
 			return plugin.Operation{}, err
 		}
 		op.Kind = plugin.OpSymlink
-		op.LinkTarget = linkTarget
+		op.LinkTarget = filepath.ToSlash(linkTarget)
 	} else {
 		op.Kind = plugin.OpWrite
 		op.Content = doc.Body

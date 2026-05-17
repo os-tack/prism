@@ -9,6 +9,7 @@ package importer
 
 import (
 	"errors"
+	"fmt"
 
 	"agents.dev/agents/internal/model"
 )
@@ -52,12 +53,16 @@ func NewRegistry() *Registry {
 	return &Registry{importers: map[string]Importer{}}
 }
 
-// Register adds an importer. Panics on duplicate name.
-func (r *Registry) Register(i Importer) {
+// Register adds an importer. Returns an error if an importer with the same
+// name is already registered. Callers typically know their registrations are
+// static and ignore the error with `_ =`; the error path exists so tests can
+// assert dup-detection without panicking.
+func (r *Registry) Register(i Importer) error {
 	if _, dup := r.importers[i.Name()]; dup {
-		panic("importer already registered: " + i.Name())
+		return fmt.Errorf("importer: %q already registered", i.Name())
 	}
 	r.importers[i.Name()] = i
+	return nil
 }
 
 // Get returns the importer with the given name, or nil if absent.

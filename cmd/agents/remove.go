@@ -22,6 +22,12 @@ the package entry is also preserved so you can resolve the drift and
 re-run remove).`,
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
+		// RunE returns errors instead of calling os.Exit so cobra's own
+		// error pipeline handles the non-zero exit. This lets any cleanup
+		// defers in main() / Execute() run before the process dies. Drift
+		// is reported by printing warnings to stderr and returning the
+		// drift error unchanged; cobra surfaces the error and Execute()
+		// returns non-nil, so main exits 1.
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			root := installRoot(state, global)
@@ -39,11 +45,9 @@ re-run remove).`,
 				for _, w := range drift.Warnings {
 					fmt.Fprintf(os.Stderr, "  - %s\n", w)
 				}
-				os.Exit(1)
+				return drift
 			}
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-			return nil
+			return err
 		},
 	}
 

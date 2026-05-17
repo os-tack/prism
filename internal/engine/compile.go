@@ -36,6 +36,16 @@ func compile(opts Options) (*Report, error) {
 		return nil, err
 	}
 
+	// Normalize every Operation.Path to forward slashes. This is the single
+	// chokepoint that guarantees lockfile keys and `agents which` lookups
+	// agree on Windows just as they do on macOS/Linux: plugins build paths
+	// with filepath.Join (backslashes on Windows) but the engine projects,
+	// looks up, and persists by the slash form. On macOS/Linux this is a
+	// no-op since filepath.Join already emits forward slashes.
+	for i := range ops {
+		ops[i].Path = filepath.ToSlash(ops[i].Path)
+	}
+
 	plannedPaths := make(map[string]struct{}, len(ops))
 	for _, op := range ops {
 		plannedPaths[op.Path] = struct{}{}
@@ -50,7 +60,11 @@ func compile(opts Options) (*Report, error) {
 	if prev != nil {
 		stalePaths := make([]string, 0, len(prev.Files))
 		for path := range prev.Files {
-			if _, kept := plannedPaths[path]; kept {
+			// Normalize so a legacy macOS-built lockfile (forward slashes)
+			// and a legacy Windows-built lockfile (backslashes) both compare
+			// against the slash-form plannedPaths.
+			slash := filepath.ToSlash(path)
+			if _, kept := plannedPaths[slash]; kept {
 				continue
 			}
 			stalePaths = append(stalePaths, path)
@@ -67,7 +81,7 @@ func compile(opts Options) (*Report, error) {
 			entry := prev.Files[path]
 			deletes = append(deletes, plugin.Operation{
 				Kind:    plugin.OpDelete,
-				Path:    path,
+				Path:    filepath.ToSlash(path),
 				Plugin:  entry.Plugin,
 				Sources: entry.Sources,
 			})
@@ -78,12 +92,19 @@ func compile(opts Options) (*Report, error) {
 	// last write and the new plan would overwrite those edits. Attach the
 	// warning to the op so the CLI prints it inline.
 	if prev != nil {
+		// Build a slash-keyed view of prev.Files so the lookup matches
+		// ops (which are now slash-form) even if the on-disk lockfile is
+		// a legacy Windows artifact with backslash keys.
+		prevBySlash := make(map[string]lockfile.Entry, len(prev.Files))
+		for k, v := range prev.Files {
+			prevBySlash[filepath.ToSlash(k)] = v
+		}
 		for i := range ops {
 			op := &ops[i]
 			if op.Kind != plugin.OpWrite && op.Kind != plugin.OpAppend && op.Kind != plugin.OpMerge {
 				continue
 			}
-			entry, tracked := prev.Files[op.Path]
+			entry, tracked := prevBySlash[op.Path]
 			if !tracked || entry.Hash == "" {
 				continue
 			}

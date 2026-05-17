@@ -141,7 +141,7 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 				return nil, fmt.Errorf("copilot: compute symlink target for %s: %w", path, err)
 			}
 			op.Kind = plugin.OpSymlink
-			op.LinkTarget = linkTarget
+			op.LinkTarget = filepath.ToSlash(linkTarget)
 		} else {
 			op.Kind = plugin.OpWrite
 			op.Content = proj.Context.Body

@@ -132,10 +132,20 @@ type Package struct {
 	Name        string
 	Source      string
 	Ref         string
-	SHA         string
+	SHA         string // aggregate, kept for back-compat with v0.5 lockfiles
 	InstalledAt string
 	Target      string
-	Files       []string
+	Files       []FileEntry
+}
+
+// FileEntry is one file tracked by an installed Package. Hash is the
+// SHA-256 of the file content at install time. Empty Hash indicates a
+// v0.5-migrated entry where per-file hashes weren't recorded; callers
+// should fall back to aggregate-SHA semantics for drift detection in
+// that case.
+type FileEntry struct {
+	Path string
+	Hash string
 }
 
 // Config is the user-controllable behavior knobs.

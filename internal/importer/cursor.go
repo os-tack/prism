@@ -427,6 +427,13 @@ func unionStrings(a, b []string) []string {
 
 // uniqueName returns base, or base-2, base-3, ... until exists(name) is
 // false. Used to deduplicate skill names within an importer's output.
+//
+// The 1000-iteration cap is intentionally cheap — it only matters in
+// pathological inputs (a thousand sibling skills sharing the same
+// base name), where collisions are the caller's problem to begin
+// with. On overflow we log to stderr and return the base name; the
+// resulting projection may have duplicate entries, but the log gives
+// the user a breadcrumb instead of silent corruption.
 func uniqueName(base string, exists func(string) bool) string {
 	if !exists(base) {
 		return base
@@ -437,6 +444,7 @@ func uniqueName(base string, exists func(string) bool) string {
 			return cand
 		}
 	}
+	fmt.Fprintf(os.Stderr, "importer/cursor: uniqueName cap (1000) hit for %q; collisions may occur\n", base)
 	return base
 }
 

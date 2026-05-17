@@ -31,36 +31,23 @@ func NewAgentsMD() *AgentsMDImporter { return &AgentsMDImporter{} }
 // Name returns "agents-md".
 func (i *AgentsMDImporter) Name() string { return "agents-md" }
 
-// Detect returns true if any AGENTS.md exists at root (top-level only —
-// nested-only setups still detect via the root walk during Import, but
-// activation via `--from agents-md` requires a discoverable marker).
+// Detect returns true when a discoverable AGENTS.md marker exists at the
+// project root. v0.6 makes this an O(1) stat check — earlier versions
+// walked the entire tree on every Detect call, which dominated
+// `agents init --from auto` runtime in large monorepos. Nested-only
+// layouts no longer activate via Detect; users with that shape must
+// pass `--from agents-md` explicitly. Import (below) still walks the
+// tree to gather nested AGENTS.md files once activated.
 func (i *AgentsMDImporter) Detect(root string) bool {
 	if fi, err := os.Stat(filepath.Join(root, "AGENTS.md")); err == nil && !fi.IsDir() {
 		return true
 	}
-	// Also detect if any nested AGENTS.md exists — some monorepo layouts
-	// keep only per-package AGENTS.md and no root one.
-	found := false
-	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if path != root {
-				if _, skip := skippedDirs[name]; skip {
-					return filepath.SkipDir
-				}
-			}
-			return nil
-		}
-		if d.Name() == "AGENTS.md" && filepath.Dir(path) != root {
-			found = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return found
+	// Common alternative location for monorepos that keep agent docs
+	// under .github/ alongside other meta files.
+	if fi, err := os.Stat(filepath.Join(root, ".github", "AGENTS.md")); err == nil && !fi.IsDir() {
+		return true
+	}
+	return false
 }
 
 // Import reads root and produces the canonical Project.

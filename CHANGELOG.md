@@ -4,6 +4,87 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.6.0
+
+### Added
+- **Windows path handling**: `Operation.Path` is now consistently
+  forward-slashed engine-side, so lockfile keys are portable across
+  macOS/Linux/Windows builds. Legacy backslash lockfiles from earlier
+  Windows runs are reconciled on read (no spurious "stale" deletes).
+- **Symlink fallback on Windows**: when `runtime.GOOS == "windows"`,
+  `OpSymlink` ops downgrade to `OpWrite` automatically (the symlink
+  target's bytes are read in and written). Windows users without
+  developer mode (where `os.Symlink` fails) now get a working content
+  copy instead of an apply error.
+- **Per-file SHA-256 hashes in `.agents/packages.yaml`**: `agents
+  remove` now precisely identifies which package files have been
+  manually edited and preserves only those, deleting the unchanged
+  ones. Backward-compatible: v0.5-installed packages (no per-file
+  hashes) fall back to the aggregate-SHA all-or-nothing semantics
+  with a clear warning.
+- **Importer round-trip tests**: new `internal/engine/roundtrip_test.go`
+  covers cursor / claude / continue / copilot end-to-end (stage source
+  tree → `engine.Init` → `engine.Compile` → assert original content
+  survives the canonical model). Gemini / cline / windsurf / agents-md
+  round-trips are TODO for v0.7.
+- **`--no-hook-wrappers` CLI flag**: the v0.5 CHANGELOG promised it;
+  v0.6 wires it through. Defaults to wrappers ON; pass `--no-hook-wrappers`
+  to skip generating Claude `__scope-guard__` wrappers and fall back to
+  raw source-script paths.
+
+### Changed
+- `importer.Registry.Register` returns an error on duplicate instead
+  of panicking. `plugin.Registry.Register` still panics (deferred to
+  v0.7 because of multiple call sites).
+- `agents remove` returns the drift error rather than calling
+  `os.Exit(1)` inside cobra `RunE`; cobra's exit pipeline handles the
+  non-zero exit, so deferred cleanup runs.
+- AGENTS.md importer `Detect` is now O(1): it stats `<root>/AGENTS.md`
+  and `<root>/.github/AGENTS.md` only, never walks the tree. `--from
+  auto` against monorepos no longer pays an O(tree) cost per importer.
+  Nested-only `<some/dir>/AGENTS.md` projects need explicit
+  `--from agents-md`.
+- `parseGitSource` rejects non-`github.com` URLs with a clear error
+  (`registry: only github.com URLs supported in v0.6`). v0.5 silently
+  mis-parsed gitlab group/subgroup paths.
+- `looksLikeRef` requires at least one a-f hex letter for 7-39 char
+  refs, so a numeric branch like `1234567` is no longer mis-classified
+  as a SHA. Full 40-char all-numeric strings still treat as SHA (rare,
+  indistinguishable).
+
+### Fixed
+- **`--no-hook-wrappers` propagation through cobra** (caught by v0.6
+  review): plugin registration was running before cobra parsed flags,
+  so the field was always false at runtime. Moved to lazy
+  registration via `cliState.ensureRegistry()` invoked from
+  per-subcommand RunE. Regression test (`TestNoHookWrappersFlag_ThroughExecute`)
+  drives the full Execute() path.
+- **`agents remove` aggregate SHA staleness on partial drift**:
+  when files are preserved (per-file Hash mismatch), the entry now
+  zeroes `pkg.SHA` so a future Remove of the narrowed set falls back
+  to per-file Hash checks rather than comparing against the original
+  install's aggregate.
+- **Symlink fallback no longer write-through-existing-symlink** on
+  Windows. If `abs` is an existing symlink (e.g. project synced from
+  a Unix prism install), the fallback now removes the link before
+  the OpWrite re-entry, so `os.WriteFile` doesn't follow it and
+  silently overwrite the canonical `.agents/` source.
+- `@include` recursive stack append explicitly copies the slice before
+  appending, avoiding backing-array aliasing if the slice's cap allowed
+  in-place mutation. Latent corruption that only the right depth/order
+  would have triggered.
+- `Package.Files` is now `[]FileEntry{Path, Hash}` (model change);
+  serializer and parser updated.
+- `uniqueName` (cursor importer) now logs to stderr on the 1000-cap
+  overflow instead of silently returning the base name.
+- Removed dead `var _ = errors.New` from cline importer + unused
+  `errors` import.
+
+### Test
+- Cross-compile to `GOOS=windows GOARCH=amd64` and `GOOS=linux GOARCH=arm64`
+  verified locally; release workflow already builds all five targets
+  on tag push.
+
 ## v0.5.0
 
 ### Added

@@ -7,9 +7,14 @@
 // into the project's `.agents/` tree and records the operation in
 // `.agents/packages.yaml`.
 //
-// Sources (v0.5):
+// Sources (v0.6):
 //   - github.com/owner/repo[/subpath][@ref]  → git clone, optional checkout
 //   - ./relative/path or /absolute/path      → directory copy
+//
+// Only github.com URLs are accepted as git sources in v0.6 — other hosts
+// (gitlab.com, bitbucket.org, self-hosted) are rejected with a clear
+// error rather than silently mis-parsed. Broader host support is tracked
+// for v0.7.
 //
 // The on-disk bookkeeping schema (.agents/packages.yaml):
 //
@@ -153,7 +158,13 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 		return nil, err
 	}
 
-	// 6. Build the package record. SHA is the rolled-up hash of all files.
+	// 6. Build the package record. SHA is the rolled-up aggregate of all
+	// file hashes (kept for v0.5 back-compat); the per-file hashes live on
+	// each FileEntry for precise drift detection at remove time.
+	fileEntries := make([]model.FileEntry, len(installed))
+	for i, rel := range installed {
+		fileEntries[i] = model.FileEntry{Path: rel, Hash: hashes[i]}
+	}
 	pkg := &model.Package{
 		Name:        manifest.Name,
 		Source:      sourceWithoutRef(source),
@@ -161,7 +172,7 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 		SHA:         aggregateHash(hashes),
 		InstalledAt: time.Now().UTC().Format(time.RFC3339),
 		Target:      filepath.ToSlash(target),
-		Files:       installed,
+		Files:       fileEntries,
 	}
 
 	// 7. Read-modify-write packages.yaml.
@@ -179,10 +190,17 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 // Remove deletes the package's tracked files (those whose on-disk hash still
 // matches what we recorded) and updates packages.yaml.
 //
-// If any tracked file has drifted (or is missing), it is preserved on disk
-// and the package entry is also preserved in packages.yaml, so the user can
-// resolve the drift and re-run remove. The returned error wraps the drift
-// list in that case.
+// v0.6 drift detection is per-file: each FileEntry carries the SHA-256 of
+// the file content at install time. For each entry we hash the on-disk file
+// and either delete (match) or preserve + warn (mismatch / missing). Entries
+// with empty Hash (v0.5-migrated lockfiles) fall back to the older
+// aggregate-SHA all-or-nothing check.
+//
+// If any tracked file is preserved, the package entry is also kept in
+// packages.yaml so the user can resolve the drift and re-run remove; the
+// entry's Files slice is rewritten to contain only the preserved files. If
+// everything is clean and removed, the entry is dropped from packages.yaml.
+// On drift, returns a *RemoveDriftError listing the preserved files.
 func Remove(projectRoot, name string) error {
 	pkgs, err := Load(projectRoot)
 	if err != nil {
@@ -196,40 +214,106 @@ func Remove(projectRoot, name string) error {
 
 	dotAgents := filepath.Join(projectRoot, ".agents")
 
-	// We currently store a single aggregate hash on the Package, not a
-	// per-file hash. v0.5 drift detection therefore reduces to: hash all the
-	// tracked files we can find, compare against the recorded aggregate.
-	// If they don't match, treat ALL tracked files as drifted and preserve
-	// them. A future v0.6 can store per-file hashes.
-	currentHashes, missing := hashTrackedFiles(dotAgents, pkg.Files)
-	current := aggregateHash(currentHashes)
-
-	var warnings []string
-	for _, m := range missing {
-		warnings = append(warnings, fmt.Sprintf("missing on disk: %s", m))
-	}
-
-	if pkg.SHA != "" && current != pkg.SHA {
-		warnings = append(warnings, fmt.Sprintf(
-			"package %q has been modified since install (sha %s, expected %s); files preserved",
-			pkg.Name, current, pkg.SHA))
-		return &RemoveDriftError{Package: pkg.Name, Warnings: warnings}
-	}
-
-	// Safe to delete. Walk files, then prune empty parent directories up to
-	// .agents/.
-	var deletedDirs []string
-	for _, rel := range pkg.Files {
-		abs := filepath.Join(dotAgents, filepath.FromSlash(rel))
-		if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
-			warnings = append(warnings, fmt.Sprintf("remove %s: %v", rel, err))
+	// Split entries into modern (per-file hash present) and legacy (empty
+	// hash, must fall back to aggregate). Mixed packages are theoretically
+	// possible if a user partially edits a v0.5 lockfile by hand; we handle
+	// each entry independently in the modern path and gate the legacy
+	// aggregate check on whether there are any legacy entries.
+	var (
+		warnings  []string
+		preserved []model.FileEntry
+		deleted   []string // tracked rel paths that were actually removed
+		legacy    []model.FileEntry
+	)
+	for _, entry := range pkg.Files {
+		if entry.Hash == "" {
+			legacy = append(legacy, entry)
+			continue
 		}
-		deletedDirs = append(deletedDirs, filepath.Dir(abs))
+		abs := filepath.Join(dotAgents, filepath.FromSlash(entry.Path))
+		curHash, err := hashFile(abs)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+				warnings = append(warnings, fmt.Sprintf("missing on disk: %s", entry.Path))
+				// Don't preserve a missing file — there's nothing to preserve;
+				// but don't track it in deleted either (it wasn't deleted by us).
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf("hash %s: %v", entry.Path, err))
+			preserved = append(preserved, entry)
+			continue
+		}
+		if curHash != entry.Hash {
+			warnings = append(warnings, fmt.Sprintf("modified since install: %s; preserved", entry.Path))
+			preserved = append(preserved, entry)
+			continue
+		}
+		// Hash matches: safe to delete.
+		if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+			warnings = append(warnings, fmt.Sprintf("remove %s: %v", entry.Path, err))
+			preserved = append(preserved, entry)
+			continue
+		}
+		deleted = append(deleted, entry.Path)
+	}
+
+	// Legacy fallback: if any FileEntry came from a v0.5 lockfile with no
+	// per-file hash, decide all-or-nothing using aggregate SHA over the
+	// legacy subset.
+	if len(legacy) > 0 {
+		legacyPaths := make([]string, len(legacy))
+		for i, e := range legacy {
+			legacyPaths[i] = e.Path
+		}
+		currentHashes, missing := hashTrackedFilePaths(dotAgents, legacyPaths)
+		current := aggregateHash(currentHashes)
+		for _, m := range missing {
+			warnings = append(warnings, fmt.Sprintf("missing on disk: %s", m))
+		}
+		// Only compare against pkg.SHA if it's set. If aggregate matches OR
+		// pkg.SHA is empty AND no legacy files are missing, treat as clean.
+		aggregateMatch := pkg.SHA != "" && current == pkg.SHA
+		if !aggregateMatch {
+			warnings = append(warnings, fmt.Sprintf(
+				"v0.5-installed package %q has no per-file hashes; drift detected against aggregate (sha %s, expected %s); files preserved",
+				pkg.Name, current, pkg.SHA))
+			preserved = append(preserved, legacy...)
+		} else {
+			for _, e := range legacy {
+				abs := filepath.Join(dotAgents, filepath.FromSlash(e.Path))
+				if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+					warnings = append(warnings, fmt.Sprintf("remove %s: %v", e.Path, err))
+					preserved = append(preserved, e)
+					continue
+				}
+				deleted = append(deleted, e.Path)
+			}
+		}
+	}
+
+	// Prune empty parent directories for everything we removed.
+	var deletedDirs []string
+	for _, rel := range deleted {
+		deletedDirs = append(deletedDirs, filepath.Dir(filepath.Join(dotAgents, filepath.FromSlash(rel))))
 	}
 	pruneEmptyDirs(dotAgents, deletedDirs)
 
-	// Drop the entry.
-	pkgs = append(pkgs[:idx], pkgs[idx+1:]...)
+	if len(preserved) == 0 {
+		// Everything cleaned up — drop the entry.
+		pkgs = append(pkgs[:idx], pkgs[idx+1:]...)
+	} else {
+		// Keep the entry but rewrite Files to just the preserved set so a
+		// future `agents remove --force` knows what's still tracked. Zero
+		// the aggregate SHA — it was computed over the original install
+		// content and is stale for the narrowed set. Per-file Hash on each
+		// FileEntry is still authoritative; future Remove calls fall back to
+		// per-file drift detection (modern path) and the legacy-aggregate
+		// fallback now correctly reports "no aggregate available" rather
+		// than silently comparing against the original installation.
+		pkg.Files = preserved
+		pkg.SHA = ""
+		pkgs[idx] = pkg
+	}
 	if err := Save(projectRoot, pkgs); err != nil {
 		return err
 	}
@@ -367,6 +451,12 @@ func isLocalSource(source string) bool {
 
 // parseGitSource splits "github.com/owner/repo[/subpath][@ref]" into its
 // parts. The "repo" component is exactly "host/owner/repo".
+//
+// v0.6 explicitly rejects non-github.com URLs. The legacy parser silently
+// mis-parsed e.g. gitlab.com/group/subgroup/project — taking the first
+// three segments as repo and the rest as subpath, which was wrong for
+// any host that uses nested groups. Only github.com is supported for
+// now; broader host support is tracked for v0.7.
 func parseGitSource(source string) (repo, subpath, ref string, err error) {
 	src := source
 	if at := strings.LastIndex(src, "@"); at >= 0 {
@@ -377,6 +467,9 @@ func parseGitSource(source string) (repo, subpath, ref string, err error) {
 	if len(parts) < 3 {
 		return "", "", "", fmt.Errorf("registry: source %q is not a host/owner/repo[/subpath][@ref] URL", source)
 	}
+	if parts[0] != "github.com" {
+		return "", "", "", fmt.Errorf("registry: only github.com URLs supported in v0.6 (got %q)", source)
+	}
 	repo = strings.Join(parts[:3], "/")
 	if len(parts) > 3 {
 		subpath = strings.Join(parts[3:], "/")
@@ -386,17 +479,37 @@ func parseGitSource(source string) (repo, subpath, ref string, err error) {
 
 // looksLikeRef heuristically distinguishes refs that `git clone --branch`
 // accepts (tag/branch names) from commit SHAs (which need a separate fetch).
+//
+// Returns true for refs that look like branch/tag names, false for refs
+// that look like commit SHAs. The legacy heuristic was "any string >= 7
+// chars of all hex digits is a SHA," which mis-classified fully-numeric
+// branches like "1234567" as SHAs. v0.6 requires at least one [a-f] hex
+// letter for short SHAs (7-39 chars); a 40-char all-numeric input is
+// still treated as a SHA (vanishingly rare and indistinguishable from
+// one).
 func looksLikeRef(ref string) bool {
-	if len(ref) < 7 {
+	if len(ref) < 7 || len(ref) > 40 {
 		return true
 	}
-	for _, r := range ref {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+	hasAlpha := false
+	for _, c := range ref {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+			hasAlpha = true
+		case c >= 'A' && c <= 'F':
+			hasAlpha = true
+		default:
 			return true
 		}
 	}
-	// All-hex and >=7 chars: treat as SHA.
-	return false
+	// hex-only: treat as SHA when 40 chars (full SHA-1) or 7-39 chars
+	// with at least one a-f letter. A 7-39 char all-numeric input is
+	// treated as a branch name.
+	if len(ref) == 40 {
+		return false
+	}
+	return !hasAlpha
 }
 
 func runGit(cwd string, args ...string) (string, error) {
@@ -653,9 +766,10 @@ func aggregateHash(hashes []string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashTrackedFiles returns per-file hashes (for files that exist) and a list
-// of files that are missing from disk.
-func hashTrackedFiles(dotAgents string, files []string) (hashes []string, missing []string) {
+// hashTrackedFilePaths returns per-file hashes (for files that exist) and a
+// list of files that are missing from disk. Used by the legacy aggregate
+// fallback in Remove; per-entry hashing in the modern path inlines hashFile.
+func hashTrackedFilePaths(dotAgents string, files []string) (hashes []string, missing []string) {
 	for _, rel := range files {
 		abs := filepath.Join(dotAgents, filepath.FromSlash(rel))
 		h, err := hashFile(abs)

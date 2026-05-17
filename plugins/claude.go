@@ -354,7 +354,7 @@ func buildOp(proj *model.Project, doc *model.Document, targetPath string, mode p
 			return plugin.Operation{}, err
 		}
 		op.Kind = plugin.OpSymlink
-		op.LinkTarget = linkTarget
+		op.LinkTarget = filepath.ToSlash(linkTarget)
 	} else {
 		op.Kind = plugin.OpWrite
 		op.Content = doc.Body
@@ -394,7 +394,7 @@ func buildScriptOp(proj *model.Project, scriptPath, skillDir string, mode plugin
 			return plugin.Operation{}, err
 		}
 		op.Kind = plugin.OpSymlink
-		op.LinkTarget = linkTarget
+		op.LinkTarget = filepath.ToSlash(linkTarget)
 	} else {
 		// In write mode we still emit a symlink — engine may downgrade later.
 		// We don't read the script bytes here because plugins are pure.
@@ -404,7 +404,7 @@ func buildScriptOp(proj *model.Project, scriptPath, skillDir string, mode plugin
 		if err != nil {
 			return plugin.Operation{}, err
 		}
-		op.LinkTarget = linkTarget
+		op.LinkTarget = filepath.ToSlash(linkTarget)
 	}
 
 	return op, nil
