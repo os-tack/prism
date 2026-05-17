@@ -162,8 +162,7 @@ func applyOne(root string, op plugin.Operation, dryRun bool) (bool, error) {
 		}
 		return true, nil
 
-	case plugin.OpWrite, plugin.OpMerge:
-		// Compare existing content using the diff hash to detect unchanged.
+	case plugin.OpWrite:
 		data, err := os.ReadFile(abs)
 		if err == nil && diff.HashBytes(data) == diff.HashContent(op.Content) {
 			return false, nil
@@ -179,6 +178,43 @@ func applyOne(root string, op plugin.Operation, dryRun bool) (bool, error) {
 		}
 		mode := fileMode(op)
 		if err := os.WriteFile(abs, []byte(op.Content), mode); err != nil {
+			return false, fmt.Errorf("apply: write %s: %w", abs, err)
+		}
+		return true, nil
+
+	case plugin.OpMerge:
+		// The engine reads, the plugin merges. When op.Merger is set the
+		// plugin computes the merged content here (with no Plan-time disk
+		// I/O); when nil we fall back to trusting op.Content for backward
+		// compatibility with pre-Merger callers.
+		existing, rerr := os.ReadFile(abs)
+		if rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			return false, fmt.Errorf("apply: read %s: %w", abs, rerr)
+		}
+		if rerr != nil {
+			existing = nil
+		}
+		var merged string
+		if op.Merger != nil {
+			m, mErr := op.Merger(existing)
+			if mErr != nil {
+				return false, fmt.Errorf("apply: merger %s: %w", abs, mErr)
+			}
+			merged = m
+		} else {
+			merged = op.Content
+		}
+		if diff.HashBytes(existing) == diff.HashContent(merged) {
+			return false, nil
+		}
+		if dryRun {
+			return true, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return false, fmt.Errorf("apply: mkdir %s: %w", filepath.Dir(abs), err)
+		}
+		mode := fileMode(op)
+		if err := os.WriteFile(abs, []byte(merged), mode); err != nil {
 			return false, fmt.Errorf("apply: write %s: %w", abs, err)
 		}
 		return true, nil

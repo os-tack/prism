@@ -134,7 +134,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 				Heuristic:  "missing applyTo frontmatter; imported as a skill (no target known)",
 				Severity:   "warn",
 			})
-			skillName := uniqueName(slugifyName(baseName), skillExists)
+			skillName := uniqueName("copilot", slugifyName(baseName), skillExists)
 			if skillName == "" {
 				skillName = "instructions"
 			}
@@ -149,7 +149,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 		default:
 			switch classifyGlobs(applyTo) {
 			case globKindExtension:
-				skillName := uniqueName(slugifyName(baseName), skillExists)
+				skillName := uniqueName("copilot", slugifyName(baseName), skillExists)
 				if skillName == "" {
 					skillName = "instructions"
 				}
@@ -171,7 +171,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 						Heuristic:  "applyTo path glob had no common directory prefix; imported as a skill",
 						Severity:   "info",
 					})
-					skillName := uniqueName(slugifyName(baseName), skillExists)
+					skillName := uniqueName("copilot", slugifyName(baseName), skillExists)
 					if skillName == "" {
 						skillName = "instructions"
 					}
@@ -247,7 +247,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 		if cmdName == "" {
 			cmdName = "prompt"
 		}
-		cmdName = uniqueName(cmdName, commandExists)
+		cmdName = uniqueName("copilot", cmdName, commandExists)
 		proj.Commands = append(proj.Commands, &model.Command{
 			Name:        cmdName,
 			Description: description,

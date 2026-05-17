@@ -225,3 +225,27 @@ func hasGeneratedHeader(data []byte) bool {
 	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	return generatedHeaderRE.Match(data)
 }
+
+// uniqueName returns base, or base-2, base-3, ... until exists(name) is
+// false. Used to deduplicate skill names within an importer's output.
+//
+// The 1000-iteration cap is intentionally cheap — it only matters in
+// pathological inputs (a thousand sibling skills sharing the same
+// base name), where collisions are the caller's problem to begin
+// with. On overflow we log to stderr (tagged with caller for the
+// breadcrumb) and return the base name; the resulting projection may
+// have duplicate entries, but the log gives the user a breadcrumb
+// instead of silent corruption.
+func uniqueName(caller, base string, exists func(string) bool) string {
+	if !exists(base) {
+		return base
+	}
+	for n := 2; n < 1000; n++ {
+		cand := fmt.Sprintf("%s-%d", base, n)
+		if !exists(cand) {
+			return cand
+		}
+	}
+	fmt.Fprintf(os.Stderr, "importer/%s: uniqueName cap (1000) hit for %q; collisions may occur\n", caller, base)
+	return base
+}

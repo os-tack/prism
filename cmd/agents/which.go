@@ -17,7 +17,10 @@ func newWhichCmd(state *cliState) *cobra.Command {
 		// We manage our own exit codes here.
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := state.options(nil, true, true)
+			opts, err := state.options(nil, true, true)
+			if err != nil {
+				return err
+			}
 			sources, err := engine.Which(opts, args[0])
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "error:", err)

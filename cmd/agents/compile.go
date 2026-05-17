@@ -19,7 +19,10 @@ func newCompileCmd(state *cliState) *cobra.Command {
 		Short: "Compile .agents/ into per-tool projections",
 		Long:  "Parse .agents/, run all enabled plugins, and apply the resulting operations to the filesystem.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := state.options(splitTargets(rawTargets), dryRun, quiet)
+			opts, err := state.options(splitTargets(rawTargets), dryRun, quiet)
+			if err != nil {
+				return err
+			}
 			rep, err := engine.Compile(opts)
 			if err != nil {
 				return err

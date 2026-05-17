@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -304,9 +305,10 @@ func TestClaude_Hooks_SettingsMerge(t *testing.T) {
 		t.Errorf("settings op Mode = %q, want %q", settingsOp.Mode, plugin.ModeWrite)
 	}
 
+	mergedContent := mergeContent(t, root, settingsOp)
 	var merged map[string]any
-	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
-		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, settingsOp.Content)
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
+		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, mergedContent)
 	}
 
 	// User key preserved.
@@ -379,8 +381,9 @@ func TestClaude_Permissions_SettingsMerge(t *testing.T) {
 		t.Fatalf("missing settings.json op; got: %+v", ops)
 	}
 
+	mergedContent := mergeContent(t, root, settingsOp)
 	var merged map[string]any
-	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	perms, ok := merged["permissions"].(map[string]any)
@@ -683,9 +686,10 @@ func TestClaude_ScopedHook_Wrapper(t *testing.T) {
 	if settingsOp == nil {
 		t.Fatalf("missing settings.json op")
 	}
+	mergedContent := mergeContent(t, root, settingsOp)
 	var merged map[string]any
-	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
-		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, settingsOp.Content)
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
+		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, mergedContent)
 	}
 	hooks, _ := merged["hooks"].(map[string]any)
 	pre, _ := hooks["PreToolUse"].([]any)
@@ -738,8 +742,9 @@ func TestClaude_ScopedPermissions_Merge(t *testing.T) {
 		t.Fatalf("missing settings.json op; got: %+v", ops)
 	}
 
+	mergedContent := mergeContent(t, root, settingsOp)
 	var merged map[string]any
-	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	perms, _ := merged["permissions"].(map[string]any)
@@ -886,4 +891,27 @@ func TestClaude_NoCollision(t *testing.T) {
 	if len(ordersOp.Sources) == 0 || ordersOp.Sources[0] != wantOrdersSrc {
 		t.Errorf("orders skill Sources = %v, want first entry %q", ordersOp.Sources, wantOrdersSrc)
 	}
+}
+
+// mergeContent invokes op.Merger with the current contents of root/op.Path
+// (or nil if absent), returning the merged bytes. Falls back to op.Content
+// when Merger is unset. Test-only helper for OpMerge inspection.
+func mergeContent(t *testing.T, root string, op *plugin.Operation) string {
+	t.Helper()
+	abs := filepath.Join(root, op.Path)
+	existing, err := os.ReadFile(abs)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read existing %s: %v", abs, err)
+	}
+	if err != nil {
+		existing = nil
+	}
+	if op.Merger == nil {
+		return op.Content
+	}
+	out, mErr := op.Merger(existing)
+	if mErr != nil {
+		t.Fatalf("merger %s: %v", abs, mErr)
+	}
+	return out
 }

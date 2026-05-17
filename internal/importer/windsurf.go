@@ -120,7 +120,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 					Heuristic:  "trigger=glob but no globs frontmatter; imported as a skill",
 					Severity:   "warn",
 				})
-				skillName := uniqueName(slugifyName(baseName), skillExists)
+				skillName := uniqueName("windsurf", slugifyName(baseName), skillExists)
 				if skillName == "" {
 					skillName = "rule"
 				}
@@ -137,7 +137,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 			}
 			switch classifyGlobs(globs) {
 			case globKindExtension:
-				skillName := uniqueName(slugifyName(baseName), skillExists)
+				skillName := uniqueName("windsurf", slugifyName(baseName), skillExists)
 				if skillName == "" {
 					skillName = "rule"
 				}
@@ -160,7 +160,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 						Heuristic:  "trigger=glob with no common directory prefix; imported as a skill",
 						Severity:   "info",
 					})
-					skillName := uniqueName(slugifyName(baseName), skillExists)
+					skillName := uniqueName("windsurf", slugifyName(baseName), skillExists)
 					if skillName == "" {
 						skillName = "rule"
 					}
@@ -199,7 +199,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 			if skillName == "" {
 				skillName = "rule"
 			}
-			skillName = uniqueName(skillName, skillExists)
+			skillName = uniqueName("windsurf", skillName, skillExists)
 			proj.Skills = append(proj.Skills, &model.Skill{
 				Name:        skillName,
 				Description: description,
@@ -216,7 +216,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 			if cmdName == "" {
 				cmdName = "command"
 			}
-			cmdName = uniqueName(cmdName, commandExists)
+			cmdName = uniqueName("windsurf", cmdName, commandExists)
 			proj.Commands = append(proj.Commands, &model.Command{
 				Name:        cmdName,
 				Description: description,
@@ -239,7 +239,7 @@ func (w *WindsurfImporter) Import(root string) (*model.Project, []Warning, error
 			if skillName == "" {
 				skillName = "rule"
 			}
-			skillName = uniqueName(skillName, skillExists)
+			skillName = uniqueName("windsurf", skillName, skillExists)
 			proj.Skills = append(proj.Skills, &model.Skill{
 				Name:        skillName,
 				Description: description,

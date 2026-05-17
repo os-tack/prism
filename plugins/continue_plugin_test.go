@@ -50,7 +50,7 @@ func TestContinue_RootContext(t *testing.T) {
 	if !strings.Contains(op.Content, "alwaysApply: true") {
 		t.Errorf("content missing alwaysApply: true\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "description: Project-wide context") {
+	if !strings.Contains(op.Content, "description: \"Project-wide context\"") {
 		t.Errorf("content missing description\n---\n%s", op.Content)
 	}
 	if !strings.Contains(op.Content, "global continue context") {
@@ -90,7 +90,7 @@ func TestContinue_Scope(t *testing.T) {
 	if op.Path != ".continue/rules/src-billing.md" {
 		t.Errorf("path = %q, want .continue/rules/src-billing.md", op.Path)
 	}
-	if !strings.Contains(op.Content, "description: Stripe webhook context") {
+	if !strings.Contains(op.Content, "description: \"Stripe webhook context\"") {
 		t.Errorf("missing description\n---\n%s", op.Content)
 	}
 	if !strings.Contains(op.Content, `globs: ["src/billing/**"]`) {
@@ -136,7 +136,7 @@ func TestContinue_Skill(t *testing.T) {
 	if op.Path != ".continue/rules/skill-pdf-editing.md" {
 		t.Errorf("path = %q, want .continue/rules/skill-pdf-editing.md", op.Path)
 	}
-	if !strings.Contains(op.Content, "description: Edit PDF content programmatically") {
+	if !strings.Contains(op.Content, "description: \"Edit PDF content programmatically\"") {
 		t.Errorf("missing description\n---\n%s", op.Content)
 	}
 	if !strings.Contains(op.Content, `globs: ["**/*.pdf"]`) {
@@ -577,4 +577,179 @@ func TestContinue_ScopedHook_Warning(t *testing.T) {
 	if !found {
 		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
 	}
+}
+
+// TestContinue_PermsGuard_GlobalNoHooks verifies that a global Permissions
+// block with no hooks projects a sidecar policy + a bare gate wrapper
+// under .continue/hooks/__perms-guard__/.
+func TestContinue_PermsGuard_GlobalNoHooks(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "x",
+		},
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	paths := map[string]plugin.Operation{}
+	for _, op := range ops {
+		paths[op.Path] = op
+	}
+	wantPolicy := filepath.Join(".continue", "hooks", "__perms-guard__", "policy.json")
+	wantGate := filepath.Join(".continue", "hooks", "__perms-guard__", "global-gate.sh")
+	if _, ok := paths[wantPolicy]; !ok {
+		t.Fatalf("missing policy at %q; have: %v", wantPolicy, opsPaths(ops))
+	}
+	if _, ok := paths[wantGate]; !ok {
+		t.Fatalf("missing gate at %q; have: %v", wantGate, opsPaths(ops))
+	}
+	if !strings.Contains(paths[wantPolicy].Content, `"bash:rm -rf *"`) {
+		t.Errorf("policy content missing deny:\n%s", paths[wantPolicy].Content)
+	}
+	if !strings.Contains(paths[wantGate].Content, "prism perms-guard") {
+		t.Errorf("gate doesn't exec perms-guard:\n%s", paths[wantGate].Content)
+	}
+}
+
+// TestContinue_PermsGuard_ScopedWithHook verifies scoped permissions +
+// scoped hook produces a scoped sidecar + wrapper that wires the source
+// script to the scope's policy.
+func TestContinue_PermsGuard_ScopedWithHook(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/fake/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{ScopePath: "src/billing", Deny: []string{"bash:rm *"}},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	paths := map[string]plugin.Operation{}
+	for _, op := range ops {
+		paths[op.Path] = op
+	}
+	wantPolicy := filepath.Join(".continue", "hooks", "__perms-guard__", "src-billing.policy.json")
+	wantWrapper := filepath.Join(".continue", "hooks", "__perms-guard__", "src-billing-PreToolUse-audit.sh")
+	if _, ok := paths[wantPolicy]; !ok {
+		t.Fatalf("missing scoped policy at %q; have: %v", wantPolicy, opsPaths(ops))
+	}
+	wrapperOp, ok := paths[wantWrapper]
+	if !ok {
+		t.Fatalf("missing scoped wrapper at %q; have: %v", wantWrapper, opsPaths(ops))
+	}
+	if !strings.Contains(wrapperOp.Content, "src-billing.policy.json") {
+		t.Errorf("wrapper missing scoped-policy reference:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "audit.sh") {
+		t.Errorf("wrapper missing source script:\n%s", wrapperOp.Content)
+	}
+	if wrapperOp.FileMode != 0o755 {
+		t.Errorf("wrapper FileMode = %o, want 0755", wrapperOp.FileMode)
+	}
+}
+
+// TestContinue_PermsGuard_DisableHookWrappers verifies the disable knob
+// suppresses wrapper + policy emission entirely.
+func TestContinue_PermsGuard_DisableHookWrappers(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+		},
+	}
+	p := &ContinuePlugin{DisableHookWrappers: true}
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("unexpected perms-guard artifact with DisableHookWrappers=true: %s", op.Path)
+		}
+	}
+}
+
+// TestContinue_PermsGuard_CapabilityNative verifies the matrix entry.
+func TestContinue_PermsGuard_CapabilityNative(t *testing.T) {
+	p := NewContinue()
+	if got := p.Capabilities().Permissions; got != plugin.SupportNative {
+		t.Errorf("Capabilities().Permissions = %v, want SupportNative", got)
+	}
+}
+
+func TestContinue_Skill_DescriptionWithColon_YAMLValid(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "Deploy Skill",
+				Description: "Ship a release: cuts a tag, builds artifacts, publishes",
+				Globs:       []string{"deploy/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/skills/deploy/SKILL.md",
+					Body:       "steps",
+				},
+			},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) == 0 {
+		t.Fatalf("expected at least 1 op")
+	}
+	var skillOp *plugin.Operation
+	for i := range ops {
+		if strings.HasSuffix(ops[i].Path, "skill-deploy-skill.md") {
+			skillOp = &ops[i]
+			break
+		}
+	}
+	if skillOp == nil {
+		t.Fatalf("skill op not found among ops; paths: %v", opPaths(ops))
+	}
+	parts := strings.SplitN(skillOp.Content, "---\n", 3)
+	if len(parts) < 3 {
+		t.Fatalf("frontmatter delimiters missing in:\n%s", skillOp.Content)
+	}
+	var fm struct {
+		Description string   `yaml:"description"`
+		Globs       []string `yaml:"globs"`
+	}
+	if err := yaml.Unmarshal([]byte(parts[1]), &fm); err != nil {
+		t.Fatalf("frontmatter is not valid YAML (the v0.7 colon-in-description bug): %v\n---\n%s", err, parts[1])
+	}
+	if fm.Description != "Ship a release: cuts a tag, builds artifacts, publishes" {
+		t.Errorf("description = %q after YAML round-trip, want full string", fm.Description)
+	}
+}
+
+func opPaths(ops []plugin.Operation) []string {
+	out := make([]string, len(ops))
+	for i, o := range ops {
+		out[i] = o.Path
+	}
+	return out
 }

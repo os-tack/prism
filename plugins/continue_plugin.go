@@ -35,7 +35,12 @@ import (
 
 // ContinuePlugin projects Project state into `.continue/rules/*.md` and
 // `.continue/mcpServers/*.yaml` files.
-type ContinuePlugin struct{}
+type ContinuePlugin struct {
+	// DisableHookWrappers, when true, suppresses the perms-guard wrapper
+	// script + sidecar policy emission used to enforce prism permissions.
+	// Default false (wrappers ON). Mirrors ClaudePlugin.DisableHookWrappers.
+	DisableHookWrappers bool
+}
 
 // NewContinue constructs a ContinuePlugin.
 //
@@ -72,7 +77,7 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 		Commands:      plugin.SupportDegraded,
 		Agents:        plugin.SupportUnsupported,
 		Hooks:         plugin.SupportUnsupported,
-		Permissions:   plugin.SupportUnsupported,
+		Permissions:   plugin.SupportNative, // via prism perms-guard wrapper + sidecar policy
 		MCP:           plugin.SupportNative,
 	}
 }
@@ -260,28 +265,16 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Severity: "info",
 		})
 	}
-	if proj.Permissions != nil {
-		if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
-			warnings = append(warnings, plugin.Warning{
-				Source:   "",
-				Message:  "Continue has no permissions primitive; permissions not projected",
-				Severity: "info",
-			})
-		}
+	// Permissions (global + scoped) project via prism perms-guard wrappers.
+	// Each non-empty Permissions block becomes a sidecar JSON policy plus
+	// either per-hook wrappers (when hooks exist) or a bare gate wrapper.
+	// The CHANGELOG documents the on-disk layout and JSON policy schema.
+	wrapperOps, wrapperWarnings, err := emitPermsGuardWrappers(p.Name(), proj, p.DisableHookWrappers)
+	if err != nil {
+		return nil, err
 	}
-	for _, sp := range proj.ScopedPermissions {
-		if sp == nil {
-			continue
-		}
-		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
-			continue
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "",
-			Message:  fmt.Sprintf("Continue has no permissions primitive; scoped permissions (scope: %s) not projected", sp.ScopePath),
-			Severity: "info",
-		})
-	}
+	ops = append(ops, wrapperOps...)
+	warnings = append(warnings, wrapperWarnings...)
 
 	// MCP servers → one .continue/mcpServers/<slug>.yaml per server.
 	// Scoped MCP servers project to the same global file set with an info
@@ -390,8 +383,12 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 	var b strings.Builder
 	b.WriteString("---\n")
 	if description != "" {
+		raw, err := json.Marshal(description)
+		if err != nil {
+			raw = []byte("\"\"")
+		}
 		b.WriteString("description: ")
-		b.WriteString(description)
+		b.Write(raw)
 		b.WriteString("\n")
 	}
 	if len(globs) > 0 {

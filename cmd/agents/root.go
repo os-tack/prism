@@ -30,16 +30,26 @@ type cliState struct {
 //
 // Discovered during v0.6 review — the symptom was a silently-dead
 // --no-hook-wrappers flag.
-func (s *cliState) ensureRegistry() {
+//
+// Returns an error if plugin registration fails (currently only possible
+// on a duplicate-name programming error from registerPlugins; the static
+// production list is collision-free).
+func (s *cliState) ensureRegistry() error {
 	if s.registry != nil {
-		return
+		return nil
 	}
-	s.registry = plugin.NewRegistry()
-	registerPlugins(s.registry, s.noHookWrappers)
+	reg := plugin.NewRegistry()
+	if err := registerPlugins(reg, s.noHookWrappers); err != nil {
+		return err
+	}
+	s.registry = reg
+	return nil
 }
 
-func (s *cliState) options(targets []string, dryRun, quiet bool) engine.Options {
-	s.ensureRegistry()
+func (s *cliState) options(targets []string, dryRun, quiet bool) (engine.Options, error) {
+	if err := s.ensureRegistry(); err != nil {
+		return engine.Options{}, err
+	}
 	global := ""
 	if !s.noGlobal {
 		global = s.globalRoot
@@ -51,7 +61,7 @@ func (s *cliState) options(targets []string, dryRun, quiet bool) engine.Options 
 		Targets:    targets,
 		DryRun:     dryRun,
 		Quiet:      quiet,
-	}
+	}, nil
 }
 
 func newRootCmd() *cobra.Command {
@@ -91,6 +101,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newWatchCmd(state))
 	root.AddCommand(newCapabilitiesCmd(state))
 	root.AddCommand(newScopeGuardCmd())
+	root.AddCommand(newPermsGuardCmd())
 	root.AddCommand(newAddCmd(state))
 	root.AddCommand(newRemoveCmd(state))
 	root.AddCommand(newListCmd(state))

@@ -327,67 +327,59 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	return ops, nil
 }
 
-// buildMCPOp constructs the OpMerge operation for `.cursor/mcp.json`. It
-// reads any existing file at <root>/.cursor/mcp.json, decodes it as a
-// generic JSON object, and overlays the `mcpServers` key with the contents
-// of proj.MCP. All other top-level keys in the existing file are preserved.
+// buildMCPOp emits the OpMerge for `.cursor/mcp.json`. The engine reads the
+// existing file and hands the bytes to the Merger closure; Plan() touches
+// nothing on disk. The merger overlays the `mcpServers` key built from
+// proj.MCP onto whatever top-level structure already exists.
 func (p *CursorPlugin) buildMCPOp(proj *model.Project) (plugin.Operation, error) {
-	// Existing file — parse if present, else start from {}.
-	existing := map[string]any{}
-	if proj.Root != "" {
-		raw, err := os.ReadFile(filepath.Join(proj.Root, ".cursor", "mcp.json"))
-		if err == nil {
-			if jerr := json.Unmarshal(raw, &existing); jerr != nil {
-				return plugin.Operation{}, fmt.Errorf("cursor: parse existing .cursor/mcp.json: %w", jerr)
+	merger := func(existingBytes []byte) (string, error) {
+		existing := map[string]any{}
+		if len(existingBytes) > 0 {
+			if jerr := json.Unmarshal(existingBytes, &existing); jerr != nil {
+				return "", fmt.Errorf("cursor: parse existing .cursor/mcp.json: %w", jerr)
 			}
-		} else if !os.IsNotExist(err) {
-			return plugin.Operation{}, fmt.Errorf("cursor: read existing .cursor/mcp.json: %w", err)
 		}
-	}
 
-	// Build mcpServers map from proj.MCP. Emit only non-empty fields.
-	servers := map[string]any{}
-	for _, srv := range proj.MCP {
-		if srv == nil || srv.Name == "" {
-			continue
-		}
-		entry := map[string]any{}
-		if srv.Command != "" {
-			entry["command"] = srv.Command
-		}
-		if len(srv.Args) > 0 {
-			entry["args"] = srv.Args
-		}
-		if len(srv.Env) > 0 {
-			// Sort env keys for deterministic output.
-			env := map[string]string{}
-			for k, v := range srv.Env {
-				env[k] = v
+		servers := map[string]any{}
+		for _, srv := range proj.MCP {
+			if srv == nil || srv.Name == "" {
+				continue
 			}
-			entry["env"] = env
+			entry := map[string]any{}
+			if srv.Command != "" {
+				entry["command"] = srv.Command
+			}
+			if len(srv.Args) > 0 {
+				entry["args"] = srv.Args
+			}
+			if len(srv.Env) > 0 {
+				env := map[string]string{}
+				for k, v := range srv.Env {
+					env[k] = v
+				}
+				entry["env"] = env
+			}
+			if srv.URL != "" {
+				entry["url"] = srv.URL
+			}
+			servers[srv.Name] = entry
 		}
-		if srv.URL != "" {
-			entry["url"] = srv.URL
-		}
-		servers[srv.Name] = entry
-	}
-	existing["mcpServers"] = servers
+		existing["mcpServers"] = servers
 
-	// Marshal with stable key ordering. encoding/json sorts map keys
-	// alphabetically by default, so this is already deterministic, but we
-	// pretty-print for human readability.
-	content, err := marshalJSONStable(existing)
-	if err != nil {
-		return plugin.Operation{}, fmt.Errorf("cursor: marshal .cursor/mcp.json: %w", err)
+		content, err := marshalJSONStable(existing)
+		if err != nil {
+			return "", fmt.Errorf("cursor: marshal .cursor/mcp.json: %w", err)
+		}
+		return content, nil
 	}
 
 	return plugin.Operation{
 		Kind:    plugin.OpMerge,
 		Path:    ".cursor/mcp.json",
-		Content: content,
 		Mode:    plugin.ModeWrite,
 		Plugin:  p.Name(),
 		Sources: []string{"mcp.yaml"},
+		Merger:  merger,
 	}, nil
 }
 

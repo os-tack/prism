@@ -25,6 +25,12 @@ type Options struct {
 	DryRun bool
 	// Quiet suppresses non-error output.
 	Quiet bool
+	// Interactive enables interactive filtering of imported items during
+	// `agents init --from <tool>`. When true, initProject prompts the user
+	// to include/exclude each top-level item (skill, command, scope, etc.)
+	// before serializing. Meaningless without --from; ignored when no
+	// importer runs. Requires a TTY on stdin; initProject errors otherwise.
+	Interactive bool
 }
 
 // Report summarizes the result of an operation.

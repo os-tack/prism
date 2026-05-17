@@ -60,8 +60,8 @@ func TestRun_AutoDetect(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "b.md", Content: "b"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 	proj := newProject()
 
 	ops, _, err := Run(proj, reg, nil)
@@ -91,8 +91,8 @@ func TestRun_ExplicitTargets(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "b.md", Content: "b"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 	proj := newProject()
 
 	ops, _, err := Run(proj, reg, []string{"alpha"})
@@ -117,7 +117,7 @@ func TestRun_ExplicitTargetBypassesDetect(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "a.md", Content: "a"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
+	_ = reg.Register(a)
 	proj := newProject()
 
 	ops, _, err := Run(proj, reg, []string{"alpha"})
@@ -139,7 +139,7 @@ func TestRun_Disabled(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "a.md", Content: "a"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
+	_ = reg.Register(a)
 	proj := newProject()
 	proj.Config.TargetOptions["alpha"] = model.TargetOption{Disabled: true}
 
@@ -167,8 +167,8 @@ func TestRun_ConflictDetection(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "shared.md", Content: "from-b"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 	proj := newProject()
 
 	_, _, err := Run(proj, reg, nil)
@@ -196,8 +196,8 @@ func TestRun_NoConflictDifferentPaths(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "b.md", Content: "b"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 	proj := newProject()
 
 	ops, _, err := Run(proj, reg, nil)
@@ -221,7 +221,7 @@ func TestRun_DeterministicOrder(t *testing.T) {
 	// Run multiple times, assert ordering is stable.
 	mkRegistry := func() *plugin.Registry {
 		r := plugin.NewRegistry()
-		r.Register(&mockPlugin{
+		_ = r.Register(&mockPlugin{
 			name:   "zeta",
 			detect: true,
 			ops: []plugin.Operation{
@@ -229,7 +229,7 @@ func TestRun_DeterministicOrder(t *testing.T) {
 				{Kind: plugin.OpWrite, Path: "z1.md", Content: "z1"},
 			},
 		})
-		r.Register(&mockPlugin{
+		_ = r.Register(&mockPlugin{
 			name:   "alpha",
 			detect: true,
 			ops: []plugin.Operation{
@@ -237,7 +237,7 @@ func TestRun_DeterministicOrder(t *testing.T) {
 				{Kind: plugin.OpWrite, Path: "a1.md", Content: "a1"},
 			},
 		})
-		r.Register(&mockPlugin{
+		_ = r.Register(&mockPlugin{
 			name:   "mid",
 			detect: true,
 			ops: []plugin.Operation{
@@ -296,7 +296,7 @@ func TestRun_PassesTargetOption(t *testing.T) {
 		ops:    []plugin.Operation{{Kind: plugin.OpWrite, Path: "a.md", Content: "a"}},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
+	_ = reg.Register(a)
 	proj := newProject()
 	proj.Config.TargetOptions["alpha"] = model.TargetOption{Mode: "symlink", Disabled: false}
 
@@ -342,8 +342,8 @@ func TestRun_AggregatesWarnings(t *testing.T) {
 		},
 	}
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 	proj := newProject()
 
 	_, warnings, err := Run(proj, reg, nil)

@@ -17,7 +17,13 @@ import (
 // (MCP servers under mcpServers). Gemini CLI has no native primitive for
 // skills, slash-commands, sub-agents, hooks, or permissions; those degrade
 // to warnings.
-type GeminiPlugin struct{}
+type GeminiPlugin struct {
+	// DisableHookWrappers, when true, suppresses the perms-guard wrapper
+	// script + sidecar policy emission used to enforce prism permissions
+	// for plugins that lack a native permissions primitive. Default false
+	// (wrappers ON). Mirrors ClaudePlugin.DisableHookWrappers.
+	DisableHookWrappers bool
+}
 
 // NewGemini returns a fresh GeminiPlugin.
 func NewGemini() *GeminiPlugin {
@@ -51,7 +57,7 @@ func (p *GeminiPlugin) Capabilities() plugin.Capabilities {
 		Commands:      plugin.SupportUnsupported,
 		Agents:        plugin.SupportUnsupported,
 		Hooks:         plugin.SupportUnsupported,
-		Permissions:   plugin.SupportUnsupported,
+		Permissions:   plugin.SupportNative, // via prism perms-guard wrapper + sidecar policy
 		MCP:           plugin.SupportNative,
 	}
 }
@@ -174,26 +180,17 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Severity: "info",
 		})
 	}
-	if proj.Permissions != nil && (len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0) {
-		warnings = append(warnings, plugin.Warning{
-			Source:   "permissions.yaml",
-			Message:  "Gemini has no permissions primitive; permissions not projected.",
-			Severity: "info",
-		})
+	// Permissions (global + scoped) project via prism perms-guard wrappers.
+	// Each non-empty Permissions block becomes a sidecar JSON policy plus
+	// either per-hook wrappers (when hooks exist) or a bare gate wrapper
+	// the user can wire into their tool's pipeline. The CHANGELOG documents
+	// the on-disk layout and the JSON policy schema.
+	wrapperOps, wrapperWarnings, err := emitPermsGuardWrappers(p.Name(), proj, p.DisableHookWrappers)
+	if err != nil {
+		return nil, err
 	}
-	for _, sp := range proj.ScopedPermissions {
-		if sp == nil {
-			continue
-		}
-		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
-			continue
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   filepath.Join(sp.ScopePath, "permissions.yaml"),
-			Message:  fmt.Sprintf("Gemini has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
-			Severity: "info",
-		})
-	}
+	ops = append(ops, wrapperOps...)
+	warnings = append(warnings, wrapperWarnings...)
 	for _, srv := range proj.MCP {
 		if srv == nil || srv.Name == "" || srv.ScopePath == "" {
 			continue
@@ -275,53 +272,54 @@ type geminiMCPServerJSON struct {
 	URL     string            `json:"url,omitempty"`
 }
 
-// buildGeminiSettingsOp merges proj.MCP into any existing
-// .gemini/settings.json at proj.Root, preserving unrelated keys.
+// buildGeminiSettingsOp emits the OpMerge for .gemini/settings.json. The
+// engine reads the existing file and passes its bytes to the Merger; Plan()
+// does not touch disk.
 func buildGeminiSettingsOp(proj *model.Project) (plugin.Operation, error) {
-	settingsPath := filepath.Join(proj.Root, ".gemini", "settings.json")
+	relPath := filepath.Join(".gemini", "settings.json")
 
-	settings := map[string]any{}
-	if data, err := os.ReadFile(settingsPath); err == nil && len(data) > 0 {
-		if err := json.Unmarshal(data, &settings); err != nil {
-			return plugin.Operation{}, fmt.Errorf("gemini: parsing existing %s: %w", settingsPath, err)
+	merger := func(existing []byte) (string, error) {
+		settings := map[string]any{}
+		if len(existing) > 0 {
+			if err := json.Unmarshal(existing, &settings); err != nil {
+				return "", fmt.Errorf("gemini: parsing existing %s: %w", relPath, err)
+			}
 		}
-	}
 
-	servers, _ := settings["mcpServers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
+		servers, _ := settings["mcpServers"].(map[string]any)
+		if servers == nil {
+			servers = map[string]any{}
+		}
+		for _, srv := range proj.MCP {
+			if srv == nil || srv.Name == "" {
+				continue
+			}
+			entry := geminiMCPServerJSON{
+				Command: srv.Command,
+				Args:    srv.Args,
+				Env:     srv.Env,
+			}
+			if srv.Command == "" && srv.URL != "" {
+				entry.URL = srv.URL
+			}
+			servers[srv.Name] = entry
+		}
+		settings["mcpServers"] = servers
 
-	for _, srv := range proj.MCP {
-		if srv == nil || srv.Name == "" {
-			continue
+		content, err := json.MarshalIndent(settings, "", "  ")
+		if err != nil {
+			return "", err
 		}
-		entry := geminiMCPServerJSON{
-			Command: srv.Command,
-			Args:    srv.Args,
-			Env:     srv.Env,
-		}
-		// Only set URL when there's no command — keeps the JSON minimal
-		// and matches the "only non-empty fields" rule.
-		if srv.Command == "" && srv.URL != "" {
-			entry.URL = srv.URL
-		}
-		servers[srv.Name] = entry
-	}
-	settings["mcpServers"] = servers
-
-	content, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return plugin.Operation{}, err
+		return string(content) + "\n", nil
 	}
 
 	return plugin.Operation{
 		Kind:    plugin.OpMerge,
-		Path:    filepath.Join(".gemini", "settings.json"),
-		Content: string(content) + "\n",
+		Path:    relPath,
 		Mode:    plugin.ModeWrite,
 		Sources: []string{"mcp.yaml"},
 		Plugin:  "gemini",
+		Merger:  merger,
 	}, nil
 }
 

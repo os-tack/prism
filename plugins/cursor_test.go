@@ -513,9 +513,10 @@ func TestCursor_MCP(t *testing.T) {
 
 	// Content must parse to JSON containing experimental=true AND
 	// mcpServers with both new servers.
+	mergedContent := mergeContent(t, root, mcpOp)
 	var out map[string]any
-	if err := json.Unmarshal([]byte(mcpOp.Content), &out); err != nil {
-		t.Fatalf("mcp op content does not parse as JSON: %v\n---\n%s", err, mcpOp.Content)
+	if err := json.Unmarshal([]byte(mergedContent), &out); err != nil {
+		t.Fatalf("mcp op content does not parse as JSON: %v\n---\n%s", err, mergedContent)
 	}
 	if exp, ok := out["experimental"].(bool); !ok || !exp {
 		t.Errorf("expected experimental=true preserved; got %v", out["experimental"])
@@ -577,13 +578,14 @@ func TestCursor_MCP_NoExisting(t *testing.T) {
 	if mcpOp == nil {
 		t.Fatalf("no mcp op")
 	}
+	mergedContent := mergeContent(t, root, mcpOp)
 	var out map[string]any
-	if err := json.Unmarshal([]byte(mcpOp.Content), &out); err != nil {
+	if err := json.Unmarshal([]byte(mergedContent), &out); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	servers, _ := out["mcpServers"].(map[string]any)
 	if _, ok := servers["linear"]; !ok {
-		t.Errorf("expected linear in output: %s", mcpOp.Content)
+		t.Errorf("expected linear in output: %s", mergedContent)
 	}
 }
 

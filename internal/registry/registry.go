@@ -70,6 +70,10 @@ type InstallOptions struct {
 	// Yes auto-confirms any interactive prompts. The registry itself is
 	// non-interactive; this is a CLI hint plumbed through for completeness.
 	Yes bool
+	// Registry controls central-registry index resolution for bare-name
+	// sources (e.g. "billing-skills"). Zero value uses the default registry
+	// URL with normal cache TTL.
+	Registry RegistryOptions
 }
 
 // Install installs a package from `source` into projectRoot.
@@ -87,8 +91,15 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 		return nil, fmt.Errorf("%w: %s", ErrNoAgentsDir, filepath.Join(projectRoot, ".agents"))
 	}
 
-	// 1. Materialize source onto local disk.
-	pkgRoot, cleanup, err := materializeSource(source, opts.Ref)
+	// 1. Resolve bare-name sources via the central registry index, then
+	// materialize source onto local disk. The resolved git source is
+	// recorded in packages.yaml (rather than the bare name) so reinstalls
+	// remain reproducible if the registry index later changes.
+	resolvedSource, resolvedRefOverride, err := resolveSource(source, opts.Ref, opts.Registry)
+	if err != nil {
+		return nil, err
+	}
+	pkgRoot, cleanup, err := materializeSource(resolvedSource, resolvedRefOverride)
 	if err != nil {
 		return nil, err
 	}
@@ -104,13 +115,13 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 	if manifest == nil {
 		synthesized = true
 		manifest = &Manifest{
-			Name:     defaultPackageName(source),
+			Name:     defaultPackageName(resolvedSource),
 			Schema:   SupportedSchemas[0],
 			Contents: []string{"."},
 		}
 	}
 	if manifest.Name == "" {
-		manifest.Name = defaultPackageName(source)
+		manifest.Name = defaultPackageName(resolvedSource)
 	}
 	if err := manifest.Validate(); err != nil {
 		return nil, err
@@ -167,8 +178,8 @@ func Install(projectRoot, source string, opts InstallOptions) (*model.Package, e
 	}
 	pkg := &model.Package{
 		Name:        manifest.Name,
-		Source:      sourceWithoutRef(source),
-		Ref:         resolvedRef(source, opts.Ref),
+		Source:      sourceWithoutRef(resolvedSource),
+		Ref:         resolvedRef(resolvedSource, resolvedRefOverride),
 		SHA:         aggregateHash(hashes),
 		InstalledAt: time.Now().UTC().Format(time.RFC3339),
 		Target:      filepath.ToSlash(target),

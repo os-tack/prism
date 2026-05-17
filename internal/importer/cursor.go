@@ -178,7 +178,7 @@ func (i *CursorImporter) addSkill(proj *model.Project, mdcBase, description, bod
 		name = "rule"
 	}
 	// Detect duplicate names — if the same slug already exists, suffix it.
-	name = uniqueName(name, func(candidate string) bool {
+	name = uniqueName("cursor", name, func(candidate string) bool {
 		for _, sk := range proj.Skills {
 			if sk.Name == candidate {
 				return true
@@ -423,29 +423,6 @@ func unionStrings(a, b []string) []string {
 		out = append(out, s)
 	}
 	return out
-}
-
-// uniqueName returns base, or base-2, base-3, ... until exists(name) is
-// false. Used to deduplicate skill names within an importer's output.
-//
-// The 1000-iteration cap is intentionally cheap — it only matters in
-// pathological inputs (a thousand sibling skills sharing the same
-// base name), where collisions are the caller's problem to begin
-// with. On overflow we log to stderr and return the base name; the
-// resulting projection may have duplicate entries, but the log gives
-// the user a breadcrumb instead of silent corruption.
-func uniqueName(base string, exists func(string) bool) string {
-	if !exists(base) {
-		return base
-	}
-	for n := 2; n < 1000; n++ {
-		cand := fmt.Sprintf("%s-%d", base, n)
-		if !exists(cand) {
-			return cand
-		}
-	}
-	fmt.Fprintf(os.Stderr, "importer/cursor: uniqueName cap (1000) hit for %q; collisions may occur\n", base)
-	return base
 }
 
 // relTo returns path relative to root for use in user-facing warnings.

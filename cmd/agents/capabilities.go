@@ -33,7 +33,9 @@ func newCapabilitiesCmd(state *cliState) *cobra.Command {
 		Short: "Show the capability matrix for every registered plugin",
 		Long:  "Print a matrix of how each plugin supports each canonical capability (native / degraded / unsupported). Does not touch the filesystem.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			state.ensureRegistry()
+			if err := state.ensureRegistry(); err != nil {
+				return err
+			}
 			plugins := state.registry.All()
 
 			if target != "" {

@@ -351,8 +351,12 @@ func renderWindsurfRule(fm windsurfFrontmatter, body string) string {
 		b.WriteString("\n")
 	}
 	if fm.Description != "" {
+		raw, err := json.Marshal(fm.Description)
+		if err != nil {
+			raw = []byte("\"\"")
+		}
 		b.WriteString("description: ")
-		b.WriteString(fm.Description)
+		b.Write(raw)
 		b.WriteString("\n")
 	}
 	b.WriteString("---\n")

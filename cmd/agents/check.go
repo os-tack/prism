@@ -20,16 +20,19 @@ func newCheckCmd(state *cliState) *cobra.Command {
 		// default error path, which would always return 2.
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := state.options(splitTargets(rawTargets), true, false)
-			rep, err := engine.Check(opts)
+			opts, err := state.options(splitTargets(rawTargets), true, false)
+			if err != nil {
+				return err
+			}
+			rep, runErr := engine.Check(opts)
 			out := cmd.OutOrStdout()
 
-			if err != nil && !errors.Is(err, engine.ErrDrift) {
-				fmt.Fprintln(os.Stderr, "error:", err)
+			if runErr != nil && !errors.Is(runErr, engine.ErrDrift) {
+				fmt.Fprintln(os.Stderr, "error:", runErr)
 				os.Exit(2)
 			}
 
-			if errors.Is(err, engine.ErrDrift) {
+			if errors.Is(runErr, engine.ErrDrift) {
 				fmt.Fprintln(out, "Drift detected. The following changes would be applied:")
 				if rep != nil {
 					for _, op := range rep.Operations {

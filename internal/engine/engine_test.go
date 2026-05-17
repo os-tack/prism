@@ -50,9 +50,9 @@ func setupFixture(t *testing.T) string {
 func newOptions(t *testing.T, root string) engine.Options {
 	t.Helper()
 	reg := plugin.NewRegistry()
-	reg.Register(plugins.NewClaude())
-	reg.Register(plugins.NewCursor())
-	reg.Register(plugins.NewAgentsMD())
+	_ = reg.Register(plugins.NewClaude())
+	_ = reg.Register(plugins.NewCursor())
+	_ = reg.Register(plugins.NewAgentsMD())
 	return engine.Options{
 		Root:     root,
 		Registry: reg,

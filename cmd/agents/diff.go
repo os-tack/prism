@@ -15,7 +15,10 @@ func newDiffCmd(state *cliState) *cobra.Command {
 		Short: "Show what compile would change without writing",
 		Long:  "Like `compile --dry-run`, but exits 0 regardless of drift.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := state.options(splitTargets(rawTargets), true, false)
+			opts, err := state.options(splitTargets(rawTargets), true, false)
+			if err != nil {
+				return err
+			}
 			rep, err := engine.Diff(opts)
 			if err != nil {
 				return err

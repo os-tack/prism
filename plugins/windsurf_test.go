@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"agents.dev/agents/internal/model"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestWindsurf_RootContext(t *testing.T) {
@@ -80,7 +82,7 @@ func TestWindsurf_Scope(t *testing.T) {
 	if !strings.Contains(sc.Content, `globs: ["src/billing/**"]`) {
 		t.Errorf("scope op content missing globs\n---\n%s", sc.Content)
 	}
-	if !strings.Contains(sc.Content, "description: Stripe webhook context") {
+	if !strings.Contains(sc.Content, "description: \"Stripe webhook context\"") {
 		t.Errorf("scope op content missing description\n---\n%s", sc.Content)
 	}
 	if !strings.Contains(sc.Content, "billing context") {
@@ -125,7 +127,7 @@ func TestWindsurf_Skill_WithGlobs(t *testing.T) {
 	if !strings.Contains(op.Content, `globs: ["src/billing/**","tests/billing/**"]`) {
 		t.Errorf("skill op content missing globs\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "description: Validate Stripe webhook signatures") {
+	if !strings.Contains(op.Content, "description: \"Validate Stripe webhook signatures\"") {
 		t.Errorf("skill op content missing description\n---\n%s", op.Content)
 	}
 	if !strings.Contains(op.Content, "validation steps") {
@@ -172,7 +174,7 @@ func TestWindsurf_Skill_NoGlobs(t *testing.T) {
 	if !strings.Contains(op.Content, "trigger: model_decision") {
 		t.Errorf("skill op content missing trigger: model_decision\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "description: Triggered when the user asks about purity") {
+	if !strings.Contains(op.Content, "description: \"Triggered when the user asks about purity\"") {
 		t.Errorf("skill op content missing description\n---\n%s", op.Content)
 	}
 	if strings.Contains(op.Content, "globs:") {
@@ -445,5 +447,45 @@ func TestWindsurf_ScopedHook_Warning(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
+	}
+}
+
+func TestWindsurf_Skill_DescriptionWithColon_YAMLValid(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Skills: []*model.Skill{
+			{
+				Name:        "Deploy Skill",
+				Description: "Ship a release: cuts a tag, builds artifacts, publishes",
+				Globs:       []string{"deploy/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/skills/deploy/SKILL.md",
+					Body:       "steps",
+				},
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	parts := strings.SplitN(ops[0].Content, "---\n", 3)
+	if len(parts) < 3 {
+		t.Fatalf("frontmatter delimiters missing in:\n%s", ops[0].Content)
+	}
+	var fm struct {
+		Trigger     string   `yaml:"trigger"`
+		Globs       []string `yaml:"globs"`
+		Description string   `yaml:"description"`
+	}
+	if err := yaml.Unmarshal([]byte(parts[1]), &fm); err != nil {
+		t.Fatalf("frontmatter is not valid YAML (the v0.7 colon-in-description bug): %v\n---\n%s", err, parts[1])
+	}
+	if fm.Description != "Ship a release: cuts a tag, builds artifacts, publishes" {
+		t.Errorf("description = %q after YAML round-trip, want full string", fm.Description)
 	}
 }

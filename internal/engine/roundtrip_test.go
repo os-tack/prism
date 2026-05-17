@@ -27,10 +27,10 @@ package engine_test
 //   - claude
 //   - continue
 //   - copilot
-//
-// TODO(v0.7): add round-trip coverage for gemini, cline, windsurf,
-// agents-md. They share the cursor/continue mapping patterns and so the
-// v0.6 set is the must-have; the rest are higher coverage but lower risk.
+//   - gemini
+//   - cline
+//   - windsurf
+//   - agents-md
 
 import (
 	"encoding/json"
@@ -231,7 +231,9 @@ func rtOptions(t *testing.T, root string, plugins ...plugin.Plugin) engine.Optio
 	t.Helper()
 	reg := plugin.NewRegistry()
 	for _, p := range plugins {
-		reg.Register(p)
+		if err := reg.Register(p); err != nil {
+			t.Fatalf("rtOptions: register %q: %v", p.Name(), err)
+		}
 	}
 	return engine.Options{Root: root, Registry: reg, Quiet: true}
 }
@@ -406,6 +408,8 @@ func TestRoundTrip_Claude(t *testing.T) {
 		".mcp.json": `{"mcpServers":{"linear":{"command":"npx","args":["@linear/mcp"]}}}`,
 	})
 
+	original := captureOriginal(t, root)
+
 	opts := rtOptions(t, root, plugins.NewClaude())
 	runRoundTrip(t, opts, "claude")
 
@@ -465,6 +469,22 @@ func TestRoundTrip_Claude(t *testing.T) {
 	if servers == nil || servers["linear"] == nil {
 		t.Errorf(".mcp.json mcpServers.linear missing after round-trip:\n%s", string(mcpData))
 	}
+
+	allOutputs := concatAllBodiesRecursive(t, root, []string{".", ".claude/skills", "src"}, []string{".md"})
+	for relPath, content := range original {
+		if !isMarkdownPath(relPath) {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("claude round-trip: original body of %s not present in any output:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
 }
 
 // slicesEqualSet reports whether a and b contain the same elements
@@ -522,6 +542,8 @@ func TestRoundTrip_Continue(t *testing.T) {
 			"args:\n  - \"@linear/mcp\"\n",
 	})
 
+	original := captureOriginal(t, root)
+
 	opts := rtOptions(t, root, plugins.NewContinue())
 	runRoundTrip(t, opts, "continue")
 
@@ -569,6 +591,22 @@ func TestRoundTrip_Continue(t *testing.T) {
 		t.Errorf("%s args = %v, want [@linear/mcp]\nfull:\n%s",
 			mcpPath, args, string(mcpData))
 	}
+
+	allOutputs := concatAllRuleBodies(t, root, ".continue/rules")
+	for relPath, content := range original {
+		if !strings.HasPrefix(relPath, ".continue/rules/") || !strings.HasSuffix(relPath, ".md") {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("continue round-trip: original body of %s not present in any output rule:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +641,8 @@ func TestRoundTrip_Copilot(t *testing.T) {
 			"Run gofmt, vet, and the unit tests before opening.\n",
 	})
 
+	original := captureOriginal(t, root)
+
 	opts := rtOptions(t, root, plugins.NewCopilot())
 	runRoundTrip(t, opts, "copilot")
 
@@ -633,5 +673,336 @@ func TestRoundTrip_Copilot(t *testing.T) {
 	if desc, _ := promptFM["description"].(string); !strings.Contains(desc, "Review checklist") {
 		t.Errorf("%s description = %q, want to contain %q",
 			promptPath, desc, "Review checklist")
+	}
+
+	allOutputs := concatAllBodiesRecursive(t, root, []string{".github"}, []string{".md"})
+	for relPath, content := range original {
+		if !isMarkdownPath(relPath) {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("copilot round-trip: original body of %s not present in any output:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
+}
+
+// concatAllBodiesRecursive walks each dir relative to root, reading every
+// file whose extension is in exts, and concatenates their bodies (after
+// frontmatter and provenance stripping). Used by round-trip tests where
+// output spans nested directories.
+func concatAllBodiesRecursive(t *testing.T, root string, dirs []string, exts []string) string {
+	t.Helper()
+	var b strings.Builder
+	seen := map[string]struct{}{}
+	matchExt := func(name string) bool {
+		for _, e := range exts {
+			if strings.HasSuffix(strings.ToLower(name), e) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dir := range dirs {
+		full := filepath.Join(root, dir)
+		err := filepath.Walk(full, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				if os.IsNotExist(walkErr) {
+					return nil
+				}
+				return walkErr
+			}
+			if info.IsDir() {
+				return nil
+			}
+			if !matchExt(info.Name()) {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if _, dup := seen[rel]; dup {
+				return nil
+			}
+			seen[rel] = struct{}{}
+			body := readBody(t, root, rel)
+			b.WriteString(body)
+			b.WriteString("\n")
+			return nil
+		})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("concatAllBodiesRecursive walk %s: %v", full, err)
+		}
+	}
+	return b.String()
+}
+
+// isMarkdownPath reports whether p has a .md, .mdc, or .markdown suffix
+// (case-insensitive). Used by sweep loops to skip JSON / YAML sources.
+func isMarkdownPath(p string) bool {
+	lower := strings.ToLower(p)
+	return strings.HasSuffix(lower, ".md") ||
+		strings.HasSuffix(lower, ".mdc") ||
+		strings.HasSuffix(lower, ".markdown")
+}
+
+// ---------------------------------------------------------------------------
+// Gemini round-trip
+// ---------------------------------------------------------------------------
+
+func TestRoundTrip_Gemini(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		"GEMINI.md":             "# Root\n\nUse the project-wide Go conventions.\n",
+		"src/billing/GEMINI.md": "# Billing\n\nValidate Stripe webhook signatures.\n",
+		".gemini/settings.json": `{
+  "mcpServers": {
+    "linear": {"command": "npx", "args": ["@linear/mcp"]}
+  },
+  "theme": "dark"
+}`,
+	})
+	original := captureOriginal(t, root)
+
+	opts := rtOptions(t, root, plugins.NewGemini())
+	runRoundTrip(t, opts, "gemini")
+
+	rootBody := readBody(t, root, "GEMINI.md")
+	assertBodyContains(t, "GEMINI.md", rootBody, "Use the project-wide Go conventions.")
+
+	billPath := "src/billing/GEMINI.md"
+	billBody := readBody(t, root, billPath)
+	assertBodyContains(t, billPath, billBody, "Validate Stripe webhook signatures.")
+
+	settingsData, err := os.ReadFile(filepath.Join(root, ".gemini", "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(settingsData, &settings); err != nil {
+		t.Fatalf("parse settings.json: %v", err)
+	}
+	servers, _ := settings["mcpServers"].(map[string]any)
+	if servers == nil || servers["linear"] == nil {
+		t.Errorf(".gemini/settings.json mcpServers.linear missing after round-trip:\n%s", string(settingsData))
+	}
+	if theme, _ := settings["theme"].(string); theme != "dark" {
+		t.Errorf(".gemini/settings.json theme = %q, want dark (unrelated keys must survive merge)", theme)
+	}
+
+	allOutputs := concatAllBodiesRecursive(t, root, []string{"."}, []string{".md"})
+	for relPath, content := range original {
+		if !isMarkdownPath(relPath) {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("gemini round-trip: original body of %s not present in any output:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cline round-trip
+// ---------------------------------------------------------------------------
+
+func TestRoundTrip_Cline(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	writeFiles(t, root, map[string]string{
+		".clinerules/00-overview.md": "Project-wide Go conventions: gofmt, error wrapping with %w.\n",
+		".clinerules/10-scope-src-billing.md": "---\n" +
+			"paths:\n  - src/billing/**\n" +
+			"---\n" +
+			"Validate Stripe webhook signatures before processing.\n",
+		".clinerules/20-skill-pdf.md": "---\n" +
+			"description: PDF editing helper\n" +
+			"---\n" +
+			"Use pdftk for PDF manipulation tasks.\n",
+		".clinerules/30-command-deploy.md": "---\n" +
+			"description: Ship a release\n" +
+			"---\n" +
+			"Run the release script with --confirm.\n",
+	})
+	original := captureOriginal(t, root)
+
+	opts := rtOptions(t, root, plugins.NewCline())
+	runRoundTrip(t, opts, "cline")
+
+	ctxBody := readBody(t, root, ".clinerules/00-context.md")
+	assertBodyContains(t, ".clinerules/00-context.md", ctxBody,
+		"Project-wide Go conventions: gofmt, error wrapping with %w.")
+
+	scopeOut := ".clinerules/10-scope-src-billing.md"
+	scopeBody := readBody(t, root, scopeOut)
+	assertBodyContains(t, scopeOut, scopeBody,
+		"Validate Stripe webhook signatures before processing.",
+		"When working in src/billing")
+
+	skillOut := ".clinerules/20-skill-pdf.md"
+	skillBody := readBody(t, root, skillOut)
+	assertBodyContains(t, skillOut, skillBody,
+		"Use pdftk for PDF manipulation tasks.",
+		"Skill: pdf")
+
+	cmdOut := ".clinerules/30-command-deploy.md"
+	cmdBody := readBody(t, root, cmdOut)
+	assertBodyContains(t, cmdOut, cmdBody,
+		"Run the release script with --confirm.",
+		"Command /deploy")
+
+	allOutputs := concatAllRuleBodies(t, root, ".clinerules")
+	for relPath, content := range original {
+		if !strings.HasPrefix(relPath, ".clinerules/") || !strings.HasSuffix(relPath, ".md") {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("cline round-trip: original body of %s not present in any output rule:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Windsurf round-trip
+// ---------------------------------------------------------------------------
+
+func TestRoundTrip_Windsurf(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		".windsurf/rules/always.md": "---\n" +
+			"trigger: always_on\n" +
+			"---\n" +
+			"Project-wide Go conventions: gofmt, error wrapping with %w.\n",
+		".windsurf/rules/billing.md": "---\n" +
+			"trigger: glob\n" +
+			"globs:\n  - src/billing/**\n" +
+			"description: Stripe webhook rules\n" +
+			"---\n" +
+			"Validate Stripe webhook signatures before processing.\n",
+		".windsurf/rules/pdf-skill.md": "---\n" +
+			"trigger: glob\n" +
+			"globs:\n  - '**/*.pdf'\n" +
+			"description: PDF editing\n" +
+			"---\n" +
+			"Use pdftk for PDF manipulation tasks.\n",
+	})
+	original := captureOriginal(t, root)
+
+	opts := rtOptions(t, root, plugins.NewWindsurf())
+	runRoundTrip(t, opts, "windsurf")
+
+	rootBody := readBody(t, root, ".windsurf/rules/_root.md")
+	assertBodyContains(t, ".windsurf/rules/_root.md", rootBody,
+		"Project-wide Go conventions: gofmt, error wrapping with %w.")
+	rootFM := readFrontmatter(t, root, ".windsurf/rules/_root.md")
+	if trig, _ := rootFM["trigger"].(string); trig != "always_on" {
+		t.Errorf("_root.md trigger = %q, want always_on", trig)
+	}
+
+	billOut := ".windsurf/rules/src-billing.md"
+	billBody := readBody(t, root, billOut)
+	assertBodyContains(t, billOut, billBody,
+		"Validate Stripe webhook signatures before processing.")
+	billFM := readFrontmatter(t, root, billOut)
+	if trig, _ := billFM["trigger"].(string); trig != "glob" {
+		t.Errorf("%s trigger = %q, want glob", billOut, trig)
+	}
+	if globs := stringSliceFromAny(billFM["globs"]); len(globs) == 0 ||
+		!strings.HasPrefix(globs[0], "src/billing") {
+		t.Errorf("%s globs = %v, want to start with src/billing", billOut, globs)
+	}
+
+	pdfOut := ".windsurf/rules/skill-pdf-skill.md"
+	pdfBody := readBody(t, root, pdfOut)
+	assertBodyContains(t, pdfOut, pdfBody, "Use pdftk for PDF manipulation tasks.")
+	pdfFM := readFrontmatter(t, root, pdfOut)
+	if trig, _ := pdfFM["trigger"].(string); trig != "glob" {
+		t.Errorf("%s trigger = %q, want glob", pdfOut, trig)
+	}
+	if globs := stringSliceFromAny(pdfFM["globs"]); len(globs) == 0 || globs[0] != "**/*.pdf" {
+		t.Errorf("%s globs = %v, want [**/*.pdf]", pdfOut, globs)
+	}
+
+	allOutputs := concatAllRuleBodies(t, root, ".windsurf/rules")
+	for relPath, content := range original {
+		if !strings.HasPrefix(relPath, ".windsurf/rules/") || !strings.HasSuffix(relPath, ".md") {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("windsurf round-trip: original body of %s not present in any output rule:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AgentsMD round-trip
+// ---------------------------------------------------------------------------
+
+func TestRoundTrip_AgentsMD(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		"AGENTS.md":             "# Project conventions\n\nUse Go 1.25 idioms. Wrap errors with %w.\n",
+		"src/billing/AGENTS.md": "# Billing\n\nValidate Stripe webhook signatures before processing.\n",
+	})
+	original := captureOriginal(t, root)
+
+	opts := rtOptions(t, root, plugins.NewAgentsMD())
+	runRoundTrip(t, opts, "agents-md")
+
+	rootBody := readBody(t, root, "AGENTS.md")
+	assertBodyContains(t, "AGENTS.md", rootBody,
+		"Use Go 1.25 idioms.", "Wrap errors with %w.")
+	assertBodyContains(t, "AGENTS.md", rootBody,
+		"When working in src/billing",
+		"Validate Stripe webhook signatures before processing.")
+
+	rootRaw, err := os.ReadFile(filepath.Join(root, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(rootRaw)), "<!-- Generated by agents.") {
+		t.Errorf("AGENTS.md missing generated-by header (would risk re-import loops):\n%s", string(rootRaw))
+	}
+
+	allOutputs := readBody(t, root, "AGENTS.md")
+	for relPath, content := range original {
+		if !isMarkdownPath(relPath) {
+			continue
+		}
+		_, body, _ := splitFrontmatterTest([]byte(content))
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(body)) {
+			t.Errorf("agents-md round-trip: original body of %s not present in output AGENTS.md:\noriginal:\n%s\nall outputs:\n%s",
+				relPath, body, allOutputs)
+		}
 	}
 }

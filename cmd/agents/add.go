@@ -14,12 +14,15 @@ import (
 
 func newAddCmd(state *cliState) *cobra.Command {
 	var (
-		ref    string
-		as     string
-		global bool
-		force  bool
-		yes    bool
-		dryRun bool
+		ref             string
+		as              string
+		global          bool
+		force           bool
+		yes             bool
+		dryRun          bool
+		registryURL     string
+		refreshRegistry bool
+		noFetch         bool
 	)
 
 	cmd := &cobra.Command{
@@ -49,6 +52,14 @@ and signature verification are intentionally out-of-scope.`,
 				Global: global,
 				Force:  force,
 				Yes:    yes,
+				Registry: registry.RegistryOptions{
+					URL:     registryURL,
+					Refresh: refreshRegistry,
+					NoFetch: noFetch,
+					Warnf: func(format string, args ...any) {
+						fmt.Fprintf(cmd.ErrOrStderr(), "warning: "+format+"\n", args...)
+					},
+				},
 			}
 
 			out := cmd.OutOrStdout()
@@ -98,6 +109,9 @@ and signature verification are intentionally out-of-scope.`,
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing installation")
 	cmd.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be installed without writing")
+	cmd.Flags().StringVar(&registryURL, "registry", "", "central registry index URL (overrides $PRISM_REGISTRY and the built-in default)")
+	cmd.Flags().BoolVar(&refreshRegistry, "refresh-registry", false, "force a fresh fetch of the central registry index instead of using the cache")
+	cmd.Flags().BoolVar(&noFetch, "no-fetch", false, "do not contact the network; use only the cached registry index")
 	return cmd
 }
 

@@ -16,9 +16,9 @@ func TestRun_HonorsConfigTargets(t *testing.T) {
 	c := &recordingPlugin{name: "c", detect: false}
 
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
-	reg.Register(c)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
+	_ = reg.Register(c)
 
 	proj := &model.Project{
 		Root: "/tmp/fake",
@@ -45,8 +45,8 @@ func TestRun_ExplicitTargetsOverrideConfig(t *testing.T) {
 	b := &recordingPlugin{name: "b", detect: true}
 
 	reg := plugin.NewRegistry()
-	reg.Register(a)
-	reg.Register(b)
+	_ = reg.Register(a)
+	_ = reg.Register(b)
 
 	proj := &model.Project{
 		Root: "/tmp/fake",

@@ -174,9 +174,10 @@ func TestGemini_MCP(t *testing.T) {
 		t.Errorf("settings op Kind = %q, want %q", settingsOp.Kind, plugin.OpMerge)
 	}
 
+	mergedContent := mergeContent(t, root, settingsOp)
 	var merged map[string]any
-	if err := json.Unmarshal([]byte(settingsOp.Content), &merged); err != nil {
-		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, settingsOp.Content)
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
+		t.Fatalf("unmarshal settings: %v\ncontent: %s", err, mergedContent)
 	}
 
 	// User key preserved.
@@ -454,7 +455,8 @@ func TestGemini_ScopedCommandAgentHookMCP(t *testing.T) {
 		{`scoped command "deploy"`, "command"},
 		{`scoped agent "reviewer"`, "agent"},
 		{`scoped hook PostToolUse:Edit`, "hook"},
-		{"scoped permissions", "perm"},
+		// Scoped permissions now project to a perms-guard wrapper (covered
+		// by TestGemini_PermsGuard_*) instead of emitting an info warning.
 		{`scoped MCP server "linear"`, "mcp"},
 	}
 	found := map[string]bool{}
@@ -474,5 +476,152 @@ func TestGemini_ScopedCommandAgentHookMCP(t *testing.T) {
 		if !found[m.kind] {
 			t.Errorf("missing %s scoped warning containing %q", m.kind, m.needle)
 		}
+	}
+}
+
+// TestGemini_PermsGuard_GlobalNoHooks verifies that a global Permissions
+// block with no hooks projects a sidecar policy + a bare gate wrapper
+// under .gemini/hooks/__perms-guard__/.
+func TestGemini_PermsGuard_GlobalNoHooks(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+			Ask:   []string{"bash:git *"},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	paths := map[string]plugin.Operation{}
+	for _, op := range ops {
+		paths[op.Path] = op
+	}
+	policyPath := filepath.Join(".gemini", "hooks", "__perms-guard__", "policy.json")
+	gatePath := filepath.Join(".gemini", "hooks", "__perms-guard__", "global-gate.sh")
+	policyOp, ok := paths[policyPath]
+	if !ok {
+		t.Fatalf("missing policy op at %q; have: %v", policyPath, opsPaths(ops))
+	}
+	if policyOp.Kind != plugin.OpWrite {
+		t.Errorf("policy Kind = %v, want OpWrite", policyOp.Kind)
+	}
+	if !strings.Contains(policyOp.Content, `"bash:ls *"`) {
+		t.Errorf("policy content missing Allow rule:\n%s", policyOp.Content)
+	}
+	if !strings.Contains(policyOp.Content, `"bash:rm -rf *"`) {
+		t.Errorf("policy content missing Deny rule:\n%s", policyOp.Content)
+	}
+	gateOp, ok := paths[gatePath]
+	if !ok {
+		t.Fatalf("missing gate wrapper at %q; have: %v", gatePath, opsPaths(ops))
+	}
+	if gateOp.FileMode != 0o755 {
+		t.Errorf("gate FileMode = %o, want 0755", gateOp.FileMode)
+	}
+	if !strings.Contains(gateOp.Content, "prism perms-guard") {
+		t.Errorf("gate script doesn't exec prism perms-guard:\n%s", gateOp.Content)
+	}
+	if !strings.Contains(gateOp.Content, "policy.json") {
+		t.Errorf("gate script doesn't reference policy path:\n%s", gateOp.Content)
+	}
+}
+
+// TestGemini_PermsGuard_ScopedWithHook verifies that a scoped permissions
+// block + a scoped hook produces a scoped sidecar and a wrapper that wires
+// the source script to the scope's policy.
+func TestGemini_PermsGuard_ScopedWithHook(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/fake/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{
+				ScopePath: "src/billing",
+				Deny:      []string{"bash:rm *"},
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	paths := map[string]plugin.Operation{}
+	for _, op := range ops {
+		paths[op.Path] = op
+	}
+	wantPolicy := filepath.Join(".gemini", "hooks", "__perms-guard__", "src-billing.policy.json")
+	wantWrapper := filepath.Join(".gemini", "hooks", "__perms-guard__", "src-billing-PreToolUse-audit.sh")
+	policyOp, ok := paths[wantPolicy]
+	if !ok {
+		t.Fatalf("missing scoped policy at %q; have: %v", wantPolicy, opsPaths(ops))
+	}
+	if !strings.Contains(policyOp.Content, `"bash:rm *"`) {
+		t.Errorf("scoped policy missing deny rule:\n%s", policyOp.Content)
+	}
+	wrapperOp, ok := paths[wantWrapper]
+	if !ok {
+		t.Fatalf("missing scoped wrapper at %q; have: %v", wantWrapper, opsPaths(ops))
+	}
+	if !strings.Contains(wrapperOp.Content, "src-billing.policy.json") {
+		t.Errorf("wrapper doesn't reference scoped policy:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "audit.sh") {
+		t.Errorf("wrapper doesn't reference source script:\n%s", wrapperOp.Content)
+	}
+}
+
+// TestGemini_PermsGuard_DisableHookWrappers verifies that setting
+// DisableHookWrappers suppresses wrapper + policy emission entirely.
+func TestGemini_PermsGuard_DisableHookWrappers(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "root",
+		},
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+		},
+	}
+	p := &GeminiPlugin{DisableHookWrappers: true}
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("unexpected perms-guard artifact with DisableHookWrappers=true: %s", op.Path)
+		}
+	}
+}
+
+// TestGemini_PermsGuard_CapabilityNative verifies the Capabilities matrix
+// reports Permissions as Native now that the wrapper provides enforcement.
+func TestGemini_PermsGuard_CapabilityNative(t *testing.T) {
+	p := NewGemini()
+	if got := p.Capabilities().Permissions; got != plugin.SupportNative {
+		t.Errorf("Capabilities().Permissions = %v, want SupportNative", got)
 	}
 }

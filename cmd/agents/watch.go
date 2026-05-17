@@ -15,7 +15,10 @@ func newWatchCmd(state *cliState) *cobra.Command {
 		Short: "Compile and watch .agents/ for changes",
 		Long:  "Run compile once, then watch .agents/ for changes and re-run on each change (debounced). Blocks until interrupted.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := state.options(splitTargets(rawTargets), false, false)
+			opts, err := state.options(splitTargets(rawTargets), false, false)
+			if err != nil {
+				return err
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Watching %s (Ctrl+C to exit)...\n", state.root)
 			// engine.Watch is responsible for installing signal handlers and
 			// returning cleanly on Ctrl+C; we just propagate its error.

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -53,6 +54,22 @@ func initProject(opts Options, importFrom string) error {
 			// project tree is still useful.
 			project.Context = &model.Document{Body: defaultContext}
 		}
+	}
+
+	if opts.Interactive && importFrom != "" {
+		if !stdinIsTTY() {
+			return ErrInteractiveNoTTY
+		}
+		in := bufio.NewReader(os.Stdin)
+		filtered, ferr := filterProjectInteractively(project, in, os.Stdout)
+		if ferr != nil {
+			if errors.Is(ferr, ErrInteractiveDeclinedAll) {
+				fmt.Fprintln(os.Stdout, "Interactive selection declined all items; nothing to write.")
+				return nil
+			}
+			return ferr
+		}
+		project = filtered
 	}
 
 	created, err := serializeProject(opts.Root, project)

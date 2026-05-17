@@ -5,6 +5,7 @@
 package plugin
 
 import (
+	"fmt"
 	"io/fs"
 
 	"agents.dev/agents/internal/model"
@@ -53,6 +54,13 @@ type Operation struct {
 	Plugin string
 	// Warnings are degradation notes attached to this Operation.
 	Warnings []Warning
+	// Merger, when non-nil and Kind == OpMerge, is called by the engine with
+	// the existing file's bytes (nil if the file doesn't exist) and returns
+	// the merged content the engine should write. Plugins setting Merger
+	// MUST NOT pre-read the target file in Plan() — that I/O belongs to the
+	// engine, which keeps Plan pure and testable. Content is ignored when
+	// Merger is set.
+	Merger func(existing []byte) (string, error)
 }
 
 // Warning is a degradation note from a plugin: something in the canonical
@@ -121,17 +129,17 @@ func NewRegistry() *Registry {
 	return &Registry{plugins: make(map[string]Plugin)}
 }
 
-// Register adds a plugin. Panics on duplicate name (programming error).
-//
-// TODO(v0.7): mirror importer.Registry.Register and return error instead of
-// panicking. Deferred for v0.6 because plugin.Registry.Register has many
-// call sites across internal/plan/plan_test.go and engine tests; threading
-// the error return is a larger refactor.
-func (r *Registry) Register(p Plugin) {
+// Register adds a plugin. Returns an error if a plugin with the same name is
+// already registered. Callers that build the registry statically typically
+// ignore the error with `_ =`; the error path exists so tests and callers
+// constructing the registry dynamically can detect duplicate registration
+// without panicking.
+func (r *Registry) Register(p Plugin) error {
 	if _, exists := r.plugins[p.Name()]; exists {
-		panic("plugin already registered: " + p.Name())
+		return fmt.Errorf("plugin: %q already registered", p.Name())
 	}
 	r.plugins[p.Name()] = p
+	return nil
 }
 
 // Get returns the plugin with the given name, or nil if absent.

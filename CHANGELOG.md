@@ -4,6 +4,143 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.7.0
+
+### Added
+- **Central registry resolution for `agents add`** (`internal/registry/index.go`,
+  `cmd/agents/add.go`): bare names like `agents add billing-skills` now
+  resolve through a JSON index instead of requiring a full
+  `host/owner/repo` URL. Default index URL is
+  `https://raw.githubusercontent.com/os-tack/prism-registry/main/index.json`;
+  override with `--registry <url>` or `PRISM_REGISTRY` env var. Cache lives
+  at `os.UserCacheDir() + "/prism/registry-index.json"` with a 24h TTL.
+  New flags: `--registry`, `--refresh-registry`, `--no-fetch`. Index shape:
+  ```json
+  {
+    "version": 1,
+    "packages": {
+      "billing-skills": {
+        "source": "github.com/os-tack/prism-pkg-billing-skills",
+        "default_ref": "v1.0.0",
+        "description": "Billing-domain skills bundle"
+      }
+    }
+  }
+  ```
+  The `prism-registry` repo is a v0.7+ deliverable; resolution layer ships
+  now with offline-friendly cache fallback and clear errors when the index
+  isn't reachable.
+- **`--interactive` / `-i` on `agents init`** (`internal/engine/interactive.go`,
+  `cmd/agents/init.go`): `agents init --from <tool> -i` prompts per-item
+  (skills, commands, scopes, MCP servers, agents) with `Y/n/a/d` (plus `s`
+  on scopes to skip the scope's children). EOF → accept-all. Non-TTY stdin
+  is refused loudly (`ErrInteractiveNoTTY`) rather than silently filtering
+  nothing in CI. Declining a scope cascades to its children — no "you
+  already said no" noise.
+- **Round-trip coverage for gemini, cline, windsurf, agents-md**
+  (`internal/engine/roundtrip_test.go`): the four importers deferred from
+  v0.6 are now end-to-end tested. Existing claude/continue/copilot tests
+  upgraded with the Cursor-style body-sweep pattern (loop over every
+  original body string, assert it appears somewhere in the post-compile
+  output) so silently-dropped content is caught.
+- **Permissions wrapper for Gemini and Continue** (`plugins/gemini.go`,
+  `plugins/continue_plugin.go`): both plugins now project
+  `model.Permissions` to a perms-guard wrapper + sidecar JSON policy
+  instead of just logging a warning. Capabilities matrix for both moved
+  `Permissions: SupportUnsupported` → `Permissions: SupportNative`.
+- **`prism perms-guard` hidden subcommand** (`cmd/agents/perms_guard.go`):
+  runtime enforcement called from the generated wrapper scripts. Reads
+  Claude-style hook JSON from stdin, derives `(tool_name, action)`,
+  consults the sidecar policy, and either exec's the underlying hook
+  (allow), exits non-zero (deny), or prompts on a TTY (ask).
+- **`internal/perms` package**: shared policy load/check used by
+  `perms-guard` and the projection plugins. JSON shape:
+  ```json
+  {
+    "allow": ["bash:ls *", "bash:cat *"],
+    "deny":  ["bash:rm -rf *", "bash:curl *"],
+    "ask":   ["bash:git *"]
+  }
+  ```
+  Each rule is `<tool>:<pattern>`. Tool match is case-insensitive. The
+  pattern supports exact match (`bash:ls`) and trailing-wildcard glob
+  (`bash:git *` matches any bash action beginning with `git `). Rules
+  with no colon are tool-only matchers. Deny dominates Allow, which
+  dominates Ask; no match returns the default (the wrapper allows).
+- **`DisableHookWrappers` on `GeminiPlugin` and `ContinuePlugin`**:
+  mirrors `ClaudePlugin.DisableHookWrappers`. The existing
+  `--no-hook-wrappers` CLI flag now suppresses perms-guard wrappers for
+  these plugins too.
+
+### Changed
+- **OpMerge contract** (`internal/plugin/plugin.go`, `internal/apply/apply.go`,
+  `plugins/claude.go`, `plugins/gemini.go`, `plugins/cursor.go`): plugins no
+  longer read existing files from disk inside `Plan()`. Instead,
+  `plugin.Operation` got a new `Merger func(existing []byte) (string, error)`
+  field; the engine reads the existing bytes (or nil if absent) and calls
+  the closure. The three plugins that previously violated purity in their
+  Plan() — claude `buildSettingsOp`, gemini `buildGeminiSettingsOp`, cursor
+  `buildMCPOp` — now use Merger closures. **Back-compat**: an `OpMerge` op
+  with `Merger == nil` still works (engine falls back to `op.Content`), so
+  third-party plugins built against the v0.6 contract keep working.
+  `compile.go` also calls Merger to materialize `op.Content` for lockfile
+  hashing, so Merger closures must be deterministic (given the same
+  `existing`, return the same bytes).
+- **`plugin.Registry.Register` returns an error** instead of panicking on
+  duplicate. Mirrors `importer.Registry.Register` (already error-returning
+  in v0.6). Cascades: `registerPlugins` in `cmd/agents/plugins.go`,
+  `cliState.ensureRegistry()`, and `cliState.options(...)` all now return
+  error. All subcommand `RunE` handlers propagate it. The TODO(v0.7) at
+  `internal/plugin/plugin.go:126` is removed.
+- **`uniqueName` extracted** from `internal/importer/cursor.go` into a new
+  `internal/importer/helpers.go` (4 importers were calling it across files).
+  Added a `caller string` parameter so the stderr cap-warning identifies
+  which importer hit it (cursor / copilot / windsurf / continue).
+
+### On-disk layout for permissions projection
+
+Wrapper scripts and sidecar JSON live under
+`.{plugin}/hooks/__perms-guard__/`:
+
+  - `policy.json` — global Permissions block
+  - `<scope-slug>.policy.json` — per-scope Permissions block
+  - `<event>-<basename>.sh` — wrapper per global hook
+  - `<scope-slug>-<event>-<basename>.sh` — wrapper per scoped hook
+  - `global-gate.sh` / `<scope-slug>-gate.sh` — bare gate when no hooks
+    exist; users can wire it into their tool's pipeline manually
+
+### Fixed
+- **Windsurf and Continue YAML colon bug** (`plugins/windsurf.go`,
+  `plugins/continue_plugin.go`): both plugins emitted raw unquoted YAML
+  scalars for skill/command descriptions, so any description containing a
+  colon (e.g., `Ship a release: cuts a tag`) produced invalid YAML. Both
+  renderers now `json.Marshal` the description before writing (a JSON-quoted
+  string is also a valid YAML flow scalar). Regression tests
+  (`TestWindsurf_Skill_DescriptionWithColon_YAMLValid`,
+  `TestContinue_Skill_DescriptionWithColon_YAMLValid`) lock the contract.
+- **`roundtrip_test.go` was dropping `Register` errors silently** (the only
+  bare `Register` call in the repo). Now uses the standard `if err :=
+  reg.Register(p); err != nil { t.Fatalf(...) }` pattern.
+
+### Known issues (deferred to v0.7.1)
+
+- **Dual Merger invocation** (`internal/engine/compile.go` + `internal/apply/apply.go`):
+  the engine reads existing bytes and runs `Merger` in both compile (to
+  materialize `op.Content` for lockfile hashing) and apply (the actual
+  write). Under concurrent edits between those two reads, the on-disk hash
+  and lockfile hash can disagree, producing a false-positive
+  "manual edits detected" loop on the next `agents compile`. Window is
+  microseconds in a one-shot compile; only a concern for `agents watch`.
+- **Wrapper scripts bake `proj.Root` absolute paths** into the generated
+  bash wrapper bodies (`plugins/perms_wrapper.go`, `plugins/claude.go`).
+  Moving the project root via `mv` / `rsync` / container mount leaves the
+  wrappers pointing at the old path. **Workaround:** rerun
+  `agents compile` after relocating the project.
+- **`agents diff` op ordering for gemini/continue perms wrappers is
+  non-deterministic** when only multiple scoped permissions exist
+  (`plugins/perms_wrapper.go` iterates a Go map). The lockfile is still
+  deterministic (keyed by Path); only the report output drifts.
+
 ## v0.6.0
 
 ### Added

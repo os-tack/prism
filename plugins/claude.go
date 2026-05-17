@@ -426,29 +426,13 @@ type hookGroup struct {
 	Hooks   []hookEntry `json:"hooks"`
 }
 
-// buildSettingsOp merges proj.Permissions, proj.ScopedPermissions, and
-// proj.Hooks into any existing .claude/settings.json at proj.Root. Scoped
-// hooks reference their generated wrapper script (passed in via
-// wrapperPaths) rather than the raw source script. Returns an OpMerge with
-// the fully merged content (plugin produces the final bytes; the engine's
-// OpMerge handler currently treats it as a write).
+// buildSettingsOp emits the OpMerge for .claude/settings.json. The op carries
+// a Merger closure that the engine invokes with the file's existing bytes;
+// Plan() itself does no filesystem I/O so plugin behavior is reproducible
+// from (proj, wrapperPaths) alone.
 func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, error) {
-	settingsPath := filepath.Join(proj.Root, ".claude", "settings.json")
-
-	// Start with whatever the user already has.
-	settings := map[string]any{}
-	if data, err := os.ReadFile(settingsPath); err == nil && len(data) > 0 {
-		if err := json.Unmarshal(data, &settings); err != nil {
-			return plugin.Operation{}, fmt.Errorf("claude: parsing existing %s: %w", settingsPath, err)
-		}
-	}
-
 	var warnings []plugin.Warning
 
-	// Merge permissions. Only overwrite the keys we own if our slices are
-	// non-empty; leave the user's value alone otherwise. Scoped permission
-	// sets are unioned into the global block (Claude Code has no native
-	// per-scope permissions) with one info warning per scoped source.
 	allow, deny, ask := []string{}, []string{}, []string{}
 	if proj.Permissions != nil {
 		allow = append(allow, proj.Permissions.Allow...)
@@ -468,85 +452,86 @@ func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (
 			Severity: "info",
 		})
 	}
-
 	allow = dedupeStrings(allow)
 	deny = dedupeStrings(deny)
 	ask = dedupeStrings(ask)
-	if len(allow) > 0 || len(deny) > 0 || len(ask) > 0 {
-		perms, _ := settings["permissions"].(map[string]any)
-		if perms == nil {
-			perms = map[string]any{}
+	buckets := map[string]map[string][]hookEntry{}
+	eventOrder := []string{}
+	for _, h := range proj.Hooks {
+		if h == nil || h.Event == "" {
+			continue
 		}
-		if len(allow) > 0 {
-			perms["allow"] = allow
+		if _, ok := buckets[h.Event]; !ok {
+			buckets[h.Event] = map[string][]hookEntry{}
+			eventOrder = append(eventOrder, h.Event)
 		}
-		if len(deny) > 0 {
-			perms["deny"] = deny
+		cmdPath := h.ScriptPath
+		if w, ok := wrapperPaths[h]; ok {
+			cmdPath = w
 		}
-		if len(ask) > 0 {
-			perms["ask"] = ask
+		buckets[h.Event][h.Matcher] = append(buckets[h.Event][h.Matcher], hookEntry{
+			Type:    "command",
+			Command: cmdPath,
+		})
+	}
+	relPath := filepath.Join(".claude", "settings.json")
+
+	merger := func(existing []byte) (string, error) {
+		settings := map[string]any{}
+		if len(existing) > 0 {
+			if err := json.Unmarshal(existing, &settings); err != nil {
+				return "", fmt.Errorf("claude: parsing existing %s: %w", relPath, err)
+			}
 		}
-		settings["permissions"] = perms
+
+		if len(allow) > 0 || len(deny) > 0 || len(ask) > 0 {
+			perms, _ := settings["permissions"].(map[string]any)
+			if perms == nil {
+				perms = map[string]any{}
+			}
+			if len(allow) > 0 {
+				perms["allow"] = allow
+			}
+			if len(deny) > 0 {
+				perms["deny"] = deny
+			}
+			if len(ask) > 0 {
+				perms["ask"] = ask
+			}
+			settings["permissions"] = perms
+		}
+
+		if len(proj.Hooks) > 0 {
+			hooksRoot, _ := settings["hooks"].(map[string]any)
+			if hooksRoot == nil {
+				hooksRoot = map[string]any{}
+			}
+			for _, event := range eventOrder {
+				matcherMap := buckets[event]
+				matchers := make([]string, 0, len(matcherMap))
+				for m := range matcherMap {
+					matchers = append(matchers, m)
+				}
+				sort.Strings(matchers)
+				var groups []hookGroup
+				for _, m := range matchers {
+					groups = append(groups, hookGroup{
+						Matcher: m,
+						Hooks:   matcherMap[m],
+					})
+				}
+				hooksRoot[event] = groups
+			}
+			settings["hooks"] = hooksRoot
+		}
+
+		content, err := json.MarshalIndent(settings, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(content) + "\n", nil
 	}
 
-	// Merge hooks: group by Event, then by Matcher within each event.
-	// Scoped hooks reference their wrapper script (via wrapperPaths) when
-	// the wrapper was generated; otherwise (DisableHookWrappers) they fall
-	// back to the raw source script path, same as global hooks.
-	if len(proj.Hooks) > 0 {
-		hooksRoot, _ := settings["hooks"].(map[string]any)
-		if hooksRoot == nil {
-			hooksRoot = map[string]any{}
-		}
-
-		// Bucket: event → matcher → []hookEntry
-		buckets := map[string]map[string][]hookEntry{}
-		eventOrder := []string{}
-		for _, h := range proj.Hooks {
-			if h == nil || h.Event == "" {
-				continue
-			}
-			if _, ok := buckets[h.Event]; !ok {
-				buckets[h.Event] = map[string][]hookEntry{}
-				eventOrder = append(eventOrder, h.Event)
-			}
-			cmdPath := h.ScriptPath
-			if w, ok := wrapperPaths[h]; ok {
-				cmdPath = w
-			}
-			buckets[h.Event][h.Matcher] = append(buckets[h.Event][h.Matcher], hookEntry{
-				Type:    "command",
-				Command: cmdPath,
-			})
-		}
-
-		for _, event := range eventOrder {
-			matcherMap := buckets[event]
-			// Stable order for matchers for deterministic output.
-			matchers := make([]string, 0, len(matcherMap))
-			for m := range matcherMap {
-				matchers = append(matchers, m)
-			}
-			sort.Strings(matchers)
-
-			var groups []hookGroup
-			for _, m := range matchers {
-				groups = append(groups, hookGroup{
-					Matcher: m,
-					Hooks:   matcherMap[m],
-				})
-			}
-			hooksRoot[event] = groups
-		}
-		settings["hooks"] = hooksRoot
-	}
-
-	content, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return plugin.Operation{}, err
-	}
-
-	// Synthesize sources from contributing inputs.
 	var sources []string
 	if proj.Permissions != nil {
 		sources = append(sources, "permissions.yaml")
@@ -563,12 +548,12 @@ func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (
 
 	return plugin.Operation{
 		Kind:     plugin.OpMerge,
-		Path:     filepath.Join(".claude", "settings.json"),
-		Content:  string(content) + "\n",
+		Path:     relPath,
 		Mode:     plugin.ModeWrite,
 		Sources:  sources,
 		Plugin:   "claude",
 		Warnings: warnings,
+		Merger:   merger,
 	}, nil
 }
 

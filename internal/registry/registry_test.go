@@ -722,6 +722,10 @@ func TestLooksLikeRef(t *testing.T) {
 		{"branch_too_long", strings.Repeat("a", 41), true},
 		{"uppercase_hex_sha", "ABCDEF1", false},
 		{"mixed_hex_with_alpha", "abc1234", false},
+		{"empty_string", "", true},
+		{"head_ref", "HEAD", true},
+		{"abbreviated_sha_7_uppercase_letter", "1234567A", false},
+		{"non_hex_char_g", "1234567g", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

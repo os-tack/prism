@@ -127,7 +127,7 @@ func (c *ContinueImporter) Import(root string) (*model.Project, []Warning, error
 		case len(globs) == 0:
 			// No globs → skill (model-decision trigger).
 			skillName := continueDeriveSkillName(fmName, e.Name())
-			skillName = uniqueName(skillName, skillExists)
+			skillName = uniqueName("continue", skillName, skillExists)
 			proj.Skills = append(proj.Skills, &model.Skill{
 				Name:        skillName,
 				Description: description,
@@ -143,7 +143,7 @@ func (c *ContinueImporter) Import(root string) (*model.Project, []Warning, error
 			switch classification {
 			case globKindExtension:
 				skillName := continueDeriveSkillName(fmName, e.Name())
-				skillName = uniqueName(skillName, skillExists)
+				skillName = uniqueName("continue", skillName, skillExists)
 				proj.Skills = append(proj.Skills, &model.Skill{
 					Name:        skillName,
 					Description: description,

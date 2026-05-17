@@ -19,9 +19,9 @@ func regressionFixture(t *testing.T) (root string, reg *plugin.Registry) {
 	mustMkdirAll(t, filepath.Join(root, ".claude"))
 	mustWrite(t, filepath.Join(root, ".agents", "context.md"), "# root\n")
 	reg = plugin.NewRegistry()
-	reg.Register(plugins.NewClaude())
-	reg.Register(plugins.NewCursor())
-	reg.Register(plugins.NewAgentsMD())
+	_ = reg.Register(plugins.NewClaude())
+	_ = reg.Register(plugins.NewCursor())
+	_ = reg.Register(plugins.NewAgentsMD())
 	return root, reg
 }
 

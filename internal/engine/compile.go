@@ -46,6 +46,29 @@ func compile(opts Options) (*Report, error) {
 		ops[i].Path = filepath.ToSlash(ops[i].Path)
 	}
 
+	// Resolve OpMerge.Merger closures into op.Content so the lockfile hash
+	// and manual-edit detection below see the canonical merged bytes. apply
+	// also invokes Merger; doing it here too is intentional belt-and-braces
+	// and the cost (one extra read+merge per merge op) is negligible.
+	for i := range ops {
+		if ops[i].Kind != plugin.OpMerge || ops[i].Merger == nil {
+			continue
+		}
+		abs := filepath.Join(opts.Root, ops[i].Path)
+		existing, rerr := os.ReadFile(abs)
+		if rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			return nil, fmt.Errorf("engine: read %s: %w", abs, rerr)
+		}
+		if rerr != nil {
+			existing = nil
+		}
+		merged, mErr := ops[i].Merger(existing)
+		if mErr != nil {
+			return nil, fmt.Errorf("engine: merger %s: %w", abs, mErr)
+		}
+		ops[i].Content = merged
+	}
+
 	plannedPaths := make(map[string]struct{}, len(ops))
 	for _, op := range ops {
 		plannedPaths[op.Path] = struct{}{}
