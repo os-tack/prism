@@ -1,6 +1,6 @@
 // Package perms is the shared permission-policy loader and matcher used by
 // the wrapper-script enforcement path (plugins/gemini.go, plugins/continue_plugin.go)
-// and the runtime `prism perms-guard` subcommand (cmd/agents/perms_guard.go).
+// and the runtime `prism perms-guard` subcommand (cmd/prism/perms_guard.go).
 //
 // Plugins serialize a model.Permissions block to a sidecar JSON file next
 // to the generated hook wrapper. At hook-firing time the wrapper exec's

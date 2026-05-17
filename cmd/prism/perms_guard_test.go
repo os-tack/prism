@@ -98,7 +98,7 @@ func runPermsGuard(t *testing.T, args []string, payload string) (string, error) 
 	defer restore()
 
 	root := &cobra.Command{
-		Use:           "agents",
+		Use:           "prism",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

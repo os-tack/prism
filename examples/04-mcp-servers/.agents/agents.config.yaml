@@ -1,0 +1,5 @@
+targets:
+  - claude
+  - cursor
+  - continue
+  - gemini

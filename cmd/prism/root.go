@@ -68,9 +68,9 @@ func newRootCmd() *cobra.Command {
 	state := &cliState{}
 
 	root := &cobra.Command{
-		Use:           "agents",
+		Use:           "prism",
 		Short:         "Project a canonical .agents/ directory into per-tool config files",
-		Long:          "agents projects a canonical .agents/ directory into per-AI-tool config files (CLAUDE.md, .cursor/rules/*, AGENTS.md, GEMINI.md, .clinerules, .continue/rules, .windsurf/rules, .github/instructions).",
+		Long:          "prism projects a canonical .agents/ directory into per-AI-tool config files (CLAUDE.md, .cursor/rules/*, AGENTS.md, GEMINI.md, .clinerules, .continue/rules, .windsurf/rules, .github/instructions).",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

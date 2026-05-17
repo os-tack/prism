@@ -1,0 +1,5 @@
+targets:
+  - claude
+  - cursor
+  - gemini
+  - agents-md

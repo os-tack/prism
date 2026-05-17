@@ -4,6 +4,49 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.7.3
+
+Documentation + tooling round. README rewritten for v0.7.x features,
+runnable `examples/` tree added, and a binary-name fix that unblocks
+`go install`.
+
+### Fixed
+- **Binary defaulted to `agents` instead of `prism` on `go install` /
+  bare `go build`**: the command package lived at `cmd/agents/`, so
+  `go install agents.dev/agents/cmd/agents@latest` (and `go build
+  ./cmd/agents`) produced a binary named `agents` on PATH. The v0.7.x
+  scope-guard and perms-guard wrappers exec `prism` at hook-firing time
+  — without a binary by that name, the wrappers would fail. Renamed
+  `cmd/agents/` → `cmd/prism/` so the default name now matches what
+  wrappers expect. Module path stays `agents.dev/agents` (that's the
+  Go import path; only the command directory moved).
+  - `go install agents.dev/agents/cmd/prism@latest` → installs as `prism`
+  - `go build -o prism ./cmd/prism` → same
+  - Release artifacts unchanged (CI matrix already builds `-o
+    prism-${version}-${platform}`).
+- **Cobra `Use` and `Long` strings updated** from "agents" to "prism" so
+  `prism --help` shows the correct command name in usage lines.
+- **Lockfile `generated_by` updated** from `agents@<ver>` to
+  `prism@<ver>` for consistency. Plays through on the next `compile`;
+  not a breaking schema change (the field is a free-form string).
+
+### Added
+- **`README.md` rewritten** for v0.7.x: covers importers, layered
+  config, `@include`-style composition (with correct `<!-- include:
+  path -->` syntax), central registry, `--interactive` importers,
+  scope-guard / perms-guard wrappers (with policy-rule grammar),
+  releases, and current capability matrix. Stale "TODO" items from
+  the v0.4 README removed.
+- **`examples/` directory** with 6 runnable `.agents/` layouts:
+  - `01-minimal/` — bare-minimum getting started
+  - `02-scoped-skills/` — scoped context + path-bound skill
+  - `03-include-composition/` — `<!-- include: path -->` directive
+  - `04-mcp-servers/` — MCP config across plugins
+  - `05-hooks-with-scope-guard/` — scoped Claude hook via scope-guard wrapper
+  - `06-permissions-wrappers/` — perms-guard wrapper for Gemini/Continue
+  Each is self-contained — `cd examples/N-name && prism compile` works.
+  All six verified end-to-end (compile + check + drift-free).
+
 ## v0.7.2
 
 Nit sweep on top of v0.7.1. Three small fixes from the v0.7.1 reviewer's

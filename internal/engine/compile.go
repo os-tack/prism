@@ -167,7 +167,7 @@ func compile(opts Options) (*Report, error) {
 	if !opts.DryRun {
 		newLF := &lockfile.Lockfile{
 			Version:     1,
-			GeneratedBy: "agents@" + version.Version,
+			GeneratedBy: "prism@" + version.Version,
 			At:          time.Now().UTC(),
 			Files:       make(map[string]lockfile.Entry, len(ops)),
 		}

@@ -104,7 +104,7 @@ func TestNoHookWrappersFlag_ThroughExecute(t *testing.T) {
 // with newRootCmd by calling the same helper functions.
 func buildTestRoot(state *cliState) *cobra.Command {
 	root := &cobra.Command{
-		Use:           "agents",
+		Use:           "prism",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

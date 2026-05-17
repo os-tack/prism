@@ -1,0 +1,6 @@
+deny:
+  - "Edit:src/billing/migrations/*"
+  - "bash:psql *"
+
+ask:
+  - "Edit:src/billing/*"

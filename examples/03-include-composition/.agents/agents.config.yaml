@@ -1,0 +1,4 @@
+targets:
+  - claude
+  - cursor
+  - agents-md

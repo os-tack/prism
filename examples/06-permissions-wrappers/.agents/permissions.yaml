@@ -1,0 +1,20 @@
+# Rule format: "<tool>:<pattern>" with optional trailing "*" glob.
+# Tool match is case-insensitive. Bash actions are matched against the
+# command string; Edit/Write/Read actions against the file path.
+#
+# These strings are passed through verbatim to .claude/settings.json
+# under permissions.{allow,deny,ask}; Claude Code is generally lenient
+# about formats it doesn't recognize, but if you only target Claude you
+# can also use its native "Tool(pattern)" syntax instead.
+allow:
+  - "bash:go test *"
+  - "bash:go build *"
+  - "bash:npm test *"
+
+deny:
+  - "bash:rm -rf *"
+  - "bash:git push *"
+
+ask:
+  - "bash:npm install *"
+  - "Edit:.env*"

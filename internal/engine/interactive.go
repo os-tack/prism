@@ -53,7 +53,7 @@ func stdinIsTTY() bool {
 //
 // Concrete CLI behavior worth knowing about up-front:
 //
-//   - Non-TTY stdin is rejected at the cmd/agents/init.go boundary (see
+//   - Non-TTY stdin is rejected at the cmd/prism/init.go boundary (see
 //     stdinIsTTY and ErrInteractiveNoTTY) — piped or CI input never
 //     reaches this function. If you need scriptable selection, generate
 //     the project YAML directly rather than driving --interactive.

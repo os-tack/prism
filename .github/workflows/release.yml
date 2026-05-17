@@ -34,7 +34,7 @@ jobs:
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
           name="prism-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${ext}"
-          go build -trimpath -ldflags "-s -w" -o "dist/${name}" ./cmd/agents
+          go build -trimpath -ldflags "-s -w" -o "dist/${name}" ./cmd/prism
           (cd dist && shasum -a 256 "${name}" > "${name}.sha256")
       - uses: actions/upload-artifact@v4
         with:
