@@ -4,6 +4,43 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.7.2
+
+Nit sweep on top of v0.7.1. Three small fixes from the v0.7.1 reviewer's
+deferred list, all with regression tests.
+
+### Fixed
+- **`rootRelativeFromWrapper` not defensive against noisy inputs** (N-a):
+  `plugins/perms_wrapper.go` now `filepath.Clean`s `wrapperRel` before
+  splitting on `/`. Inputs like `.gemini/./hooks/wrapper.sh` or
+  `.gemini//hooks/wrapper.sh` now produce the canonical `../..` instead
+  of the over-counted depth. Behavior unchanged for callers that already
+  go through `filepath.Join` (which Cleans), but the function is now safe
+  for direct unit-test inputs. Locked by 3 new cases in
+  `TestRootRelativeFromWrapper`.
+- **Comment-line injection in scope-guard wrapper** (N-b): the
+  `# prism-generated scope guard for ...` header in
+  `plugins/claude.go:buildScopeGuardScript` interpolated `scopePath` and
+  the source-script basename unescaped. A scope path or filename
+  containing `\n` or `\r` could split the comment into a second line
+  that bash would interpret. New `sanitizeBashComment` helper replaces
+  control chars with `?`. Pre-existing (not introduced by v0.7.x);
+  flagged by the v0.7.1 reviewer for closure. Locked by
+  `TestBuildScopeGuardScript_SanitizesCommentHeader_Nb`.
+- **User-declined error not addressable via `errors.Is`** (N-c):
+  `cmd/agents/perms_guard.go` had an inline `errors.New("perms-guard:
+  user declined")` at the ask-rule TTY-decline site. Extracted to
+  package-level `errPermsGuardUserDeclined` so callers can distinguish
+  user-decline from policy-deny via `errors.Is`. Locked by
+  `TestPermsGuard_UserDeclined_ErrorsIs_Nc` (positive match, wrapping,
+  and negative test that a freshly-allocated error with the same string
+  does NOT match — the point of the sentinel).
+
+### Changed
+- `internal/version.Version` bumped to `0.7.2`. Single source of truth;
+  picked up by `internal/registry/index.go`'s User-Agent and
+  `internal/engine/compile.go`'s lockfile `GeneratedBy` automatically.
+
 ## v0.7.1
 
 A fixes/polish release on top of v0.7.0. Addresses the three Important

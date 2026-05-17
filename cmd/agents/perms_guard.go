@@ -73,7 +73,7 @@ func newPermsGuardCmd() *cobra.Command {
 					return fmt.Errorf("perms-guard: ask-rule matched but no TTY available; denying: tool=%s action=%q", tool, action)
 				}
 				if !promptYesNo(fmt.Sprintf("permit %s %q? [y/N] ", tool, action)) {
-					return errors.New("perms-guard: user declined")
+					return errPermsGuardUserDeclined
 				}
 			}
 			// Allow + Default fall through. If no script was provided, the
@@ -183,3 +183,9 @@ func promptYesNo(msg string) bool {
 var permsGuardExit = func(code int) {
 	os.Exit(code)
 }
+
+// errPermsGuardUserDeclined is returned when the user answers "no" at the
+// ask-rule TTY prompt. Package-level so callers can distinguish
+// user-decline from policy-deny via errors.Is without parsing error
+// strings (N-c from v0.7.1 review).
+var errPermsGuardUserDeclined = errors.New("perms-guard: user declined")

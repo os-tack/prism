@@ -199,6 +199,10 @@ func TestRootRelativeFromWrapper(t *testing.T) {
 		{filepath.Join(".claude", "hooks", "wrapper.sh"), "../.."},
 		{filepath.Join(".gemini", "hooks", "__perms-guard__", "wrapper.sh"), "../../.."},
 		{filepath.Join(".claude", "hooks", "__scope-guard__", "wrapper.sh"), "../../.."},
+		// N-a regression: noisy inputs cleaned to canonical depth.
+		{".gemini/./hooks/wrapper.sh", "../.."},
+		{".gemini//hooks/wrapper.sh", "../.."},
+		{"./wrapper.sh", "."},
 	}
 	for _, c := range cases {
 		got := rootRelativeFromWrapper(c.wrapperRel)
@@ -348,5 +352,34 @@ func TestBuildPermsGuardScript_PolicyShellEscaping_C2(t *testing.T) {
 	// Single-quoted form preserves both $ and whitespace literally.
 	if !strings.Contains(body, `'.gemini/hooks/__perms-guard__/src-$x foo.policy.json'`) {
 		t.Errorf("policy not single-quoted (C2 regression):\n%s", body)
+	}
+}
+
+func TestBuildScopeGuardScript_SanitizesCommentHeader_Nb(t *testing.T) {
+	// N-b: a scope path or filename containing a newline must not split the
+	// `# prism-generated scope guard for ...` comment into a second line
+	// that bash would interpret.
+	body := buildScopeGuardScript(
+		".claude/hooks/__scope-guard__/x.sh",
+		"src/foo\nrm -rf /\n",
+		"/abs/.agents/src/foo\nbar/hooks/guard.sh",
+		"'/dev/null'",
+	)
+	lines := strings.Split(body, "\n")
+	if !strings.HasPrefix(lines[0], "#!/usr/bin/env bash") {
+		t.Fatalf("shebang missing: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "# prism-generated scope guard for ") {
+		t.Fatalf("header comment not on line 2: %q", lines[1])
+	}
+	// The point isn't to strip the substring — `?rm -rf /?` is still in
+	// the line — it's that bash sees one comment line, not two. Lines that
+	// follow must be the rest of the wrapper preamble, not anything from
+	// the injected payload.
+	if !strings.Contains(lines[1], "src/foo?") {
+		t.Errorf("newline in scopePath not replaced with `?`:\n%s", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "#") {
+		t.Errorf("line 3 should still be a comment continuation, got: %q", lines[2])
 	}
 }

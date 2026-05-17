@@ -236,7 +236,13 @@ func formatScriptArg(scriptPath, projRoot string) string {
 // project-relative; the result has one ".." per path component in
 // filepath.Dir(wrapperRel). Returns "." when the wrapper lives at root.
 func rootRelativeFromWrapper(wrapperRel string) string {
-	dir := filepath.ToSlash(filepath.Dir(wrapperRel))
+	// Clean defensively so callers passing `.gemini/./hooks/wrapper.sh` or
+	// `.gemini//hooks/wrapper.sh` get the same depth as the canonical form.
+	// filepath.Dir already Cleans internally on every platform Go supports,
+	// but the explicit Clean here makes the function safe for direct unit
+	// tests passing arbitrary strings (N-a from v0.7.1 review).
+	cleaned := filepath.Clean(wrapperRel)
+	dir := filepath.ToSlash(filepath.Dir(cleaned))
 	if dir == "." || dir == "" {
 		return "."
 	}

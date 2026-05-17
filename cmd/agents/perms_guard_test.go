@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -221,5 +223,19 @@ func TestPermsGuard_ScriptFailureExitsWithChildCode(t *testing.T) {
 	}
 	if recorded != 2 {
 		t.Errorf("recorded exit code = %d, want 2 (Claude block semantic must round-trip)", recorded)
+	}
+}
+
+func TestPermsGuard_UserDeclined_ErrorsIs_Nc(t *testing.T) {
+	if !errors.Is(errPermsGuardUserDeclined, errPermsGuardUserDeclined) {
+		t.Fatal("sentinel is not errors.Is-comparable to itself")
+	}
+	wrapped := fmt.Errorf("ask path: %w", errPermsGuardUserDeclined)
+	if !errors.Is(wrapped, errPermsGuardUserDeclined) {
+		t.Errorf("wrapped sentinel not detectable via errors.Is")
+	}
+	other := errors.New("perms-guard: user declined")
+	if errors.Is(other, errPermsGuardUserDeclined) {
+		t.Errorf("a freshly-allocated error with the same string should NOT match the sentinel (N-c rationale)")
 	}
 }

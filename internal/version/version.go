@@ -6,4 +6,4 @@ package version
 // Version is the current prism release. Bump this in lockstep with the
 // project's tagged release; every consumer (engine.compile, registry HTTP
 // client, etc.) reads from here so there is only one place to update.
-const Version = "0.7.1"
+const Version = "0.7.2"

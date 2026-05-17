@@ -312,9 +312,9 @@ func buildScopeGuardScript(wrapperRel, scopePath, sourceScript, scriptArg string
 	var b strings.Builder
 	b.WriteString("#!/usr/bin/env bash\n")
 	b.WriteString("# prism-generated scope guard for ")
-	b.WriteString(scopePath)
+	b.WriteString(sanitizeBashComment(scopePath))
 	b.WriteString("/hooks/")
-	b.WriteString(strings.TrimSuffix(filepath.Base(sourceScript), filepath.Ext(sourceScript)))
+	b.WriteString(sanitizeBashComment(strings.TrimSuffix(filepath.Base(sourceScript), filepath.Ext(sourceScript))))
 	b.WriteString(".yaml\n")
 	b.WriteString("#\n")
 	b.WriteString("# Reads Claude Code's hook JSON from stdin, dispatches to the source\n")
@@ -334,9 +334,21 @@ func buildScopeGuardScript(wrapperRel, scopePath, sourceScript, scriptArg string
 }
 
 // shellQuote single-quotes a string for safe shell interpolation. Single
-// quotes inside the input are emitted as '\”.
+// quotes inside the input are emitted as '\'\'.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// sanitizeBashComment replaces characters that would break a `# ...` line
+// in the wrapper preamble. Newlines and carriage returns become `?` so a
+// scope path or filename containing them does not split the comment into
+// a second line that bash would interpret (N-b from v0.7.1 review).
+func sanitizeBashComment(s string) string {
+	if !strings.ContainsAny(s, "\n\r") {
+		return s
+	}
+	r := strings.NewReplacer("\n", "?", "\r", "?")
+	return r.Replace(s)
 }
 
 // buildOp constructs a single Operation for a Document being projected to the
