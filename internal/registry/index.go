@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"agents.dev/agents/internal/version"
 )
 
 // DefaultRegistryURL is the canonical central-registry index URL used when
@@ -211,7 +213,7 @@ func readCachedIndex(path string) (*Index, error) {
 // so a partial write can't corrupt the cache.
 func writeCachedIndex(path string, data []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -223,7 +225,12 @@ func fetchIndex(url string, client *http.Client) (*Index, []byte, error) {
 	if client == nil {
 		client = &http.Client{Timeout: fetchTimeout}
 	}
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("User-Agent", "prism/"+version.Version+" (+https://github.com/os-tack/prism)")
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}

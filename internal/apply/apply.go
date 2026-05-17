@@ -183,10 +183,10 @@ func applyOne(root string, op plugin.Operation, dryRun bool) (bool, error) {
 		return true, nil
 
 	case plugin.OpMerge:
-		// The engine reads, the plugin merges. When op.Merger is set the
-		// plugin computes the merged content here (with no Plan-time disk
-		// I/O); when nil we fall back to trusting op.Content for backward
-		// compatibility with pre-Merger callers.
+		// Canonical path: engine.compile already resolved Merger into op.Content
+		// and nil'd the closure, so we just write op.Content. The op.Merger != nil
+		// branch below exists only for direct callers of apply.Apply that bypass
+		// engine.Compile; never reached on the normal compile -> apply flow.
 		existing, rerr := os.ReadFile(abs)
 		if rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 			return false, fmt.Errorf("apply: read %s: %w", abs, rerr)

@@ -50,6 +50,27 @@ func stdinIsTTY() bool {
 // selections. EOF on the reader is treated as accept-all for the remaining
 // items, so a hung pipe or Ctrl-D mid-session preserves the user's existing
 // inclusions rather than silently dropping work.
+//
+// Concrete CLI behavior worth knowing about up-front:
+//
+//   - Non-TTY stdin is rejected at the cmd/agents/init.go boundary (see
+//     stdinIsTTY and ErrInteractiveNoTTY) — piped or CI input never
+//     reaches this function. If you need scriptable selection, generate
+//     the project YAML directly rather than driving --interactive.
+//   - Within an interactive session, EOF on stdin is treated as
+//     accept-all for everything that has not yet been prompted. This
+//     means:
+//   - Ctrl-D at any prompt accepts the remaining items.
+//   - Piping input that lacks a trailing newline causes the last
+//     line to be consumed without a decision and EOF to fire on the
+//     next prompt — which then accepts that item and every later
+//     one. (We surface "(EOF -- accepting all remaining items)" to
+//     stdout so the user can see this happen.)
+//   - A closed pipe mid-stream similarly preserves whatever has not
+//     been explicitly declined.
+//     The intent is to fail safe: dropping imported content on a
+//     stream-end accident is worse than over-including, since the user
+//     can re-run with --interactive to narrow down further.
 func filterProjectInteractively(p *model.Project, in *bufio.Reader, out io.Writer) (*model.Project, error) {
 	if p == nil {
 		return nil, fmt.Errorf("engine: nil project")

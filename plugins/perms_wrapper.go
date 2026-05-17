@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"agents.dev/agents/internal/model"
@@ -121,7 +122,7 @@ func emitPermsGuardWrappers(pluginName string, proj *model.Project, disabled boo
 			wrapperName = permsScopeSlug(h.ScopePath) + "-" + h.Event + "-" + base + ".sh"
 		}
 		wrapperRel := filepath.Join(hooksDir, wrapperName)
-		body := buildPermsGuardScript(filepath.Join(proj.Root, policyRel), h.ScriptPath)
+		body := buildPermsGuardScript(wrapperRel, policyRel, formatScriptArg(h.ScriptPath, proj.Root))
 		ops = append(ops, plugin.Operation{
 			Kind:     plugin.OpWrite,
 			Path:     wrapperRel,
@@ -137,14 +138,22 @@ func emitPermsGuardWrappers(pluginName string, proj *model.Project, disabled boo
 	// If permissions exist but no hooks were wrapped, drop a bare gate
 	// wrapper per policy so users can integrate the guard into their own
 	// hook pipeline (alias, shell function, tool-specific config).
+	// Iterate map keys in sorted order so OpWrite ops emit deterministically
+	// across runs (fixes I5: `agents diff` drift from map iteration).
 	if !wroteHookWrapper {
-		for scopePath, policyRel := range policyPaths {
+		scopes := make([]string, 0, len(policyPaths))
+		for k := range policyPaths {
+			scopes = append(scopes, k)
+		}
+		sort.Strings(scopes)
+		for _, scopePath := range scopes {
+			policyRel := policyPaths[scopePath]
 			gateName := "global-gate.sh"
 			if scopePath != "" {
 				gateName = permsScopeSlug(scopePath) + "-gate.sh"
 			}
 			wrapperRel := filepath.Join(hooksDir, gateName)
-			body := buildPermsGuardScript(filepath.Join(proj.Root, policyRel), "")
+			body := buildPermsGuardScript(wrapperRel, policyRel, "")
 			ops = append(ops, plugin.Operation{
 				Kind:     plugin.OpWrite,
 				Path:     wrapperRel,
@@ -163,25 +172,80 @@ func emitPermsGuardWrappers(pluginName string, proj *model.Project, disabled boo
 // buildPermsGuardScript renders the bash wrapper that exec's prism perms-guard
 // with the given policy and optional underlying hook script. Empty script
 // = pure gate (perms-guard exits 0 on allow, non-zero on deny / ask-decline).
-func buildPermsGuardScript(policyAbs, sourceScript string) string {
+//
+// wrapperRel and policyRel are project-relative paths. scriptArg is the
+// already-formatted shell argument for --script: empty for pure gate,
+// otherwise a pre-quoted string (either shellQuote(absolute) or
+// "${PROJECT_DIR}"/shellQuote(rel) — produced by formatScriptArg at the
+// call site so the renderer doesn't need proj.Root).
+//
+// The script resolves the project root at runtime from ${BASH_SOURCE[0]}
+// so the generated wrapper survives `mv` of the project directory
+// (fixes I4). Env-var precedence: PRISM_PROJECT_DIR > CLAUDE_PROJECT_DIR
+// > computed from BASH_SOURCE via the wrapper's path-from-root depth.
+func buildPermsGuardScript(wrapperRel, policyRel, scriptArg string) string {
+	upDots := rootRelativeFromWrapper(wrapperRel)
+
 	var b strings.Builder
 	b.WriteString("#!/usr/bin/env bash\n")
 	b.WriteString("# prism-generated perms-guard wrapper\n")
 	b.WriteString("# Reads hook JSON from stdin, enforces sidecar policy, then\n")
 	b.WriteString("# exec's the underlying script (or exits 0) on allow.\n")
 	b.WriteString("set -euo pipefail\n")
-	if sourceScript == "" {
-		b.WriteString("exec prism perms-guard --policy ")
-		b.WriteString(shellQuote(policyAbs))
-		b.WriteString("\n")
-	} else {
-		b.WriteString("exec prism perms-guard --policy ")
-		b.WriteString(shellQuote(policyAbs))
+	b.WriteString("SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n")
+	b.WriteString("PROJECT_DIR=\"${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd \"${SCRIPT_DIR}/")
+	b.WriteString(upDots)
+	b.WriteString("\" && pwd)}}\"\n")
+	b.WriteString("exec prism perms-guard --policy \"${PROJECT_DIR}\"/")
+	b.WriteString(shellQuote(policyRel))
+	if scriptArg != "" {
 		b.WriteString(" --script ")
-		b.WriteString(shellQuote(sourceScript))
-		b.WriteString("\n")
+		b.WriteString(scriptArg)
 	}
+	b.WriteString("\n")
 	return b.String()
+}
+
+// formatScriptArg builds the pre-quoted shell argument for --script that
+// callers pass to buildPermsGuardScript or buildScopeGuardScript. When
+// the script lives under projRoot we rewrite to "${PROJECT_DIR}"/<rel>
+// so the wrapper survives `mv` of the project (fixes I-1 from v0.7.1
+// review). When it lives outside (e.g., a global hook from ~/.agents),
+// we fall back to shellQuote(absolute).
+func formatScriptArg(scriptPath, projRoot string) string {
+	if scriptPath == "" {
+		return ""
+	}
+	absScript := scriptPath
+	if !filepath.IsAbs(absScript) {
+		absScript = filepath.Join(projRoot, absScript)
+	}
+	absRoot := projRoot
+	if !filepath.IsAbs(absRoot) {
+		absRoot, _ = filepath.Abs(absRoot)
+	}
+	rel, err := filepath.Rel(absRoot, absScript)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return shellQuote(scriptPath)
+	}
+	return "\"${PROJECT_DIR}\"/" + shellQuote(filepath.ToSlash(rel))
+}
+
+// rootRelativeFromWrapper returns the "../../.."-style suffix that, joined
+// onto the wrapper's directory, lands at the project root. wrapperRel is
+// project-relative; the result has one ".." per path component in
+// filepath.Dir(wrapperRel). Returns "." when the wrapper lives at root.
+func rootRelativeFromWrapper(wrapperRel string) string {
+	dir := filepath.ToSlash(filepath.Dir(wrapperRel))
+	if dir == "." || dir == "" {
+		return "."
+	}
+	parts := strings.Split(dir, "/")
+	ups := make([]string, len(parts))
+	for i := range parts {
+		ups[i] = ".."
+	}
+	return strings.Join(ups, "/")
 }
 
 // permsScopeSlug renders a scope path as a filename-safe slug. Mirrors

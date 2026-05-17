@@ -244,7 +244,7 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		wrapperRel := filepath.Join(".claude", "hooks", "__scope-guard__", wrapperFile)
 		wrapperAbs := filepath.Join(proj.Root, wrapperRel)
 
-		body := buildScopeGuardScript(h.ScopePath, h.ScriptPath)
+		body := buildScopeGuardScript(wrapperRel, h.ScopePath, h.ScriptPath, formatScriptArg(h.ScriptPath, proj.Root))
 		ops = append(ops, plugin.Operation{
 			Kind:     plugin.OpWrite,
 			Path:     wrapperRel,
@@ -291,10 +291,24 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 // --scope <path> --script <abs>`, which parses the JSON and either
 // invokes the source script (passing stdin through) or exits 0.
 //
+// wrapperRel is the project-relative path of the wrapper itself; we
+// embed neither the project root nor any absolute path into the
+// rendered bash. At runtime the wrapper resolves the project root from
+// ${BASH_SOURCE[0]} (with PRISM_PROJECT_DIR and CLAUDE_PROJECT_DIR
+// taking precedence), so the wrapper survives `mv` of the project (I4).
+// sourceScript is the absolute path to the user's authored hook (used
+// only for the comment header / filename basename). scriptArg is the
+// pre-quoted shell argument for --script, formatted at the call site
+// via formatScriptArg so that scripts under proj.Root are rewritten to
+// "${PROJECT_DIR}"/<rel> — the wrapper survives `mv` of the project
+// for both PROJECT_DIR resolution and the --script reference (fixes
+// I-1 from v0.7.1 review).
+//
 // The wrapper requires `prism` on PATH at hook-firing time. That's a
 // reasonable assumption since the user installed prism to project the
 // hook in the first place.
-func buildScopeGuardScript(scopePath, sourceScript string) string {
+func buildScopeGuardScript(wrapperRel, scopePath, sourceScript, scriptArg string) string {
+	upDots := rootRelativeFromWrapper(wrapperRel)
 	var b strings.Builder
 	b.WriteString("#!/usr/bin/env bash\n")
 	b.WriteString("# prism-generated scope guard for ")
@@ -306,10 +320,15 @@ func buildScopeGuardScript(scopePath, sourceScript string) string {
 	b.WriteString("# Reads Claude Code's hook JSON from stdin, dispatches to the source\n")
 	b.WriteString("# script when tool_input.file_path falls under the scope.\n")
 	b.WriteString("set -euo pipefail\n")
+	b.WriteString("SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n")
+	b.WriteString("PROJECT_DIR=\"${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd \"${SCRIPT_DIR}/")
+	b.WriteString(upDots)
+	b.WriteString("\" && pwd)}}\"\n")
+	b.WriteString("export CLAUDE_PROJECT_DIR=\"${CLAUDE_PROJECT_DIR:-${PROJECT_DIR}}\"\n")
 	b.WriteString("exec prism scope-guard --scope ")
 	b.WriteString(shellQuote(scopePath))
 	b.WriteString(" --script ")
-	b.WriteString(shellQuote(sourceScript))
+	b.WriteString(scriptArg)
 	b.WriteString("\n")
 	return b.String()
 }

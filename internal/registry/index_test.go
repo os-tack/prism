@@ -30,15 +30,25 @@ const sampleIndex = `{
 // indexServer returns an httptest server that serves the given body at the
 // root path with status 200, and a counter for hit-count assertions.
 func indexServer(t *testing.T, body string) (url string, hits *int) {
+	url, hits, _ = indexServerWithUA(t, body)
+	return url, hits
+}
+
+// indexServerWithUA is indexServer plus a pointer that records the
+// User-Agent header from the most recent request — useful for asserting
+// that the registry HTTP client identifies itself.
+func indexServerWithUA(t *testing.T, body string) (url string, hits *int, lastUA *string) {
 	t.Helper()
 	count := 0
+	ua := ""
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count++
+		ua = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL, &count
+	return srv.URL, &count, &ua
 }
 
 // failingServer returns a URL that always 500s.
@@ -142,10 +152,29 @@ func TestResolveBareName_FetchAndCache(t *testing.T) {
 		t.Errorf("cache should be reused; got %d hits", *hits)
 	}
 
-	// Cache file should exist.
+	// Cache file should exist and be mode 0o600 (not world-readable — the
+	// index may contain source URLs the cache owner does not want to leak
+	// on multi-user systems).
 	cachePath := filepath.Join(cacheDir, "registry-index.json")
-	if _, err := os.Stat(cachePath); err != nil {
+	info, err := os.Stat(cachePath)
+	if err != nil {
 		t.Fatalf("cache file not written: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("cache file mode = %o, want 0600", mode)
+	}
+}
+
+func TestFetchIndex_SetsUserAgent(t *testing.T) {
+	url, _, lastUA := indexServerWithUA(t, sampleIndex)
+	cacheDir := withCacheDir(t)
+	opts := RegistryOptions{URL: url, CacheDir: cacheDir}
+
+	if _, _, err := resolveBareName("billing-skills", opts); err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if !strings.Contains(*lastUA, "prism/") {
+		t.Errorf("User-Agent = %q, want substring %q", *lastUA, "prism/")
 	}
 }
 

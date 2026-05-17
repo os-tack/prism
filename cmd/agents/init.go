@@ -37,6 +37,6 @@ func newInitCmd(state *cliState) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&from, "from", "", "import from existing tool config: claude,cursor,gemini,cline,continue,windsurf,copilot,agents-md (comma-separated for multi-source merge; \"auto\" detects all)")
-	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "prompt for each imported item (skill/command/scope/agent/MCP) before writing; requires --from and a TTY")
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "prompt for each imported item (skill/command/scope/agent/MCP) before writing; requires --from and a TTY (non-TTY stdin is refused; EOF / Ctrl-D at a prompt accepts that item and every remaining one)")
 	return cmd
 }

@@ -14,9 +14,8 @@ import (
 	"agents.dev/agents/internal/parser"
 	"agents.dev/agents/internal/plan"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
-
-const version = "0.4.0"
 
 func compile(opts Options) (*Report, error) {
 	if opts.Root == "" {
@@ -46,10 +45,11 @@ func compile(opts Options) (*Report, error) {
 		ops[i].Path = filepath.ToSlash(ops[i].Path)
 	}
 
-	// Resolve OpMerge.Merger closures into op.Content so the lockfile hash
-	// and manual-edit detection below see the canonical merged bytes. apply
-	// also invokes Merger; doing it here too is intentional belt-and-braces
-	// and the cost (one extra read+merge per merge op) is negligible.
+	// Resolve OpMerge.Merger closures into op.Content exactly once here, then
+	// clear Merger so apply.Apply writes the pre-computed bytes verbatim.
+	// Running the closure twice (compile + apply) under concurrent edits
+	// races: lockfile hash captures pass-1 output, disk gets pass-2 output,
+	// and the next Check sees false-positive manual-edit drift.
 	for i := range ops {
 		if ops[i].Kind != plugin.OpMerge || ops[i].Merger == nil {
 			continue
@@ -67,6 +67,7 @@ func compile(opts Options) (*Report, error) {
 			return nil, fmt.Errorf("engine: merger %s: %w", abs, mErr)
 		}
 		ops[i].Content = merged
+		ops[i].Merger = nil
 	}
 
 	plannedPaths := make(map[string]struct{}, len(ops))
@@ -166,7 +167,7 @@ func compile(opts Options) (*Report, error) {
 	if !opts.DryRun {
 		newLF := &lockfile.Lockfile{
 			Version:     1,
-			GeneratedBy: "agents@" + version,
+			GeneratedBy: "agents@" + version.Version,
 			At:          time.Now().UTC(),
 			Files:       make(map[string]lockfile.Entry, len(ops)),
 		}

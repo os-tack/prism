@@ -677,8 +677,9 @@ func TestClaude_ScopedHook_Wrapper(t *testing.T) {
 	if !strings.Contains(wrapperOp.Content, "--scope 'src/billing'") {
 		t.Errorf("wrapper body missing --scope flag; got:\n%s", wrapperOp.Content)
 	}
-	if !strings.Contains(wrapperOp.Content, "--script '"+sourceScript+"'") {
-		t.Errorf("wrapper body missing --script for source; got:\n%s", wrapperOp.Content)
+	relScript, _ := filepath.Rel(root, sourceScript)
+	if !strings.Contains(wrapperOp.Content, `--script "${PROJECT_DIR}"/'`+relScript+`'`) {
+		t.Errorf("wrapper body missing --script ${PROJECT_DIR}/<rel> for source; got:\n%s", wrapperOp.Content)
 	}
 
 	// Settings hook command should point at the wrapper's absolute path,

@@ -28,10 +28,19 @@ import (
 //  3. Derives a (tool, action) pair from the payload — Bash uses
 //     tool_input.command, file tools use tool_input.file_path / path /
 //     notebook_path.
-//  4. Calls perms.Check; Deny exits 1; Ask without a TTY exits 1 with a
-//     clear message; Ask with a TTY prompts the user; Allow / Default
-//     fall through to exec'ing the underlying hook script with the
-//     original payload on stdin.
+//  4. Calls perms.Check; Deny returns an error (cobra exits 1); Ask
+//     without a TTY returns an error with a clear message; Ask with a
+//     TTY prompts the user; Allow / Default fall through to exec'ing
+//     the underlying hook script with the original payload on stdin.
+//
+// Exit-code semantics: deny / no-TTY ask / user-declined ask all
+// surface as `return err` from RunE (cobra exits 1) — testable via
+// cobra.Execute without subprocess shenanigans. The script-fork path
+// is the exception: when the forked script exits non-zero, we preserve
+// the child's exit code via `permsGuardExit(...)` (an indirection
+// through a package-level var so tests can intercept). Mirrors
+// scope_guard.go's behavior and preserves Claude Code's exit-2
+// ("block with stderr") signal — see v0.7.1 review I-2.
 //
 // The subcommand is Hidden because it's an implementation detail.
 func newPermsGuardCmd() *cobra.Command {
@@ -58,16 +67,13 @@ func newPermsGuardCmd() *cobra.Command {
 			tool, action := extractToolAndAction(payload)
 			switch perms.Check(policy, tool, action) {
 			case perms.DecisionDeny:
-				fmt.Fprintf(os.Stderr, "perms-guard: denied by policy: tool=%s action=%q\n", tool, action)
-				os.Exit(1)
+				return fmt.Errorf("perms-guard: denied by policy: tool=%s action=%q", tool, action)
 			case perms.DecisionAsk:
 				if !isTTY(os.Stdin) {
-					fmt.Fprintf(os.Stderr, "perms-guard: ask-rule matched but no TTY available; denying: tool=%s action=%q\n", tool, action)
-					os.Exit(1)
+					return fmt.Errorf("perms-guard: ask-rule matched but no TTY available; denying: tool=%s action=%q", tool, action)
 				}
 				if !promptYesNo(fmt.Sprintf("permit %s %q? [y/N] ", tool, action)) {
-					fmt.Fprintln(os.Stderr, "perms-guard: user declined")
-					os.Exit(1)
+					return errors.New("perms-guard: user declined")
 				}
 			}
 			// Allow + Default fall through. If no script was provided, the
@@ -81,9 +87,17 @@ func newPermsGuardCmd() *cobra.Command {
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
 			if err := c.Run(); err != nil {
+				// Mirror scope_guard.go's exit-code preservation for the
+				// script-fork path only: Claude Code's hook protocol treats
+				// exit 2 as "block with stderr" (distinct from any other
+				// non-zero). Collapsing to cobra's default-1 would lose that
+				// signal. Deny / ask-decline paths still return err (no
+				// child code to preserve). Documented divergence from N1's
+				// "all failures collapse to 1" pattern (v0.7.1 review I-2).
 				var exitErr *exec.ExitError
 				if errors.As(err, &exitErr) {
-					os.Exit(exitErr.ExitCode())
+					permsGuardExit(exitErr.ExitCode())
+					return nil
 				}
 				return fmt.Errorf("perms-guard: exec %s: %w", script, err)
 			}
@@ -96,8 +110,30 @@ func newPermsGuardCmd() *cobra.Command {
 }
 
 // extractToolAndAction pulls the (tool_name, action) pair out of the hook
-// JSON envelope. The action is whichever of command / file_path / path /
-// notebook_path the tool_input map exposes — first hit wins.
+// JSON envelope. The tool_input map exposes the action under one of
+// several keys depending on which tool fired; we probe them in fixed
+// order and return the first non-empty string we find. Returns the
+// tool name and an empty action when no known key is present, which
+// upstream callers treat as a default-allow / no-context scenario.
+//
+// Keys probed (in order):
+//
+//   - "command" — Bash (Claude / Gemini / Continue): the full shell
+//     command string about to run.
+//   - "file_path" — Read / Write / Edit (Claude): absolute path of the
+//     target file.
+//   - "path" — Read (Claude variant), Glob (Claude / Gemini): the
+//     search root or path argument.
+//   - "filepath" — alternate spelling seen in older hook payloads;
+//     kept for back-compat with third-party tools.
+//   - "notebook_path" — NotebookEdit (Claude): absolute path of the
+//     .ipynb file being edited.
+//   - "url" — WebFetch (Claude): the URL being fetched.
+//
+// First hit wins. The list mirrors what extractToolFilePath in
+// scope_guard.go consults, minus "command" / "url" (scope-guard cares
+// only about file paths). Keep the two in lockstep when adding new
+// tools.
 func extractToolAndAction(payload []byte) (string, string) {
 	if len(payload) == 0 {
 		return "", ""
@@ -139,4 +175,11 @@ func promptYesNo(msg string) bool {
 		return false
 	}
 	return buf[0] == 'y' || buf[0] == 'Y'
+}
+
+// permsGuardExit is the indirection used when the forked script exits
+// non-zero. Production: os.Exit(code). Tests override with a recorder
+// to assert the code without killing the test process.
+var permsGuardExit = func(code int) {
+	os.Exit(code)
 }

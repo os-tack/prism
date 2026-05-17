@@ -545,7 +545,26 @@ func TestRoundTrip_Continue(t *testing.T) {
 	original := captureOriginal(t, root)
 
 	opts := rtOptions(t, root, plugins.NewContinue())
-	runRoundTrip(t, opts, "continue")
+	// The Continue source format has no manual/command primitive (its
+	// importer only emits Context, Skill, and Scope), so the round-trip
+	// here is asymmetric: we run Init from .continue/ to seed .agents/,
+	// then drop a command directly into .agents/commands/ before Compile.
+	// The Continue plugin still degrades the command to a rule file at
+	// .continue/rules/command-<name>.md — which is what the v0.7.0
+	// reviewer flagged as silently uncovered. The description carries a
+	// colon so the post-compile YAML frontmatter also exercises the
+	// renderContinueRule colon-quoting fix.
+	if err := engine.Init(opts, "continue"); err != nil {
+		t.Fatalf("engine.Init(continue): %v", err)
+	}
+	cmdSeed := "---\n" +
+		"description: 'Ship a release: cuts a tag, builds artifacts, publishes'\n" +
+		"---\n" +
+		"Run the release script with --confirm and wait for green CI.\n"
+	rtWrite(t, root, ".agents/commands/deploy.md", cmdSeed)
+	if _, err := engine.Compile(opts); err != nil {
+		t.Fatalf("engine.Compile: %v", err)
+	}
 
 	// 1. alwaysApply rule → _root.md (same name on both sides).
 	rootBody := readBody(t, root, ".continue/rules/_root.md")
@@ -592,6 +611,26 @@ func TestRoundTrip_Continue(t *testing.T) {
 			mcpPath, args, string(mcpData))
 	}
 
+	// 4. Command round-trip. The Continue plugin degrades commands to
+	// rules at .continue/rules/command-<name>.md (no slash-command
+	// mechanism). The description prefix becomes
+	//   "Command /deploy: Ship a release: cuts a tag, ..."
+	// — three colons, all inside the quoted JSON-encoded description.
+	cmdOut := ".continue/rules/command-deploy.md"
+	cmdBody := readBody(t, root, cmdOut)
+	assertBodyContains(t, cmdOut, cmdBody,
+		"Run the release script with --confirm and wait for green CI.")
+	cmdFM := readFrontmatter(t, root, cmdOut)
+	cmdDesc, _ := cmdFM["description"].(string)
+	if !strings.Contains(cmdDesc, "Command /deploy") {
+		t.Errorf("%s description = %q, want to contain %q", cmdOut, cmdDesc, "Command /deploy")
+	}
+	if !strings.Contains(cmdDesc, "Ship a release: cuts a tag") {
+		t.Errorf("%s description = %q, want to preserve original colon-bearing text", cmdOut, cmdDesc)
+	}
+
+	// 5. Sanity: every original input body still appears somewhere in the
+	// output rules tree, AND the directly-seeded command body appears too.
 	allOutputs := concatAllRuleBodies(t, root, ".continue/rules")
 	for relPath, content := range original {
 		if !strings.HasPrefix(relPath, ".continue/rules/") || !strings.HasSuffix(relPath, ".md") {
@@ -606,6 +645,14 @@ func TestRoundTrip_Continue(t *testing.T) {
 			t.Errorf("continue round-trip: original body of %s not present in any output rule:\noriginal:\n%s\nall outputs:\n%s",
 				relPath, body, allOutputs)
 		}
+	}
+	// The command body was seeded after Init, not via the source-tool
+	// fixture map, so it would not appear in `original` — assert
+	// explicitly that it survived to the output tree.
+	cmdBodyNeedle := "Run the release script with --confirm and wait for green CI."
+	if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(cmdBodyNeedle)) {
+		t.Errorf("continue round-trip: seeded command body %q not present in any output rule:\nall outputs:\n%s",
+			cmdBodyNeedle, allOutputs)
 	}
 }
 
@@ -905,6 +952,16 @@ func TestRoundTrip_Windsurf(t *testing.T) {
 			"description: PDF editing\n" +
 			"---\n" +
 			"Use pdftk for PDF manipulation tasks.\n",
+		// trigger: manual is imported as a Command. The description
+		// carries a colon so the post-compile YAML frontmatter exercises
+		// the v0.7.0 colon-quoting fix in renderWindsurfRule. v0.7.0 left
+		// command rules out of the fixtures, so the body-sweep below now
+		// also covers commands.
+		".windsurf/rules/deploy.md": "---\n" +
+			"trigger: manual\n" +
+			"description: 'Ship a release: cuts a tag, builds artifacts, publishes'\n" +
+			"---\n" +
+			"Run the release script with --confirm and wait for green CI.\n",
 	})
 	original := captureOriginal(t, root)
 
@@ -941,6 +998,29 @@ func TestRoundTrip_Windsurf(t *testing.T) {
 	}
 	if globs := stringSliceFromAny(pdfFM["globs"]); len(globs) == 0 || globs[0] != "**/*.pdf" {
 		t.Errorf("%s globs = %v, want [**/*.pdf]", pdfOut, globs)
+	}
+
+	// Command round-trip: trigger: manual import → Command primitive →
+	// Windsurf plugin re-emits at .windsurf/rules/command-<name>.md with
+	// trigger: model_decision and description "Command /<name>: <orig>".
+	// The original description already contains a colon, so the rendered
+	// frontmatter is "description: \"Command /deploy: Ship a release: ...\""
+	// which must be quoted correctly by the v0.7.0 YAML fix or the file
+	// fails to re-parse.
+	cmdOut := ".windsurf/rules/command-deploy.md"
+	cmdBody := readBody(t, root, cmdOut)
+	assertBodyContains(t, cmdOut, cmdBody,
+		"Run the release script with --confirm and wait for green CI.")
+	cmdFM := readFrontmatter(t, root, cmdOut)
+	if trig, _ := cmdFM["trigger"].(string); trig != "model_decision" {
+		t.Errorf("%s trigger = %q, want model_decision", cmdOut, trig)
+	}
+	cmdDesc, _ := cmdFM["description"].(string)
+	if !strings.Contains(cmdDesc, "Command /deploy") {
+		t.Errorf("%s description = %q, want to contain %q", cmdOut, cmdDesc, "Command /deploy")
+	}
+	if !strings.Contains(cmdDesc, "Ship a release: cuts a tag") {
+		t.Errorf("%s description = %q, want to preserve original colon-bearing text", cmdOut, cmdDesc)
 	}
 
 	allOutputs := concatAllRuleBodies(t, root, ".windsurf/rules")

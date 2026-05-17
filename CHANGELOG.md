@@ -4,6 +4,117 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.7.1
+
+A fixes/polish release on top of v0.7.0. Addresses the three Important
+items + five Nits flagged by the v0.7.0 reviewer, plus expanded round-trip
+coverage now that the YAML colon bug is fixed.
+
+### Fixed
+- **Dual `Merger` invocation TOCTOU window** (I2 from v0.7.0 review):
+  `internal/engine/compile.go` now sets `op.Merger = nil` after resolving
+  the closure, so `internal/apply/apply.go` writes `op.Content` directly
+  instead of re-invoking `Merger`. The previous design ran Merger twice —
+  once in compile (for lockfile hashing) and once in apply (for the
+  write) — which under concurrent edits could see different `existing`
+  bytes and produce divergent merged output, triggering a false-positive
+  "manual edits detected" loop on the next compile. apply.go retains the
+  Merger fallback for direct callers that bypass engine.Compile. Locked
+  by `TestCompile_MergerInvokedOnce` (atomic-counter Merger asserts call
+  count == 1).
+- **Wrapper scripts bake absolute paths** (I4): both `plugins/perms_wrapper.go`
+  (`buildPermsGuardScript`) and `plugins/claude.go` (`buildScopeGuardScript`)
+  used to hardcode `proj.Root` into the generated bash bodies, so `mv` /
+  `rsync` / container mounts would leave the wrappers pointing at the old
+  path. The renderers now emit bash that resolves PROJECT_DIR at runtime
+  via `${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}}`,
+  where SCRIPT_DIR is `dirname "${BASH_SOURCE[0]}"`. The scope-guard
+  wrapper also exports `CLAUDE_PROJECT_DIR=${PROJECT_DIR}` so the
+  existing `prism scope-guard` runtime lookup inherits the resolved root.
+  Env-var precedence: `PRISM_PROJECT_DIR` > `CLAUDE_PROJECT_DIR` >
+  `${BASH_SOURCE[0]}`-relative fallback. End-to-end locked by
+  `TestPermsGuardWrapper_SurvivesMv` (writes a wrapper, renames the
+  project tree, executes the wrapper from a third directory, verifies
+  PROJECT_DIR resolves to the moved location).
+- **Non-deterministic op order for gemini/continue perms wrappers** (I5):
+  `plugins/perms_wrapper.go` iterated `policyPaths` (a Go map) when
+  emitting bare-gate wrappers for projects with multiple scoped
+  permissions but no hooks, producing non-deterministic `agents diff`
+  output (lockfile was still stable). Sorted the keys before iteration.
+  Locked by a 20-run determinism test.
+- **`cmd/agents/perms_guard.go` used `os.Exit` inside cobra `RunE`** (N1):
+  four `os.Exit` calls replaced with `return err`. Exit-code semantics
+  simplified — any failure now exits 1 (was: deny=1, forked-subcommand
+  err=child-exit-code). Documented in the function doc comment. The new
+  approach is testable via `cobra.Execute` (5 new tests in
+  `cmd/agents/perms_guard_test.go` drive the subcommand via `stubStdin`
+  + cobra harness without spawning a subprocess).
+- **`http.Client` in `internal/registry/index.go` missing User-Agent** (N2):
+  fetches now send `User-Agent: prism/<Version> (+https://github.com/os-tack/prism)`.
+- **Registry cache file world-readable** (N3): cache write mode changed
+  from `0o644` to `0o600` since the file may contain registry metadata
+  the cache owner doesn't want exposed on multi-user systems.
+- **Version literal drift** (v0.7.1 review C1): consolidated the duplicate
+  `"0.7.1"` literals in `internal/engine/compile.go` and the new
+  `internal/version` package — compile.go now imports
+  `agents.dev/agents/internal/version` and uses `version.Version`. One
+  literal to bump for v0.7.2.
+- **Wrapper-script shell injection on policy path** (v0.7.1 review C2):
+  `plugins/perms_wrapper.go` interpolated `policyRel` into bash unquoted,
+  so a scope path containing `$x` or whitespace would either undergo
+  parameter expansion or word-split. Now uses `shellQuote(policyRel)`
+  (single-quoted, regardless of input) with `"${PROJECT_DIR}"/` adjacency
+  for the runtime root prefix. Locked by
+  `TestBuildPermsGuardScript_PolicyShellEscaping_C2`.
+- **Wrapper `--script` argument also baked absolute paths** (v0.7.1
+  review I-1): the I4 fix made `${PROJECT_DIR}` resolution survive `mv`,
+  but the `--script` argument still hardcoded the project-root prefix.
+  New `formatScriptArg(scriptPath, projRoot)` helper rewrites scripts
+  living under `proj.Root` to `"${PROJECT_DIR}"/<rel>` (falls back to
+  `shellQuote(absolute)` for global hooks from `~/.agents/`). The
+  "survives mv" claim now holds for both the PROJECT_DIR resolver AND
+  the underlying script reference.
+- **`perms-guard` script-fork exit code collapsed to 1** (v0.7.1 review
+  I-2): mirroring the v0.7.0 N1 fix removed `os.Exit` from RunE, which
+  also lost Claude Code's exit-2 ("block with stderr") signal on the
+  script-fork path. Restored exit-code preservation via a testable
+  `permsGuardExit` indirection (production: `os.Exit(code)`; tests:
+  recorder hook). Deny / ask-decline paths still `return err` →
+  cobra-exit-1. Mirrors `scope_guard.go`'s behavior. Locked by
+  `TestPermsGuard_ScriptFailureExitsWithChildCode`.
+
+### Added
+- **`internal/version` package**: shared `Version = "0.7.1"` constant
+  consumed by `internal/registry/index.go` (User-Agent header) and
+  `internal/engine/compile.go` (lockfile `GeneratedBy` field). Single
+  source of truth; future bumps update one literal.
+- **Round-trip command coverage for windsurf and continue**
+  (`internal/engine/roundtrip_test.go`): both tests now include a
+  `manual` / command fixture with a colon-bearing description
+  (`"Ship a release: cuts a tag, builds artifacts, publishes"`). This
+  closes the v0.7.0 reviewer's flagged coverage gap and provides ongoing
+  regression protection for the v0.7.0 YAML colon fix. (The Continue
+  importer has no command primitive in its source format, so its
+  round-trip is structurally asymmetric: Init seeds .agents/ from the
+  Continue source, the test writes `.agents/commands/deploy.md`
+  directly, then Compile asserts the windsurf-style output.)
+- **Doc comment for `extractToolAndAction` tool→key mapping** (N5) in
+  `cmd/agents/perms_guard.go`: per-tool key list (command / file_path /
+  path / filepath / notebook_path / url) is now part of the wrapper-script
+  contract documentation.
+- **`--interactive` flag help bolstered** (N4): `cmd/agents/init.go`
+  mentions EOF=accept-all and non-TTY refusal. `interactive.go` doc
+  comment got concrete CLI examples (Ctrl-D, non-newline-terminated
+  pipe, closed pipe mid-stream) and the "fail safe / over-include"
+  rationale.
+
+### Changed
+- **Wrapper-renderer signatures** (`plugins/perms_wrapper.go`,
+  `plugins/claude.go`): `buildPermsGuardScript` and `buildScopeGuardScript`
+  now take a `wrapperRel` first argument so the renderer can compute the
+  correct `../..` depth via the new `rootRelativeFromWrapper` helper.
+  Callers in the same packages updated. No external API impact.
+
 ## v0.7.0
 
 ### Added
