@@ -389,6 +389,13 @@ func hasUsableHooks(hs []*model.Hook) bool {
 //
 // Scoped hooks point their `command` at the wrapper's absolute path
 // (resolved via wrapperPaths) so the scope-guard runs first.
+//
+// Portability note: Cursor's hooks.json has no ${PROJECT_DIR}-style
+// substitution, so wrapper paths are baked in as absolute. Moving the
+// project tree (mv / rsync / container mount) requires re-running
+// `prism compile` to refresh the paths. Gemini's settings.json hooks do
+// support env-var interpolation — see plugins/gemini.go for the
+// ${PROJECT_DIR} form used there.
 func (p *CursorPlugin) buildHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, []plugin.Warning) {
 	type hookEntry struct {
 		Matcher string `json:"matcher,omitempty"`
@@ -577,12 +584,8 @@ func renderMDC(description string, globs []string, alwaysApply bool, body string
 		b.WriteString("\n")
 	}
 	if len(globs) > 0 {
-		raw, err := json.Marshal(globs)
-		if err != nil {
-			raw = []byte("[]")
-		}
 		b.WriteString("globs: ")
-		b.Write(raw)
+		b.WriteString(renderGlobs(globs))
 		b.WriteString("\n")
 	}
 	if alwaysApply {
@@ -646,21 +649,18 @@ func renderCursorSkillBody(sk *model.Skill) string {
 	if hasFM {
 		b.WriteString("---\n")
 		if sk.Description != "" {
-			desc, _ := json.Marshal(sk.Description)
 			b.WriteString("description: ")
-			b.Write(desc)
+			b.WriteString(renderYAMLScalar(sk.Description))
 			b.WriteString("\n")
 		}
 		if sk.Trigger != "" {
-			trig, _ := json.Marshal(sk.Trigger)
 			b.WriteString("trigger: ")
-			b.Write(trig)
+			b.WriteString(renderYAMLScalar(sk.Trigger))
 			b.WriteString("\n")
 		}
 		if len(sk.Globs) > 0 {
-			raw, _ := json.Marshal(sk.Globs)
 			b.WriteString("globs: ")
-			b.Write(raw)
+			b.WriteString(renderGlobs(sk.Globs))
 			b.WriteString("\n")
 		}
 		b.WriteString("---\n")

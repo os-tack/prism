@@ -4,6 +4,104 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.8.1
+
+Importer parity for the v0.8.0 emissions, helper consolidation, and a
+nit sweep from the v0.8.0 reviewer. Closes the silent-data-loss path
+where `prism init --from <tool>` against a v0.8-projected repo dropped
+the new primitives (agents, native skills, hooks, MCP, workflows,
+permissions).
+
+### Fixed
+- **Importer parity for all six rewritten plugins** (the headline fix —
+  silent data loss on round-trip).
+  - **cursor** (`internal/importer/cursor.go`): reads `.cursor/agents/`,
+    `.cursor/skills/<dir>/SKILL.md`, `.cursor/commands/`, and
+    `.cursor/hooks.json`. Wrapper paths under `__scope-guard__/` are
+    skipped (projection artifacts, not source-of-truth hooks).
+  - **cline** (`internal/importer/cline.go`): reads
+    `.clinerules/workflows/<n>.md` (the v0.8 native slash-command form
+    that replaced `30-command-*.md`), `.clinerules/hooks/<event>.json`,
+    and `.cline/cline_mcp_settings.json`. The 30-command-* prefix is
+    still recognized for backward compat; workflows take precedence.
+  - **gemini** (`internal/importer/gemini.go`): reads `.gemini/agents/`,
+    `.gemini/commands/<n>.toml` (extracts the `prompt` body and
+    description, reverses TOML triple-quote escaping), and the `hooks`
+    block in `.gemini/settings.json`.
+  - **windsurf** (`internal/importer/windsurf.go`): reads
+    `.windsurf/hooks.json` (strips the `bash '...'` wrapper the plugin
+    adds) and `.windsurf/mcp_config.json`.
+  - **copilot** (`internal/importer/copilot.go`): reads
+    `.github/agents/<slug>.agent.md`, `.github/mcp.json`, and root
+    `.mcp.json` (the Copilot CLI walks cwd→git-root loading every
+    `.mcp.json` — project-local overrides root by name).
+  - **continue** (`internal/importer/continue.go`): reads
+    `.continue/prompts/<n>.md` and `.continue/permissions.yaml`. The
+    permissions translation reverses the plugin's
+    `tool:pattern` → `Tool(pattern)` rewrite.
+- **`sanitizeTOMLTripleQuoted` was lossy for 4+ consecutive quotes**
+  (`plugins/gemini.go`): the prior `"""` → `""\"` form produced
+  `""\""` when followed by a bare `"`, which TOML reads as `""` plus
+  a stray `\""` (premature termination). The replacement walks every
+  run of three-or-more consecutive quotes and backslash-escapes each
+  quote individually. Locked by `TestGemini_Command_FourQuoteEscape`.
+- **Windsurf hooks Sources append could mutate the input slice** if
+  cap > len (`plugins/windsurf.go`): switched to a defensive copy via
+  `append([]string{}, "hooks.yaml")`.
+
+### Added
+- **mapClineEvent**: `plugins/cline.go` now translates Claude-style
+  hook event aliases (`SessionStart` → `TaskStart`, `Stop` →
+  `TaskComplete`) into Cline's native event names. Cline-native event
+  names (TaskStart, TaskResume, UserPromptSubmit, PreToolUse,
+  PostToolUse, TaskComplete, TaskCancel) pass through verbatim.
+  Documented in the plugin doc comment alongside the mapping table.
+- **`plugins/frontmatter.go`**: shared `renderYAMLScalar(s string)`
+  and `renderGlobs(globs []string)` helpers that JSON-marshal as a
+  YAML flow scalar/array. Replaces `yamlScalar` (cline.go), `yamlQuote`
+  (copilot.go), and 7 inline `json.Marshal(...)` sites across cursor,
+  continue, gemini, windsurf, and cursor's skill renderer. Unifies the
+  (slightly different) escaping rules; everything is now JSON-quoted
+  which is more conservative but always valid YAML.
+- **Round-trip v0.8 coverage** (`internal/engine/roundtrip_v08_test.go`):
+  six new tests seeding v0.8-shape inputs (`.cursor/agents/`,
+  `.cursor/skills/`, `.cursor/hooks.json`,
+  `.cline/cline_mcp_settings.json`, `.clinerules/workflows/`,
+  `.clinerules/hooks/`, `.windsurf/hooks.json`, `.windsurf/mcp_config.json`,
+  `.gemini/agents/`, `.gemini/commands/*.toml`, hooks in settings.json,
+  `.github/agents/`, `.continue/prompts/`, `.continue/permissions.yaml`).
+  The existing v0.7-shape round-trips remain to lock the legacy paths.
+
+### Changed
+- **Hook portability doc notes** (`plugins/cursor.go`, `plugins/cline.go`,
+  `plugins/windsurf.go`, `plugins/gemini.go`): added comment headers
+  explaining that cursor/cline/windsurf hooks.json have no
+  `${PROJECT_DIR}`-style substitution (wrapper paths bake in as
+  absolute; `mv` of the project requires re-running `prism compile`).
+  Gemini's settings.json hooks DO support env-var interpolation, so
+  the `${PROJECT_DIR}/<rel>` form there survives a `mv`.
+- **Continue plugin MCP loop**: collapsed the two passes over `proj.MCP`
+  (one for ops, one for warnings) into a single pass that emits both
+  in the same iteration. No behavior change.
+- **`internal/version.Version` bumped to `0.8.1`**. (v0.8.0 was tagged
+  with the version literal still at `0.7.3` — this release also fixes
+  that drift.)
+
+### Sequenced for v0.8.2+
+
+- **scope-guard JSON envelope shape for Windsurf**: Windsurf Cascade
+  Hooks send `file_path` at the root of the JSON payload (not under
+  `tool_input.file_path`), so `prism scope-guard`'s
+  `extractToolFilePath` returns "" and the wrapper silently no-ops. The
+  v0.8.0 review flagged this as a documented limitation; full support
+  requires widening the extractor.
+- **Copilot preview hooks**: gate behind `--enable-preview-hooks` when
+  GA lands.
+- **Cursor PERMS via sandbox profile** (`sandbox.json` domain
+  allowlists): could upgrade Permissions from `----` to `native`.
+- **Cline + Copilot PERMS via PreToolUse hooks**: both now have native
+  hooks, so perms could be enforced via the perms-guard wrapper pattern.
+
 ## v0.8.0
 
 Major plugin parity release. **Six of eight plugins** rewritten to match each

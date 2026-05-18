@@ -495,7 +495,7 @@ func renderCopilotInstructions(applyTo, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString("applyTo: ")
-	b.WriteString(yamlQuote(applyTo))
+	b.WriteString(renderYAMLScalar(applyTo))
 	b.WriteString("\n")
 	b.WriteString("---\n")
 	if body != "" {
@@ -514,7 +514,7 @@ func renderCopilotPrompt(description, promptMode, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString("description: ")
-	b.WriteString(yamlQuote(description))
+	b.WriteString(renderYAMLScalar(description))
 	b.WriteString("\n")
 	if promptMode != "" {
 		b.WriteString("mode: ")
@@ -550,10 +550,10 @@ func renderCopilotAgent(agent *model.Agent, body string) string {
 
 	// Canonical keys first.
 	b.WriteString("name: ")
-	b.WriteString(yamlQuote(agent.Name))
+	b.WriteString(renderYAMLScalar(agent.Name))
 	b.WriteString("\n")
 	b.WriteString("description: ")
-	b.WriteString(yamlQuote(agent.Description))
+	b.WriteString(renderYAMLScalar(agent.Description))
 	b.WriteString("\n")
 
 	// Pass-through everything else from the source frontmatter, alpha order.
@@ -604,7 +604,7 @@ func renderYAMLValue(v any) string {
 	case nil:
 		return `""`
 	case string:
-		return yamlQuote(x)
+		return renderYAMLScalar(x)
 	case bool:
 		if x {
 			return "true"
@@ -629,7 +629,7 @@ func renderYAMLValue(v any) string {
 	case []string:
 		parts := make([]string, 0, len(x))
 		for _, item := range x {
-			parts = append(parts, yamlQuote(item))
+			parts = append(parts, renderYAMLScalar(item))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case map[string]any:
@@ -645,17 +645,8 @@ func renderYAMLValue(v any) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	default:
 		// Best-effort fallback.
-		return yamlQuote(fmt.Sprintf("%v", x))
+		return renderYAMLScalar(fmt.Sprintf("%v", x))
 	}
-}
-
-// yamlQuote returns a double-quoted YAML scalar with the minimal escaping
-// needed for the kinds of strings we emit (globs and descriptions). It
-// always quotes — even when the string is "safe" — to avoid surprises with
-// glob characters and YAML's many implicit-type rules.
-func yamlQuote(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
-	return `"` + r.Replace(s) + `"`
 }
 
 // copilotMCPServerJSON is the schema Copilot expects under `.github/mcp.json`'s

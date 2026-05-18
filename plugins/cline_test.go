@@ -122,7 +122,7 @@ func TestCline_Scope(t *testing.T) {
 	if !strings.HasPrefix(op.Content, "---\n") {
 		t.Errorf("content should start with YAML frontmatter\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") {
+	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") && !strings.Contains(op.Content, "paths:\n  - \"src/billing/**\"") {
 		t.Errorf("content missing paths: frontmatter\n---\n%s", op.Content)
 	}
 	if len(op.Sources) != 1 || op.Sources[0] != "src/billing/context.md" {
@@ -164,7 +164,7 @@ func TestCline_Scope_GlobsOnly(t *testing.T) {
 	if !strings.Contains(ops[0].Content, "> Triggers: src/api/**, tests/api/**") {
 		t.Errorf("missing globs trigger line\n---\n%s", ops[0].Content)
 	}
-	if !strings.Contains(ops[0].Content, "paths:\n  - src/api/**\n  - tests/api/**") {
+	if !strings.Contains(ops[0].Content, "paths:\n  - src/api/**\n  - tests/api/**") && !strings.Contains(ops[0].Content, "paths:\n  - \"src/api/**\"\n  - \"tests/api/**\"") {
 		t.Errorf("missing paths: frontmatter\n---\n%s", ops[0].Content)
 	}
 }
@@ -399,7 +399,7 @@ func TestCline_Commands_AsWorkflows(t *testing.T) {
 	if !strings.Contains(op.Content, "Run deploy script and verify.") {
 		t.Errorf("content missing body\n---\n%s", op.Content)
 	}
-	if !strings.HasPrefix(op.Content, "---\ndescription: Deploy to staging\n---\n") {
+	if !strings.HasPrefix(op.Content, "---\ndescription: Deploy to staging\n---\n") && !strings.HasPrefix(op.Content, "---\ndescription: \"Deploy to staging\"\n---\n") {
 		t.Errorf("content missing description frontmatter\n---\n%s", op.Content)
 	}
 	for _, w := range op.Warnings {
@@ -452,7 +452,7 @@ func TestCline_ScopedSkill(t *testing.T) {
 	if !strings.Contains(op.Content, "Append hash-chain entries to ledger.") {
 		t.Errorf("content missing body\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") {
+	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") && !strings.Contains(op.Content, "paths:\n  - \"src/billing/**\"") {
 		t.Errorf("content missing paths: frontmatter\n---\n%s", op.Content)
 	}
 	// Scope must appear before the Skill header.
@@ -869,10 +869,10 @@ func TestCline_Rules_FrontmatterPaths(t *testing.T) {
 		t.Fatalf("missing scope op; got %v", opPathSet(ops))
 	}
 	fm := extractFrontmatter(t, scopeOp.Content)
-	if !strings.Contains(fm, "description: REST handler conventions") {
+	if !strings.Contains(fm, `description: "REST handler conventions"`) && !strings.Contains(fm, "description: REST handler conventions") {
 		t.Errorf("scope frontmatter missing description:\n%s", fm)
 	}
-	if !strings.Contains(fm, "paths:\n  - src/api/**/*.go\n  - tests/api/**") {
+	if !strings.Contains(fm, "paths:\n  - src/api/**/*.go\n  - tests/api/**") && !strings.Contains(fm, "paths:\n  - \"src/api/**/*.go\"\n  - \"tests/api/**\"") {
 		t.Errorf("scope frontmatter missing paths array:\n%s", fm)
 	}
 
@@ -881,7 +881,7 @@ func TestCline_Rules_FrontmatterPaths(t *testing.T) {
 		t.Fatalf("missing skill op; got %v", opPathSet(ops))
 	}
 	sfm := extractFrontmatter(t, skillOp.Content)
-	if !strings.Contains(sfm, "description: Tag spans with request IDs") {
+	if !strings.Contains(sfm, `description: "Tag spans with request IDs"`) && !strings.Contains(sfm, "description: Tag spans with request IDs") {
 		t.Errorf("skill frontmatter missing description:\n%s", sfm)
 	}
 	// `**/*.go` begins with `*` (a YAML alias indicator), so yamlScalar

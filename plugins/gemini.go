@@ -413,21 +413,13 @@ func renderGeminiAgent(name, description, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if name != "" {
-		raw, err := json.Marshal(name)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("name: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(name))
 		b.WriteString("\n")
 	}
 	if description != "" {
-		raw, err := json.Marshal(description)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("description: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
 	}
 	b.WriteString("---\n")
@@ -446,12 +438,8 @@ func renderGeminiAgent(name, description, body string) string {
 func renderGeminiCommand(description, body string) string {
 	var b strings.Builder
 	if description != "" {
-		raw, err := json.Marshal(description)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("description = ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
 	}
 	b.WriteString("prompt = \"\"\"\n")
@@ -463,13 +451,43 @@ func renderGeminiCommand(description, body string) string {
 	return b.String()
 }
 
-// sanitizeTOMLTripleQuoted escapes a literal """ inside the body by
-// inserting a backslash, preventing premature string termination.
+// sanitizeTOMLTripleQuoted escapes a literal """ inside a body so it
+// can't prematurely terminate the surrounding triple-quoted string. Every
+// quote inside any """ run gets escaped individually (\" → escaped quote),
+// which keeps a following bare `"` from re-closing the string. The earlier
+// `"""` → `""\"` form was lossy: a body containing `""""` would emit
+// `""\""`, which TOML reads as `""` (empty string) plus a stray `\""`.
 func sanitizeTOMLTripleQuoted(s string) string {
 	if !strings.Contains(s, `"""`) {
 		return s
 	}
-	return strings.ReplaceAll(s, `"""`, `""\"`)
+	// Walk the string. Whenever a run of >=3 consecutive quotes is found,
+	// escape every quote in that run. This is conservative (it over-escapes
+	// `""""` which TOML doesn't strictly require), but it never produces a
+	// malformed string.
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '"' {
+			j := i
+			for j < len(s) && s[j] == '"' {
+				j++
+			}
+			if j-i >= 3 {
+				for k := i; k < j; k++ {
+					b.WriteString(`\"`)
+				}
+			} else {
+				b.WriteString(s[i:j])
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // geminiMCPServerJSON is the schema Gemini CLI expects for entries under
@@ -500,6 +518,12 @@ type geminiHookGroup struct {
 // engine reads the existing file and passes its bytes to the Merger; Plan()
 // does not touch disk. The merger preserves any user-authored top-level
 // keys; only mcpServers and hooks are touched.
+//
+// Portability note: Gemini's settings.json hook commands use
+// ${PROJECT_DIR}/<rel> so the projection survives `mv` of the project
+// tree. This is the only host of the v0.8 group whose hook config supports
+// env-var interpolation — cursor / cline / windsurf all bake absolute
+// paths and require a re-`prism compile` after a move.
 func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, error) {
 	relPath := filepath.Join(".gemini", "settings.json")
 

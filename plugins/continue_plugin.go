@@ -25,7 +25,6 @@
 package plugins
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -292,7 +291,8 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 
 	// MCP servers → one .continue/mcpServers/<slug>.yaml per server.
 	// Scoped MCP servers project to the same global file set with an info
-	// warning per server (Continue has no per-scope MCP).
+	// warning per server (Continue has no per-scope MCP). One pass emits both
+	// the op and the warning (was two passes — collapsed in v0.8.1).
 	for _, srv := range proj.MCP {
 		if srv == nil || srv.Name == "" {
 			continue
@@ -302,16 +302,13 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			return nil, err
 		}
 		ops = append(ops, op)
-	}
-	for _, srv := range proj.MCP {
-		if srv == nil || srv.ScopePath == "" {
-			continue
+		if srv.ScopePath != "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("Continue has no per-scope MCP; scoped server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
+				Severity: "info",
+			})
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "",
-			Message:  fmt.Sprintf("Continue has no per-scope MCP; scoped server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
-			Severity: "info",
-		})
 	}
 
 	// Attach orphan warnings to the first available op.
@@ -538,21 +535,13 @@ func renderContinuePrompt(name, description, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if name != "" {
-		raw, err := json.Marshal(name)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("name: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(name))
 		b.WriteString("\n")
 	}
 	if description != "" {
-		raw, err := json.Marshal(description)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("description: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
 	}
 	b.WriteString("invokable: true\n")
@@ -641,21 +630,13 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 	var b strings.Builder
 	b.WriteString("---\n")
 	if description != "" {
-		raw, err := json.Marshal(description)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("description: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
 	}
 	if len(globs) > 0 {
-		raw, err := json.Marshal(globs)
-		if err != nil {
-			raw = []byte("[]")
-		}
 		b.WriteString("globs: ")
-		b.Write(raw)
+		b.WriteString(renderGlobs(globs))
 		b.WriteString("\n")
 	}
 	if alwaysApply {

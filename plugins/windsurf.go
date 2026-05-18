@@ -396,21 +396,13 @@ func renderWindsurfRule(fm windsurfFrontmatter, body string) string {
 		b.WriteString("\n")
 	}
 	if len(fm.Globs) > 0 {
-		raw, err := json.Marshal(fm.Globs)
-		if err != nil {
-			raw = []byte("[]")
-		}
 		b.WriteString("globs: ")
-		b.Write(raw)
+		b.WriteString(renderGlobs(fm.Globs))
 		b.WriteString("\n")
 	}
 	if fm.Description != "" {
-		raw, err := json.Marshal(fm.Description)
-		if err != nil {
-			raw = []byte("\"\"")
-		}
 		b.WriteString("description: ")
-		b.Write(raw)
+		b.WriteString(renderYAMLScalar(fm.Description))
 		b.WriteString("\n")
 	}
 	b.WriteString("---\n")
@@ -533,6 +525,10 @@ func classifyToolMatcher(matcher, phase string) string {
 // other than "hooks") on the next prism run, mirroring
 // claude.go:buildSettingsOp.
 //
+// Portability note: Windsurf's hooks.json has no ${PROJECT_DIR}-style
+// substitution, so wrapper paths are baked in as absolute. Moving the
+// project tree requires re-running `prism compile` to refresh paths.
+//
 // Returns (op, warnings, err). Warnings are returned separately so the
 // caller can fold them onto the first op (which may not be this one if
 // every input hook drops with a warning).
@@ -636,7 +632,7 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 		Kind:    plugin.OpMerge,
 		Path:    relPath,
 		Mode:    plugin.ModeWrite,
-		Sources: append([]string{"hooks.yaml"}, sources...),
+		Sources: append(append([]string{}, "hooks.yaml"), sources...),
 		Plugin:  "windsurf",
 		Merger:  merger,
 	}

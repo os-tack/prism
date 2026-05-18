@@ -1,5 +1,13 @@
-// cursor.go: imports .cursor/rules/*.mdc + .cursor/mcp.json into the
+// cursor.go: imports .cursor/rules/*.mdc + .cursor/mcp.json plus the
+// v0.8.0 Cursor 2.4+ surfaces (agents, skills, commands, hooks) into the
 // canonical *model.Project shape.
+//
+// v0.8.0 additions (mirrors plugins/cursor.go emissions):
+//
+//   .cursor/agents/<n>.md              → model.Agent (frontmatter + body)
+//   .cursor/skills/<dir>/SKILL.md      → model.Skill (frontmatter + body)
+//   .cursor/commands/<n>.md            → model.Command (bare markdown body)
+//   .cursor/hooks.json                 → model.Hook entries (one per (event, entry))
 //
 // Mapping (per /tmp/prism-v0.5-design.md lines 168-208):
 //
@@ -156,6 +164,81 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 		proj.Scopes = append(proj.Scopes, scopeByPath[p])
 	}
 
+	// .cursor/skills/<dir>/SKILL.md (Cursor 2.4+ native skills format).
+	// The directory name becomes the skill name; the SKILL.md body carries
+	// its own YAML frontmatter (description, trigger, globs) just like the
+	// Claude format.
+	skillsRoot := filepath.Join(root, ".cursor", "skills")
+	cursorSkillEntries, err := os.ReadDir(skillsRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("cursor: read %s: %w", skillsRoot, err)
+	}
+	sort.Slice(cursorSkillEntries, func(a, b int) bool { return cursorSkillEntries[a].Name() < cursorSkillEntries[b].Name() })
+	for _, e := range cursorSkillEntries {
+		if !e.IsDir() {
+			continue
+		}
+		skillMD := filepath.Join(skillsRoot, e.Name(), "SKILL.md")
+		data, rerr := os.ReadFile(skillMD)
+		if rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				continue
+			}
+			return nil, nil, fmt.Errorf("cursor: read %s: %w", skillMD, rerr)
+		}
+		fm, body, perr := splitFrontmatter(data)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("cursor: %s: %w", skillMD, perr)
+		}
+		name := slugifyName(e.Name())
+		if name == "" {
+			name = "skill"
+		}
+		name = uniqueName("cursor", name, func(candidate string) bool {
+			for _, sk := range proj.Skills {
+				if sk.Name == candidate {
+					return true
+				}
+			}
+			return false
+		})
+		desc, _ := fm["description"].(string)
+		trig, _ := fm["trigger"].(string)
+		globs := stringSliceAny(fm["globs"])
+		proj.Skills = append(proj.Skills, &model.Skill{
+			Name:        name,
+			Description: desc,
+			Trigger:     trig,
+			Globs:       globs,
+			Document: &model.Document{
+				SourcePath:  skillMD,
+				Frontmatter: fm,
+				Body:        provenanceComment("cursor", skillMD) + body,
+			},
+		})
+	}
+
+	// .cursor/agents/<n>.md (Cursor 2.4+ subagents).
+	cursorAgents, err := readCursorAgents(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	proj.Agents = append(proj.Agents, cursorAgents...)
+
+	// .cursor/commands/<n>.md (Cursor 2.4+ slash commands; bare markdown).
+	cursorCmds, err := readCursorCommands(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	proj.Commands = append(proj.Commands, cursorCmds...)
+
+	// .cursor/hooks.json (Cursor 2.4+ hook dispatch table).
+	cursorHooks, err := readCursorHooks(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	proj.Hooks = append(proj.Hooks, cursorHooks...)
+
 	// .cursor/mcp.json.
 	mcpPath := filepath.Join(root, ".cursor", "mcp.json")
 	mcps, err := readCursorMCP(mcpPath)
@@ -165,6 +248,136 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 	proj.MCP = mcps
 
 	return proj, warnings, nil
+}
+
+// readCursorAgents reads .cursor/agents/<n>.md into []*model.Agent.
+// Each file is a markdown document with optional YAML frontmatter; the
+// filename (sans .md) becomes the agent name.
+func readCursorAgents(root string) ([]*model.Agent, error) {
+	dir := filepath.Join(root, ".cursor", "agents")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cursor: read %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].Name() < entries[b].Name() })
+	var out []*model.Agent
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return nil, fmt.Errorf("cursor: read %s: %w", full, rerr)
+		}
+		fm, body, perr := splitFrontmatter(data)
+		if perr != nil {
+			return nil, fmt.Errorf("cursor: %s: %w", full, perr)
+		}
+		name := strings.TrimSuffix(e.Name(), ".md")
+		desc, _ := fm["description"].(string)
+		out = append(out, &model.Agent{
+			Name:        name,
+			Description: desc,
+			Document: &model.Document{
+				SourcePath:  full,
+				Frontmatter: fm,
+				Body:        provenanceComment("cursor", full) + body,
+			},
+		})
+	}
+	return out, nil
+}
+
+// readCursorCommands reads .cursor/commands/<n>.md into []*model.Command.
+// Cursor commands are bare markdown (no frontmatter required); we still
+// pass any frontmatter through for forward-compat.
+func readCursorCommands(root string) ([]*model.Command, error) {
+	dir := filepath.Join(root, ".cursor", "commands")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cursor: read %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].Name() < entries[b].Name() })
+	var out []*model.Command
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return nil, fmt.Errorf("cursor: read %s: %w", full, rerr)
+		}
+		fm, body, perr := splitFrontmatter(data)
+		if perr != nil {
+			return nil, fmt.Errorf("cursor: %s: %w", full, perr)
+		}
+		name := strings.TrimSuffix(e.Name(), ".md")
+		desc, _ := fm["description"].(string)
+		out = append(out, &model.Command{
+			Name:        name,
+			Description: desc,
+			Document: &model.Document{
+				SourcePath:  full,
+				Frontmatter: fm,
+				Body:        provenanceComment("cursor", full) + body,
+			},
+		})
+	}
+	return out, nil
+}
+
+// readCursorHooks reads .cursor/hooks.json into []*model.Hook. Hook entries
+// pointing at our own scope-guard wrappers (.cursor/hooks/__scope-guard__/)
+// are recognized and skipped from re-import — they're projection artifacts,
+// not source-of-truth hooks.
+func readCursorHooks(root string) ([]*model.Hook, error) {
+	path := filepath.Join(root, ".cursor", "hooks.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cursor: read %s: %w", path, err)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var raw struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("cursor: parse %s: %w", path, err)
+	}
+	events := make([]string, 0, len(raw.Hooks))
+	for ev := range raw.Hooks {
+		events = append(events, ev)
+	}
+	sort.Strings(events)
+	var out []*model.Hook
+	for _, ev := range events {
+		for _, entry := range raw.Hooks[ev] {
+			if strings.Contains(entry.Command, "__scope-guard__") {
+				continue
+			}
+			out = append(out, &model.Hook{
+				Event:      ev,
+				Matcher:    entry.Matcher,
+				ScriptPath: entry.Command,
+			})
+		}
+	}
+	return out, nil
 }
 
 // addSkill appends a Skill derived from one .mdc file.

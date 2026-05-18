@@ -1023,3 +1023,53 @@ func TestGemini_Capabilities_FeatureFlipped(t *testing.T) {
 		t.Errorf("Skills = %v, want SupportDegraded (projected as agents)", caps.Skills)
 	}
 }
+
+// TestGemini_Command_FourQuoteEscape covers the v0.8.1 fix to
+// sanitizeTOMLTripleQuoted: a body containing four consecutive quotes
+// (e.g. """ immediately followed by a bare ") used to produce ""\""
+// which TOML reads as `""` + `\""` — i.e. closes the string early. The
+// fix escapes every quote in any run of three-or-more.
+func TestGemini_Command_FourQuoteEscape(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Commands: []*model.Command{
+			{
+				Name: "edge",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/commands/edge.md",
+					Body:       `payload """" ends`,
+				},
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var cmdOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == filepath.Join(".gemini", "commands", "edge.toml") {
+			cmdOp = &ops[i]
+		}
+	}
+	if cmdOp == nil {
+		t.Fatalf("missing edge.toml op")
+	}
+	body := strings.TrimPrefix(cmdOp.Content, `prompt = """`+"\n")
+	idx := strings.LastIndex(body, `"""`)
+	if idx < 0 {
+		t.Fatalf("no closer in content:\n%s", cmdOp.Content)
+	}
+	inner := body[:idx]
+	// All four input quotes should be backslash-escaped — no unescaped
+	// quote runs survive in the inner content.
+	if strings.Contains(inner, `""`) && !strings.Contains(inner, `\"`) {
+		t.Errorf("inner contains an unescaped quote run:\n%s", inner)
+	}
+	// Specifically: no 3-in-a-row bare quotes inside.
+	if strings.Contains(inner, `"""`) {
+		t.Errorf("inner still contains a literal triple-quote:\n%s", inner)
+	}
+}

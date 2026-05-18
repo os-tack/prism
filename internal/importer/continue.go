@@ -6,6 +6,14 @@
 //                                description, alwaysApply
 //   .continue/mcpServers/*.yaml  one server per file
 //
+// v0.8.0 additions (mirrors plugins/continue_plugin.go emissions):
+//
+//   .continue/prompts/<n>.md    → model.Command (frontmatter: name,
+//                                  description, invokable: true)
+//   .continue/permissions.yaml  → model.Permissions (allow / ask / exclude
+//                                  with Tool(pattern) syntax — translated
+//                                  back to tool:pattern for the canonical model)
+//
 // Mapping:
 //   - alwaysApply: true AND no globs    → append body to .agents/context.md
 //   - regex:                            → warn and drop (not in canonical model)
@@ -225,7 +233,136 @@ func (c *ContinueImporter) Import(root string) (*model.Project, []Warning, error
 	}
 	sort.Slice(proj.MCP, func(i, j int) bool { return proj.MCP[i].Name < proj.MCP[j].Name })
 
+	// .continue/prompts/<n>.md — v0.8 native invokable slash commands.
+	prompts, perr := readContinuePrompts(root)
+	if perr != nil {
+		return nil, nil, perr
+	}
+	for _, cmd := range prompts {
+		proj.Commands = append(proj.Commands, cmd)
+	}
+
+	// .continue/permissions.yaml — v0.8 native permissions (replaces the
+	// perms-guard wrapper round-trip).
+	perms, perr := readContinuePermissions(root)
+	if perr != nil {
+		return nil, nil, perr
+	}
+	if perms != nil {
+		proj.Permissions = perms
+	}
+
 	return proj, warnings, nil
+}
+
+// readContinuePrompts reads .continue/prompts/<n>.md into []*model.Command.
+// Frontmatter `name` overrides the basename when present; the filename
+// (sans .md) is the fallback. Plugin sets `invokable: true` in every
+// prompt; we keep that in the frontmatter pass-through.
+func readContinuePrompts(root string) ([]*model.Command, error) {
+	dir := filepath.Join(root, ".continue", "prompts")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("continue: read %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].Name() < entries[b].Name() })
+	var out []*model.Command
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return nil, fmt.Errorf("continue: read %s: %w", full, rerr)
+		}
+		fm, body, fmerr := splitFrontmatter(data)
+		if fmerr != nil {
+			return nil, fmt.Errorf("continue: %s: %w", full, fmerr)
+		}
+		name := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		if n, ok := fm["name"].(string); ok && n != "" {
+			name = n
+		}
+		desc, _ := fm["description"].(string)
+		out = append(out, &model.Command{
+			Name:        name,
+			Description: desc,
+			Document: &model.Document{
+				SourcePath:  full,
+				Frontmatter: fm,
+				Body:        provenanceComment(continueTool, full) + body,
+			},
+		})
+	}
+	return out, nil
+}
+
+// readContinuePermissions reads .continue/permissions.yaml into
+// *model.Permissions, reversing the plugin's Tool(pattern) → tool:pattern
+// translation. Returns (nil, nil) when absent or empty.
+func readContinuePermissions(root string) (*model.Permissions, error) {
+	path := filepath.Join(root, ".continue", "permissions.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("continue: read %s: %w", path, err)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var raw struct {
+		Allow   []string `yaml:"allow"`
+		Ask     []string `yaml:"ask"`
+		Exclude []string `yaml:"exclude"`
+	}
+	if uerr := yaml.Unmarshal(data, &raw); uerr != nil {
+		return nil, fmt.Errorf("continue: parse %s: %w", path, uerr)
+	}
+	convert := func(in []string) []string {
+		out := make([]string, 0, len(in))
+		for _, r := range in {
+			out = append(out, continueRuleToCanonical(r))
+		}
+		return out
+	}
+	allow := convert(raw.Allow)
+	ask := convert(raw.Ask)
+	deny := convert(raw.Exclude)
+	if len(allow)+len(ask)+len(deny) == 0 {
+		return nil, nil
+	}
+	return &model.Permissions{
+		Allow: allow,
+		Deny:  deny,
+		Ask:   ask,
+	}, nil
+}
+
+// continueRuleToCanonical translates Continue's `Tool(pattern)` syntax
+// back to prism's canonical `tool:pattern`. Bare `Tool` (no parens)
+// becomes lowercased `tool` (no colon).
+func continueRuleToCanonical(rule string) string {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return ""
+	}
+	open := strings.Index(rule, "(")
+	if open < 0 {
+		return strings.ToLower(rule)
+	}
+	closeP := strings.LastIndex(rule, ")")
+	if closeP <= open {
+		return strings.ToLower(rule)
+	}
+	tool := strings.ToLower(strings.TrimSpace(rule[:open]))
+	pattern := rule[open+1 : closeP]
+	return tool + ":" + pattern
 }
 
 // continueDeriveSkillName prefers the frontmatter `name:` value, falling

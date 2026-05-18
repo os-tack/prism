@@ -41,7 +41,7 @@ SHA-256 sidecars next to each binary.
 
 ```
 # darwin/arm64 example
-curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.8.0-darwin-arm64
+curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.8.1-darwin-arm64
 chmod +x prism
 ./prism --help
 ```

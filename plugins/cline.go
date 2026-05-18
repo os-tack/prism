@@ -2,7 +2,31 @@
 //
 // ClinePlugin projects a canonical .agents/ directory into Cline (and
 // Roo Code, which uses the same convention) `.clinerules/` rule files,
-// plus the modern Cline primitives added in late 2025:
+// plus the modern Cline primitives added in late 2025.
+//
+// Hook.Event → Cline event mapping (canonical prism events on the left,
+// Cline-native event names on the right):
+//
+//	PreToolUse        → PreToolUse
+//	PostToolUse       → PostToolUse
+//	UserPromptSubmit  → UserPromptSubmit
+//	SessionStart      → TaskStart
+//	SessionEnd        → TaskComplete
+//	Stop              → TaskComplete
+//	Notification      → (no Cline analog; pass-through)
+//	SubagentStop      → (no Cline analog; pass-through)
+//	PreCompact        → (no Cline analog; pass-through)
+//
+// Cline-native event names (TaskStart, TaskResume, UserPromptSubmit,
+// PreToolUse, PostToolUse, TaskComplete, TaskCancel) pass through verbatim
+// so users targeting Cline can use the native names directly.
+//
+// Note on hook portability: the project-relative wrapper paths baked into
+// .clinerules/hooks/<event>.json are absolute paths from proj.Root. Cline's
+// hooks.json format has no ${PROJECT_DIR}-style substitution, so moving the
+// project tree (`mv`, `rsync`, container mount) requires re-running
+// `prism compile` to refresh the wrapper paths. Same constraint applies to
+// .cursor/hooks.json and .windsurf/hooks.json.
 //
 //   - YAML frontmatter on rule files (`paths:`, `description:`) — used
 //     to express ScopePaths natively.
@@ -82,6 +106,42 @@ func (p *ClinePlugin) Capabilities() plugin.Capabilities {
 		Permissions:   plugin.SupportUnsupported,
 		MCP:           plugin.SupportNative,
 	}
+}
+
+// clineHookEvents enumerates Cline's native hook event names. Used by
+// mapClineEvent to pass-through Cline-shaped event names verbatim.
+var clineHookEvents = map[string]struct{}{
+	"TaskStart":        {},
+	"TaskResume":       {},
+	"UserPromptSubmit": {},
+	"PreToolUse":       {},
+	"PostToolUse":      {},
+	"TaskComplete":     {},
+	"TaskCancel":       {},
+}
+
+// mapClineEvent translates a prism Hook.Event into a Cline-native event
+// name. Cline-shaped events pass through unchanged; Claude-style aliases
+// that map cleanly (SessionStart → TaskStart, Stop → TaskComplete) are
+// rewritten. Returns the input unchanged when no mapping is known — the
+// JSON file lands at .clinerules/hooks/<event>.json either way, but
+// users targeting Cline should prefer Cline-native names.
+func mapClineEvent(event string) string {
+	if event == "" {
+		return event
+	}
+	if _, ok := clineHookEvents[event]; ok {
+		return event
+	}
+	switch event {
+	case "SessionStart":
+		return "TaskStart"
+	case "SessionEnd", "Stop":
+		return "TaskComplete"
+	case "UserPrompt", "UserPromptSubmit":
+		return "UserPromptSubmit"
+	}
+	return event
 }
 
 // Plan produces the Operations needed to project proj into Cline's layout.
@@ -222,7 +282,7 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			continue
 		}
 		hookName := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
-		wrapperFile := scopeSlug(h.ScopePath) + "-" + h.Event + "-" + hookName + ".sh"
+		wrapperFile := scopeSlug(h.ScopePath) + "-" + mapClineEvent(h.Event) + "-" + hookName + ".sh"
 		wrapperRel := filepath.ToSlash(filepath.Join(".clinerules", "hooks", "__scope-guard__", wrapperFile))
 		wrapperAbs := filepath.Join(proj.Root, wrapperRel)
 
@@ -358,18 +418,19 @@ func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string)
 		if h == nil || h.Event == "" {
 			continue
 		}
-		if _, ok := buckets[h.Event]; !ok {
-			buckets[h.Event] = map[string][]clineHookEntry{}
-			eventOrder = append(eventOrder, h.Event)
+		ev := mapClineEvent(h.Event)
+		if _, ok := buckets[ev]; !ok {
+			buckets[ev] = map[string][]clineHookEntry{}
+			eventOrder = append(eventOrder, ev)
 		}
-		if _, ok := buckets[h.Event][h.Matcher]; !ok {
-			matcherOrder[h.Event] = append(matcherOrder[h.Event], h.Matcher)
+		if _, ok := buckets[ev][h.Matcher]; !ok {
+			matcherOrder[ev] = append(matcherOrder[ev], h.Matcher)
 		}
 		cmdPath := h.ScriptPath
 		if w, ok := wrapperPaths[h]; ok {
 			cmdPath = w
 		}
-		buckets[h.Event][h.Matcher] = append(buckets[h.Event][h.Matcher], clineHookEntry{
+		buckets[ev][h.Matcher] = append(buckets[ev][h.Matcher], clineHookEntry{
 			Type:    "command",
 			Command: cmdPath,
 		})
@@ -489,7 +550,7 @@ func renderClineScope(scope *model.Scope, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if scope.Description != "" {
-		fmt.Fprintf(&b, "description: %s\n", yamlScalar(scope.Description))
+		fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(scope.Description))
 	}
 	globs := scope.Globs
 	if len(globs) == 0 && scope.Path != "" {
@@ -498,7 +559,7 @@ func renderClineScope(scope *model.Scope, body string) string {
 	if len(globs) > 0 {
 		b.WriteString("paths:\n")
 		for _, g := range globs {
-			fmt.Fprintf(&b, "  - %s\n", yamlScalar(g))
+			fmt.Fprintf(&b, "  - %s\n", renderYAMLScalar(g))
 		}
 	}
 	b.WriteString("---\n\n")
@@ -528,7 +589,7 @@ func renderClineSkill(skill *model.Skill, body string) string {
 	if hasFrontmatter {
 		b.WriteString("---\n")
 		if skill.Description != "" {
-			fmt.Fprintf(&b, "description: %s\n", yamlScalar(skill.Description))
+			fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(skill.Description))
 		}
 		globs := skill.Globs
 		if len(globs) == 0 && skill.ScopePath != "" {
@@ -537,7 +598,7 @@ func renderClineSkill(skill *model.Skill, body string) string {
 		if len(globs) > 0 {
 			b.WriteString("paths:\n")
 			for _, g := range globs {
-				fmt.Fprintf(&b, "  - %s\n", yamlScalar(g))
+				fmt.Fprintf(&b, "  - %s\n", renderYAMLScalar(g))
 			}
 		}
 		b.WriteString("---\n\n")
@@ -573,7 +634,7 @@ func renderClineWorkflow(cmd *model.Command, body string) string {
 	hasFrontmatter := cmd.Description != ""
 	if hasFrontmatter {
 		b.WriteString("---\n")
-		fmt.Fprintf(&b, "description: %s\n", yamlScalar(cmd.Description))
+		fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(cmd.Description))
 		b.WriteString("---\n\n")
 	}
 	if cmd.ScopePath != "" {
@@ -591,35 +652,6 @@ func renderClineWorkflow(cmd *model.Command, body string) string {
 		}
 	}
 	return b.String()
-}
-
-// yamlScalar quotes a string for safe inclusion as a YAML scalar value
-// in our hand-rolled frontmatter writer. Strings containing characters
-// that YAML would interpret (`:`, `#`, leading/trailing whitespace, or
-// newlines) are wrapped in double quotes with " and \ escaped; plain
-// inputs are emitted unquoted. We intentionally keep this minimal
-// rather than pulling in a full YAML emitter, since the inputs are
-// human-authored description / glob strings, not arbitrary data.
-func yamlScalar(s string) string {
-	needsQuote := false
-	if s == "" {
-		return "\"\""
-	}
-	if strings.ContainsAny(s, ":#\n\r\t\"") {
-		needsQuote = true
-	}
-	if s[0] == ' ' || s[len(s)-1] == ' ' || s[0] == '-' || s[0] == '?' || s[0] == '!' || s[0] == '&' || s[0] == '*' || s[0] == '[' || s[0] == ']' || s[0] == '{' || s[0] == '}' || s[0] == '|' || s[0] == '>' || s[0] == '%' || s[0] == '@' || s[0] == '`' {
-		needsQuote = true
-	}
-	if !needsQuote {
-		return s
-	}
-	escaped := strings.ReplaceAll(s, `\`, `\\`)
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-	escaped = strings.ReplaceAll(escaped, "\n", `\n`)
-	escaped = strings.ReplaceAll(escaped, "\r", `\r`)
-	escaped = strings.ReplaceAll(escaped, "\t", `\t`)
-	return "\"" + escaped + "\""
 }
 
 // ensureTrailingNewline returns s with a trailing newline if it is

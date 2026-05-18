@@ -7,6 +7,13 @@
 //   .github/prompts/*.prompt.md               frontmatter: description,
 //                                                          agent, model, tools
 //
+// v0.8.0 additions (mirrors plugins/copilot.go emissions):
+//
+//   .github/agents/<slug>.agent.md  → model.Agent (frontmatter + body)
+//   .github/mcp.json                → model.MCPServer (standard mcpServers)
+//   .mcp.json (project root)        → also recognized (the Copilot CLI walks
+//                                     cwd→git-root loading every .mcp.json)
+//
 // Mapping:
 //   - .github/copilot-instructions.md         → .agents/context.md
 //   - <slug>.instructions.md (extension-only applyTo)
@@ -19,6 +26,7 @@
 package importer
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -47,6 +55,8 @@ func (c *CopilotImporter) Detect(root string) bool {
 		filepath.Join(root, ".github", "copilot-instructions.md"),
 		filepath.Join(root, ".github", "instructions"),
 		filepath.Join(root, ".github", "prompts"),
+		filepath.Join(root, ".github", "agents"),
+		filepath.Join(root, ".github", "mcp.json"),
 	}
 	for _, p := range markers {
 		if _, err := os.Stat(p); err == nil {
@@ -271,7 +281,149 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 		}
 	}
 
+	// .github/agents/<slug>.agent.md — v0.8 native Copilot agents.
+	agents, aerr := readCopilotAgents(root)
+	if aerr != nil {
+		return nil, nil, aerr
+	}
+	proj.Agents = append(proj.Agents, agents...)
+
+	// MCP: .github/mcp.json (project-local) and .mcp.json (root). The CLI
+	// walks from cwd toward the git root loading every .mcp.json it finds;
+	// the closer one wins. We import both and merge by name (project-local
+	// overrides root). Wrappers (none expected for Copilot but defensive).
+	rootMCP, merr := readCopilotMCPFile(filepath.Join(root, ".mcp.json"))
+	if merr != nil {
+		return nil, nil, merr
+	}
+	dotMCP, merr := readCopilotMCPFile(filepath.Join(root, ".github", "mcp.json"))
+	if merr != nil {
+		return nil, nil, merr
+	}
+	proj.MCP = mergeCopilotMCP(rootMCP, dotMCP)
+
 	return proj, warnings, nil
+}
+
+// readCopilotAgents reads .github/agents/<slug>.agent.md into []*model.Agent.
+// Strips the `.agent.md` suffix from the filename to recover the agent name;
+// `name` and `description` come from frontmatter when present.
+func readCopilotAgents(root string) ([]*model.Agent, error) {
+	dir := filepath.Join(root, ".github", "agents")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("copilot: read %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].Name() < entries[b].Name() })
+	var out []*model.Agent
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		lname := strings.ToLower(e.Name())
+		if !strings.HasSuffix(lname, ".agent.md") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return nil, fmt.Errorf("copilot: read %s: %w", full, rerr)
+		}
+		fm, body, perr := splitFrontmatter(data)
+		if perr != nil {
+			return nil, fmt.Errorf("copilot: %s: %w", full, perr)
+		}
+		base := strings.TrimSuffix(strings.TrimSuffix(e.Name(), ".md"), ".agent")
+		name := base
+		if n, ok := fm["name"].(string); ok && n != "" {
+			name = n
+		}
+		desc, _ := fm["description"].(string)
+		out = append(out, &model.Agent{
+			Name:        name,
+			Description: desc,
+			Document: &model.Document{
+				SourcePath:  full,
+				Frontmatter: fm,
+				Body:        provenanceComment(copilotTool, full) + body,
+			},
+		})
+	}
+	return out, nil
+}
+
+// readCopilotMCPFile reads one .mcp.json (standard {"mcpServers": {...}}
+// schema). Returns (nil, nil) when absent.
+func readCopilotMCPFile(path string) ([]*model.MCPServer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("copilot: read %s: %w", path, err)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var raw struct {
+		MCPServers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+			URL     string            `json:"url"`
+		} `json:"mcpServers"`
+	}
+	if jerr := json.Unmarshal(data, &raw); jerr != nil {
+		return nil, fmt.Errorf("copilot: parse %s: %w", path, jerr)
+	}
+	names := make([]string, 0, len(raw.MCPServers))
+	for n := range raw.MCPServers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]*model.MCPServer, 0, len(names))
+	for _, n := range names {
+		s := raw.MCPServers[n]
+		out = append(out, &model.MCPServer{
+			Name:    n,
+			Command: s.Command,
+			Args:    s.Args,
+			Env:     s.Env,
+			URL:     s.URL,
+		})
+	}
+	return out, nil
+}
+
+// mergeCopilotMCP combines two MCP server slices, with later entries
+// overriding earlier ones by Name. Output is sorted by Name for stability.
+func mergeCopilotMCP(base, override []*model.MCPServer) []*model.MCPServer {
+	byName := map[string]*model.MCPServer{}
+	for _, s := range base {
+		if s == nil || s.Name == "" {
+			continue
+		}
+		byName[s.Name] = s
+	}
+	for _, s := range override {
+		if s == nil || s.Name == "" {
+			continue
+		}
+		byName[s.Name] = s
+	}
+	names := make([]string, 0, len(byName))
+	for n := range byName {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]*model.MCPServer, 0, len(names))
+	for _, n := range names {
+		out = append(out, byName[n])
+	}
+	return out
 }
 
 // copilotApplyToList coerces the `applyTo` frontmatter value into a
