@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "IncludeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "MaxDepth": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "MaxDepth"
+      ],
+      "type": "object"
+    },
+    "TargetOption": {
+      "additionalProperties": false,
+      "properties": {
+        "Disabled": {
+          "type": "boolean"
+        },
+        "Extensions": {
+          "type": "object"
+        },
+        "Mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Mode",
+        "Disabled",
+        "Extensions"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/config",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Extensions": {
+      "type": "object"
+    },
+    "Include": {
+      "$ref": "#/$defs/IncludeConfig"
+    },
+    "Layers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "SchemaVersion": {
+      "type": "integer"
+    },
+    "TargetOptions": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TargetOption"
+      },
+      "type": "object"
+    },
+    "Targets": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "Targets",
+    "TargetOptions",
+    "Include",
+    "SchemaVersion",
+    "Extensions",
+    "Layers"
+  ],
+  "title": "AgentsConfig",
+  "type": "object"
+}

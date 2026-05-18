@@ -1,0 +1,122 @@
+{
+  "$defs": {
+    "MCPAuth": {
+      "additionalProperties": false,
+      "properties": {
+        "Headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "Scheme": {
+          "type": "string"
+        },
+        "Token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Scheme",
+        "Token",
+        "Headers"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/mcp-server",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Args": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Auth": {
+      "$ref": "#/$defs/MCPAuth"
+    },
+    "AutoApprove": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Command": {
+      "type": "string"
+    },
+    "Cwd": {
+      "type": "string"
+    },
+    "Disabled": {
+      "type": "boolean"
+    },
+    "Env": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "ExcludeTools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "Headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "IncludeTools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "ScopePath": {
+      "type": "string"
+    },
+    "TimeoutMs": {
+      "type": "integer"
+    },
+    "Transport": {
+      "type": "string"
+    },
+    "Trust": {
+      "type": "boolean"
+    },
+    "URL": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "Name",
+    "Command",
+    "Args",
+    "Env",
+    "URL",
+    "ScopePath",
+    "Transport",
+    "Cwd",
+    "Headers",
+    "Auth",
+    "TimeoutMs",
+    "Disabled",
+    "AutoApprove",
+    "Trust",
+    "IncludeTools",
+    "ExcludeTools",
+    "Extensions"
+  ],
+  "title": "MCPServer",
+  "type": "object"
+}

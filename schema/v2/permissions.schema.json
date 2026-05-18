@@ -1,0 +1,40 @@
+{
+  "$id": "https://prism.dev/schema/v2/permissions",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Allow": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Ask": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Deny": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "ScopePath": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "Allow",
+    "Deny",
+    "Ask",
+    "ScopePath",
+    "Extensions"
+  ],
+  "title": "Permissions",
+  "type": "object"
+}

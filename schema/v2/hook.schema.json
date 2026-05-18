@@ -1,0 +1,191 @@
+{
+  "$defs": {
+    "HookHandler": {
+      "additionalProperties": false,
+      "properties": {
+        "AllowedEnvVars": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Async": {
+          "type": "boolean"
+        },
+        "Bash": {
+          "type": "string"
+        },
+        "Command": {
+          "type": "string"
+        },
+        "Cwd": {
+          "type": "string"
+        },
+        "Env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "FailClosed": {
+          "type": "boolean"
+        },
+        "Headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "If": {
+          "type": "string"
+        },
+        "Kind": {
+          "type": "string"
+        },
+        "MCPInput": {
+          "type": "object"
+        },
+        "MCPName": {
+          "type": "string"
+        },
+        "MCPServer": {
+          "type": "string"
+        },
+        "Model": {
+          "type": "string"
+        },
+        "Once": {
+          "type": "boolean"
+        },
+        "Powershell": {
+          "type": "string"
+        },
+        "Prompt": {
+          "type": "string"
+        },
+        "Shell": {
+          "type": "string"
+        },
+        "StatusMessage": {
+          "type": "string"
+        },
+        "TimeoutMs": {
+          "type": "integer"
+        },
+        "URL": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Kind",
+        "TimeoutMs",
+        "StatusMessage",
+        "Async",
+        "FailClosed",
+        "Once",
+        "If",
+        "Command",
+        "Args",
+        "Cwd",
+        "Env",
+        "Shell",
+        "Bash",
+        "Powershell",
+        "URL",
+        "Headers",
+        "AllowedEnvVars",
+        "MCPServer",
+        "MCPName",
+        "MCPInput",
+        "Prompt",
+        "Model"
+      ],
+      "type": "object"
+    },
+    "HookMatcher": {
+      "additionalProperties": false,
+      "properties": {
+        "Kind": {
+          "type": "string"
+        },
+        "Patterns": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "Kind",
+        "Patterns"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/hook",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Description": {
+      "type": "string"
+    },
+    "Disabled": {
+      "type": "boolean"
+    },
+    "Event": {
+      "type": "string"
+    },
+    "EventCanonical": {
+      "type": "string"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "Handlers": {
+      "items": {
+        "$ref": "#/$defs/HookHandler"
+      },
+      "type": "array"
+    },
+    "Matcher": {
+      "type": "string"
+    },
+    "MatcherV2": {
+      "$ref": "#/$defs/HookMatcher"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "ScopePath": {
+      "type": "string"
+    },
+    "ScriptPath": {
+      "type": "string"
+    },
+    "Sequential": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "Event",
+    "Matcher",
+    "ScriptPath",
+    "ScopePath",
+    "Name",
+    "Description",
+    "EventCanonical",
+    "MatcherV2",
+    "Handlers",
+    "Sequential",
+    "Disabled",
+    "Extensions"
+  ],
+  "title": "Hook",
+  "type": "object"
+}

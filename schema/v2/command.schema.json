@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "Document": {
+      "additionalProperties": false,
+      "properties": {
+        "Body": {
+          "type": "string"
+        },
+        "Frontmatter": {
+          "type": "object"
+        },
+        "FrontmatterLineOffset": {
+          "type": "integer"
+        },
+        "Includes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "SourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "SourcePath",
+        "Frontmatter",
+        "Body",
+        "Includes",
+        "FrontmatterLineOffset"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/command",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Agent": {
+      "type": "string"
+    },
+    "ArgumentHint": {
+      "type": "string"
+    },
+    "Arguments": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "AutoInvoke": {
+      "type": "boolean"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "Document": {
+      "$ref": "#/$defs/Document"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "Model": {
+      "type": "string"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "ScopePath": {
+      "type": "string"
+    },
+    "Tools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "Name",
+    "Description",
+    "Document",
+    "ScopePath",
+    "ArgumentHint",
+    "Arguments",
+    "Model",
+    "Tools",
+    "Agent",
+    "AutoInvoke",
+    "Extensions"
+  ],
+  "title": "Command",
+  "type": "object"
+}

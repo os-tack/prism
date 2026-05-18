@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "Document": {
+      "additionalProperties": false,
+      "properties": {
+        "Body": {
+          "type": "string"
+        },
+        "Frontmatter": {
+          "type": "object"
+        },
+        "FrontmatterLineOffset": {
+          "type": "integer"
+        },
+        "Includes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "SourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "SourcePath",
+        "Frontmatter",
+        "Body",
+        "Includes",
+        "FrontmatterLineOffset"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/scope",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Activation": {
+      "type": "string"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "Document": {
+      "$ref": "#/$defs/Document"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "Globs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "IsOverride": {
+      "type": "boolean"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "Path": {
+      "type": "string"
+    },
+    "Priority": {
+      "type": "string"
+    },
+    "Tags": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "Path",
+    "Globs",
+    "Description",
+    "Priority",
+    "Document",
+    "Name",
+    "Activation",
+    "Tags",
+    "IsOverride",
+    "Extensions"
+  ],
+  "title": "Scope",
+  "type": "object"
+}

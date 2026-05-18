@@ -1,0 +1,173 @@
+{
+  "$defs": {
+    "Document": {
+      "additionalProperties": false,
+      "properties": {
+        "Body": {
+          "type": "string"
+        },
+        "Frontmatter": {
+          "type": "object"
+        },
+        "FrontmatterLineOffset": {
+          "type": "integer"
+        },
+        "Includes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "SourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "SourcePath",
+        "Frontmatter",
+        "Body",
+        "Includes",
+        "FrontmatterLineOffset"
+      ],
+      "type": "object"
+    },
+    "SkillActivation": {
+      "additionalProperties": false,
+      "properties": {
+        "ContentRegex": {
+          "type": "string"
+        },
+        "Globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ModelInvocable": {
+          "type": "boolean"
+        },
+        "Modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "UserInvocable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "Modes",
+        "Globs",
+        "ContentRegex",
+        "UserInvocable",
+        "ModelInvocable"
+      ],
+      "type": "object"
+    },
+    "SkillArgument": {
+      "additionalProperties": false,
+      "properties": {
+        "Description": {
+          "type": "string"
+        },
+        "Name": {
+          "type": "string"
+        },
+        "Required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "Name",
+        "Description",
+        "Required"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/skill",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "Activation": {
+      "$ref": "#/$defs/SkillActivation"
+    },
+    "AllowedTools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Arguments": {
+      "items": {
+        "$ref": "#/$defs/SkillArgument"
+      },
+      "type": "array"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "Document": {
+      "$ref": "#/$defs/Document"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "Globs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Model": {
+      "type": "string"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "References": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ScopePath": {
+      "type": "string"
+    },
+    "Scripts": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Subagent": {
+      "type": "string"
+    },
+    "Trigger": {
+      "type": "string"
+    },
+    "WhenToUse": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "Name",
+    "Description",
+    "Trigger",
+    "Globs",
+    "Document",
+    "Scripts",
+    "ScopePath",
+    "Activation",
+    "WhenToUse",
+    "AllowedTools",
+    "Arguments",
+    "References",
+    "Model",
+    "Subagent",
+    "Extensions"
+  ],
+  "title": "Skill",
+  "type": "object"
+}

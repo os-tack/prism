@@ -1,0 +1,12 @@
+{
+  "$id": "https://prism.dev/schema/v2/extensions-holder",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "extensions": {
+      "type": "object"
+    }
+  },
+  "title": "Extensions",
+  "type": "object"
+}

@@ -1,0 +1,268 @@
+{
+  "$defs": {
+    "Document": {
+      "additionalProperties": false,
+      "properties": {
+        "Body": {
+          "type": "string"
+        },
+        "Frontmatter": {
+          "type": "object"
+        },
+        "FrontmatterLineOffset": {
+          "type": "integer"
+        },
+        "Includes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "SourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "SourcePath",
+        "Frontmatter",
+        "Body",
+        "Includes",
+        "FrontmatterLineOffset"
+      ],
+      "type": "object"
+    },
+    "MCPAuth": {
+      "additionalProperties": false,
+      "properties": {
+        "Headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "Scheme": {
+          "type": "string"
+        },
+        "Token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Scheme",
+        "Token",
+        "Headers"
+      ],
+      "type": "object"
+    },
+    "MCPServer": {
+      "additionalProperties": false,
+      "properties": {
+        "Args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Auth": {
+          "$ref": "#/$defs/MCPAuth"
+        },
+        "AutoApprove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Command": {
+          "type": "string"
+        },
+        "Cwd": {
+          "type": "string"
+        },
+        "Disabled": {
+          "type": "boolean"
+        },
+        "Env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "ExcludeTools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Extensions": {
+          "type": "object"
+        },
+        "Headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "IncludeTools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "Name": {
+          "type": "string"
+        },
+        "ScopePath": {
+          "type": "string"
+        },
+        "TimeoutMs": {
+          "type": "integer"
+        },
+        "Transport": {
+          "type": "string"
+        },
+        "Trust": {
+          "type": "boolean"
+        },
+        "URL": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Name",
+        "Command",
+        "Args",
+        "Env",
+        "URL",
+        "ScopePath",
+        "Transport",
+        "Cwd",
+        "Headers",
+        "Auth",
+        "TimeoutMs",
+        "Disabled",
+        "AutoApprove",
+        "Trust",
+        "IncludeTools",
+        "ExcludeTools",
+        "Extensions"
+      ],
+      "type": "object"
+    },
+    "MCPServerRef": {
+      "additionalProperties": false,
+      "properties": {
+        "Inline": {
+          "$ref": "#/$defs/MCPServer"
+        },
+        "Name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "Name",
+        "Inline"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://prism.dev/schema/v2/agent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "AllowedSubagents": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Background": {
+      "type": "boolean"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "DisallowedTools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "Document": {
+      "$ref": "#/$defs/Document"
+    },
+    "Extensions": {
+      "type": "object"
+    },
+    "InitialPrompt": {
+      "type": "string"
+    },
+    "MCPServers": {
+      "items": {
+        "$ref": "#/$defs/MCPServerRef"
+      },
+      "type": "array"
+    },
+    "MaxTurns": {
+      "type": "integer"
+    },
+    "Model": {
+      "type": "string"
+    },
+    "ModelFallbacks": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ModelInvocable": {
+      "type": "boolean"
+    },
+    "Name": {
+      "type": "string"
+    },
+    "ReadOnly": {
+      "type": "boolean"
+    },
+    "ScopePath": {
+      "type": "string"
+    },
+    "SystemPrompt": {
+      "type": "string"
+    },
+    "Temperature": {
+      "type": "number"
+    },
+    "Tools": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "UserInvocable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "Name",
+    "Description",
+    "Document",
+    "ScopePath",
+    "SystemPrompt",
+    "Model",
+    "ModelFallbacks",
+    "Tools",
+    "DisallowedTools",
+    "ReadOnly",
+    "Background",
+    "MaxTurns",
+    "Temperature",
+    "MCPServers",
+    "AllowedSubagents",
+    "UserInvocable",
+    "ModelInvocable",
+    "InitialPrompt",
+    "Extensions"
+  ],
+  "title": "Agent",
+  "type": "object"
+}
