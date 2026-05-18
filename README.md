@@ -251,35 +251,77 @@ target_options:
 
 ## Wrapper scripts: scope-guard and perms-guard
 
-Some tools' hook contracts don't natively understand path-scoping or
-permission policies. `prism` ships two hidden subcommands that fill the gap
-via generated bash wrappers:
+Two enforcement concepts — path-scoping and permission policies — are
+spec'd canonically in `.agents/` but not every tool has the native
+runtime surface to enforce them. `prism` ships two hidden subcommands
+(`prism scope-guard`, `prism perms-guard`) that fill the gap as
+generated bash wrappers. Plugins emit a wrapper alongside each hook
+that needs the gate; the wrapper calls back into the prism binary at
+runtime.
 
-- **`prism scope-guard`** — gates a hook on a file-path scope. The
-  generated wrapper at `.{plugin}/hooks/__scope-guard__/<scope>-<event>-<hook>.sh`
-  reads the tool's hook JSON from stdin, extracts `tool_input.file_path`, and
-  invokes the user's hook only if the path falls under the scope. Used by
-  claude / cursor / gemini / cline / windsurf — every tool whose hook
-  contract is JSON-on-stdin with exit-2-blocks semantics (which is most of
-  them after the v0.8.0 plugin upgrades).
-- **`prism perms-guard`** — enforces an allow/deny/ask policy for plugins
-  without a native permission primitive. After v0.8.0 this is just **gemini**
-  — continue moved to native `.continue/permissions.yaml`. The wrapper at
-  `.gemini/hooks/__perms-guard__/<...>.sh` reads the hook JSON, consults a
-  sidecar `policy.json`, and either exec's the underlying script (allow),
-  exits non-zero (deny), or prompts on TTY (ask). Policy rules use a
-  `tool:pattern` grammar — `bash:rm -rf *` matches any bash command starting
-  with `rm -rf `; `bash` (no colon) matches any bash action. Deny dominates
-  Allow, which dominates Ask. Plugins with native enforcement (claude →
-  `.claude/settings.json`, continue → `.continue/permissions.yaml`) translate
-  the same canonical `.agents/permissions.yaml` directly to their native
-  format and don't go through perms-guard at all.
+### scope-guard — file-path scoping for hooks
 
-Both wrappers resolve the project root at runtime via
-`${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}}`,
+When a hook lives under a scope (`.agents/src/billing/hooks/...`) but
+the target tool fires hooks globally, the plugin emits:
+
+```
+.{plugin}/hooks/__scope-guard__/<scope>-<event>-<hook>.sh
+```
+
+The script reads the tool's hook JSON from stdin, extracts
+`tool_input.file_path`, and invokes the user's hook only if the path
+falls under the scope. Used by every tool whose hook contract is
+JSON-on-stdin with exit-2-blocks semantics:
+
+| Plugin   | scope-guard | Native scoping? |
+|----------|-------------|-----------------|
+| claude   | yes         | no              |
+| cursor   | yes         | no              |
+| gemini   | yes         | no              |
+| cline    | yes         | no              |
+| windsurf | yes         | no              |
+| copilot  | preview-on  | preview-on      |
+| continue | —           | folded (warn)   |
+| agentsmd | —           | (no hook primitive) |
+
+### perms-guard — allow / ask / deny enforcement for plugins without a native permission primitive
+
+Sidecar at `.{plugin}/hooks/__perms-guard__/policy.json`; wrapper at
+`.{plugin}/hooks/__perms-guard__/<scope>.sh`. The wrapper reads the
+hook JSON, consults the policy, and either `exec`s the underlying
+script (Allow), exits non-zero (Deny), or prompts on TTY (Ask).
+
+Policy rules use the canonical SPEC §4.6.2 grammar: `<target>:<pattern>`
+plus the dimension synonyms `fs:`, `network:`, `mcp:<server>[:<tool>]`,
+recursive `**` glob, and `!` negation prefix. **Deny dominates Allow,
+which dominates Ask.** In non-TTY contexts, Ask degrades to Deny.
+
+| Plugin   | perms-guard          | Native?                           |
+|----------|----------------------|-----------------------------------|
+| gemini   | yes                  | no                                |
+| cline    | yes                  | no                                |
+| copilot  | yes (preview-off)    | yes (preview-on, opt-in)          |
+| claude   | —                    | `.claude/settings.json`           |
+| continue | —                    | `.continue/permissions.yaml`      |
+| cursor   | —                    | (folded into sandbox profile)     |
+| windsurf | —                    | unsupported                       |
+| agentsmd | —                    | informational text only           |
+
+Plugins with native enforcement translate the canonical
+`.agents/permissions.yaml` directly to their wire format and don't go
+through perms-guard at all.
+
+### Project-root resolution
+
+Both wrappers resolve the project root at runtime via:
+
+```
+${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}}
+```
+
 so the generated scripts survive `mv` of the project directory. Pass
-`--no-hook-wrappers` to disable wrapper generation and project hooks as
-global instead.
+`--no-hook-wrappers` to `prism compile` to disable wrapper generation
+and emit project hooks as global instead.
 
 ## Central registry
 
