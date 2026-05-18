@@ -89,12 +89,6 @@ permissions).
 
 ### Sequenced for v0.8.2+
 
-- **scope-guard JSON envelope shape for Windsurf**: Windsurf Cascade
-  Hooks send `file_path` at the root of the JSON payload (not under
-  `tool_input.file_path`), so `prism scope-guard`'s
-  `extractToolFilePath` returns "" and the wrapper silently no-ops. The
-  v0.8.0 review flagged this as a documented limitation; full support
-  requires widening the extractor.
 - **Copilot preview hooks**: gate behind `--enable-preview-hooks` when
   GA lands.
 - **Cursor PERMS via sandbox profile** (`sandbox.json` domain
