@@ -41,7 +41,6 @@ func TestCursorPlan_RootAndScope(t *testing.T) {
 		t.Fatalf("expected 2 operations, got %d", len(ops))
 	}
 
-	// First op: root context.
 	root := ops[0]
 	if root.Path != ".cursor/rules/_root.mdc" {
 		t.Errorf("root op path = %q, want .cursor/rules/_root.mdc", root.Path)
@@ -59,7 +58,6 @@ func TestCursorPlan_RootAndScope(t *testing.T) {
 		t.Errorf("root op plugin = %q, want cursor", root.Plugin)
 	}
 
-	// Second op: scope.
 	sc := ops[1]
 	if sc.Path != ".cursor/rules/src-billing.mdc" {
 		t.Errorf("scope op path = %q, want .cursor/rules/src-billing.mdc", sc.Path)
@@ -141,17 +139,23 @@ func TestCursorCapabilities(t *testing.T) {
 	if caps.Context != "native" {
 		t.Errorf("Context support = %q, want native", caps.Context)
 	}
-	if caps.Agents != "unsupported" {
-		t.Errorf("Agents support = %q, want unsupported", caps.Agents)
+	if caps.Agents != "native" {
+		t.Errorf("Agents support = %q, want native", caps.Agents)
+	}
+	if caps.Commands != "native" {
+		t.Errorf("Commands support = %q, want native", caps.Commands)
+	}
+	if caps.Skills != "native" {
+		t.Errorf("Skills support = %q, want native", caps.Skills)
+	}
+	if caps.Hooks != "native" {
+		t.Errorf("Hooks support = %q, want native", caps.Hooks)
 	}
 	if caps.MCP != "native" {
 		t.Errorf("MCP support = %q, want native", caps.MCP)
 	}
-	if caps.Skills != "degraded" {
-		t.Errorf("Skills support = %q, want degraded", caps.Skills)
-	}
-	if caps.Commands != "degraded" {
-		t.Errorf("Commands support = %q, want degraded", caps.Commands)
+	if caps.Permissions != "unsupported" {
+		t.Errorf("Permissions support = %q, want unsupported", caps.Permissions)
 	}
 }
 
@@ -164,10 +168,11 @@ func TestCursorPlan_UnknownModeErrors(t *testing.T) {
 	}
 }
 
-// TestCursor_Skill_AsScopedRule verifies that a Skill projects to a scoped
-// rule file at .cursor/rules/skill-<slug>.mdc with description + globs in
-// frontmatter and body from SKILL.md. Scripts present → warning attached.
-func TestCursor_Skill_AsScopedRule(t *testing.T) {
+// TestCursor_Skill_DedicatedFormat verifies that a Skill projects natively
+// to .cursor/skills/<slug>/SKILL.md (Cursor 2.4+ format), NOT to the legacy
+// .cursor/rules/skill-*.mdc path. The source body (which already carries
+// YAML frontmatter from the parser) is written verbatim.
+func TestCursor_Skill_DedicatedFormat(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
 		Skills: []*model.Skill{
@@ -177,9 +182,8 @@ func TestCursor_Skill_AsScopedRule(t *testing.T) {
 				Globs:       []string{"src/billing/**", "tests/billing/**"},
 				Document: &model.Document{
 					SourcePath: "/tmp/.agents/skills/stripe-webhook/SKILL.md",
-					Body:       "How to validate Stripe webhooks step by step.",
+					Body:       "---\ndescription: Validate Stripe webhook signatures end-to-end\n---\n\nHow to validate Stripe webhooks step by step.",
 				},
-				Scripts: []string{"verify.sh", "diagnose.py"},
 			},
 		},
 	}
@@ -190,62 +194,47 @@ func TestCursor_Skill_AsScopedRule(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d (paths: %v)", len(ops), opsPaths(ops))
 	}
 	op := ops[0]
-	wantPath := ".cursor/rules/skill-stripe-webhook-validator.mdc"
+	wantPath := ".cursor/skills/stripe-webhook-validator/SKILL.md"
 	if op.Path != wantPath {
 		t.Errorf("skill op path = %q, want %q", op.Path, wantPath)
 	}
 	if op.Kind != plugin.OpWrite {
 		t.Errorf("skill op kind = %v, want OpWrite", op.Kind)
 	}
-	if op.Mode != plugin.ModeWrite {
-		t.Errorf("skill op mode = %v, want ModeWrite", op.Mode)
+	if !strings.Contains(op.Content, "Validate Stripe webhook signatures end-to-end") {
+		t.Errorf("skill op body missing\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, "description: Validate Stripe webhook signatures end-to-end") {
-		t.Errorf("skill op missing description\n---\n%s", op.Content)
+	// Body should NOT have been wrapped in renderMDC frontmatter — that
+	// would double the frontmatter the parser already produced.
+	if strings.Count(op.Content, "---\n") < 2 {
+		t.Errorf("expected source body's own frontmatter to be preserved\n---\n%s", op.Content)
 	}
-	if !strings.Contains(op.Content, `globs: ["src/billing/**","tests/billing/**"]`) {
-		t.Errorf("skill op missing globs\n---\n%s", op.Content)
-	}
-	if strings.Contains(op.Content, "alwaysApply") {
-		t.Errorf("skill op should not have alwaysApply\n---\n%s", op.Content)
-	}
-	if !strings.Contains(op.Content, "How to validate Stripe webhooks step by step.") {
-		t.Errorf("skill op missing body\n---\n%s", op.Content)
-	}
-
-	// Scripts → warning attached to the skill op itself.
-	if len(op.Warnings) == 0 {
-		t.Fatalf("expected at least one warning on skill op")
-	}
-	found := false
-	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no skill primitive") && strings.Contains(w.Message, "verify.sh") && strings.Contains(w.Message, "diagnose.py") {
-			found = true
-			if w.Severity != "info" {
-				t.Errorf("skill warning severity = %q, want info", w.Severity)
-			}
+	// Sanity: must not project to the legacy rules path anymore.
+	for _, o := range ops {
+		if strings.HasPrefix(o.Path, ".cursor/rules/skill-") {
+			t.Errorf("unexpected legacy rules-form skill projection: %s", o.Path)
 		}
-	}
-	if !found {
-		t.Errorf("expected skill warning naming both scripts, got %#v", op.Warnings)
 	}
 }
 
-// TestCursor_Skill_NoScripts_NoWarning verifies that a skill with no
-// scripts still projects but emits no warning on the skill op.
-func TestCursor_Skill_NoScripts_NoWarning(t *testing.T) {
+// TestCursor_Skill_WithScripts verifies that skill scripts co-locate at
+// .cursor/skills/<slug>/scripts/<basename>.
+func TestCursor_Skill_WithScripts(t *testing.T) {
 	proj := &model.Project{
-		AgentsDir: "/tmp/.agents",
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
 		Skills: []*model.Skill{
 			{
-				Name:    "Pure Skill",
-				Trigger: "When the user asks about purity",
+				Name: "format-go",
 				Document: &model.Document{
-					SourcePath: "/tmp/.agents/skills/pure/SKILL.md",
-					Body:       "no scripts here",
+					SourcePath: "/tmp/proj/.agents/skills/format-go/SKILL.md",
+					Body:       "format go body",
+				},
+				Scripts: []string{
+					"/tmp/proj/.agents/skills/format-go/scripts/run.sh",
 				},
 			},
 		},
@@ -255,33 +244,36 @@ func TestCursor_Skill_NoScripts_NoWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
-	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 ops (SKILL.md + script), got %d (%v)", len(ops), opsPaths(ops))
 	}
-	if len(ops[0].Warnings) != 0 {
-		t.Errorf("expected no warnings, got %#v", ops[0].Warnings)
+	wantScript := ".cursor/skills/format-go/scripts/run.sh"
+	foundScript := false
+	for _, op := range ops {
+		if op.Path == wantScript {
+			foundScript = true
+			if op.Kind != plugin.OpSymlink {
+				t.Errorf("script op kind = %v, want OpSymlink", op.Kind)
+			}
+		}
 	}
-	// Trigger should fill in as the description when Description is empty.
-	if !strings.Contains(ops[0].Content, "description: When the user asks about purity") {
-		t.Errorf("expected Trigger to fill description\n---\n%s", ops[0].Content)
+	if !foundScript {
+		t.Errorf("missing script op at %q; got: %v", wantScript, opsPaths(ops))
 	}
 }
 
-// TestCursor_Commands_Warning verifies that a Command emits no file but
-// attaches an info warning to some op.
-func TestCursor_Commands_Warning(t *testing.T) {
+// TestCursor_Command_Projects verifies a slash command projects to
+// .cursor/commands/<name>.md with NO frontmatter — bare markdown only.
+func TestCursor_Command_Projects(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/.agents/context.md",
-			Body:       "ctx",
-		},
 		Commands: []*model.Command{
 			{
 				Name:        "deploy",
 				Description: "Deploy to staging",
 				Document: &model.Document{
 					SourcePath: "/tmp/.agents/commands/deploy.md",
+					Body:       "Deploy the service to staging.\n\nUsage: /deploy [env]",
 				},
 			},
 		},
@@ -291,45 +283,86 @@ func TestCursor_Commands_Warning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
-	// No file-level command op; only the root context op.
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op (no command file), got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opsPaths(ops))
 	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "commands") {
-			t.Errorf("unexpected command op: %s", op.Path)
-		}
+	op := ops[0]
+	wantPath := ".cursor/commands/deploy.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
 	}
-	// Warning must be attached to the single op (root).
+	if op.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", op.Kind)
+	}
+	if strings.HasPrefix(strings.TrimLeft(op.Content, " \n"), "---") {
+		t.Errorf("command body should have no frontmatter:\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "Deploy the service to staging.") {
+		t.Errorf("command body missing\n---\n%s", op.Content)
+	}
+	if !strings.HasSuffix(op.Content, "\n") {
+		t.Errorf("command content should end with newline:\n%q", op.Content)
+	}
+}
+
+// TestCursor_ScopedCommand verifies a scoped command projects to
+// .cursor/commands/<scope-slug>-<name>.md (filename prefix preserves
+// disambiguation across scopes) and carries an info warning explaining
+// that Cursor commands are globally scoped.
+func TestCursor_ScopedCommand(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Commands: []*model.Command{
+			{
+				Name:        "deploy",
+				Description: "Deploy billing service",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/billing/commands/deploy.md",
+					Body:       "deploy steps",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opsPaths(ops))
+	}
+	op := ops[0]
+	wantPath := ".cursor/commands/src-billing-deploy.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
 	found := false
-	for _, w := range ops[0].Warnings {
-		if strings.Contains(w.Message, "no slash-command equivalent") && strings.Contains(w.Message, "deploy") {
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "Cursor commands are global") && strings.Contains(w.Message, "deploy") {
 			found = true
 			if w.Severity != "info" {
-				t.Errorf("command warning severity = %q, want info", w.Severity)
+				t.Errorf("warning severity = %q, want info", w.Severity)
 			}
 		}
 	}
 	if !found {
-		t.Errorf("expected command warning, got %#v", ops[0].Warnings)
+		t.Errorf("expected scoped-command degrade warning, got %#v", op.Warnings)
 	}
 }
 
-// TestCursor_Agents_Warning verifies that an Agent emits no file but
-// attaches an info warning to some op.
-func TestCursor_Agents_Warning(t *testing.T) {
+// TestCursor_Agent_Projects verifies a subagent projects to
+// .cursor/agents/<name>.md (body verbatim — parser produces frontmatter).
+func TestCursor_Agent_Projects(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/.agents/context.md",
-			Body:       "ctx",
-		},
 		Agents: []*model.Agent{
 			{
 				Name:        "code-reviewer",
 				Description: "Reviews code for style and bugs",
 				Document: &model.Document{
 					SourcePath: "/tmp/.agents/agents/code-reviewer.md",
+					Body:       "---\nname: code-reviewer\ndescription: Reviews code for style and bugs\nmodel: inherit\n---\n\nYou are a careful code reviewer.",
 				},
 			},
 		},
@@ -340,33 +373,88 @@ func TestCursor_Agents_Warning(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opsPaths(ops))
+	}
+	op := ops[0]
+	wantPath := ".cursor/agents/code-reviewer.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if op.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", op.Kind)
+	}
+	if !strings.Contains(op.Content, "name: code-reviewer") {
+		t.Errorf("body should carry source frontmatter:\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "You are a careful code reviewer.") {
+		t.Errorf("body missing\n---\n%s", op.Content)
+	}
+	if len(op.Warnings) != 0 {
+		t.Errorf("global agent should not warn, got %#v", op.Warnings)
+	}
+}
+
+// TestCursor_ScopedAgent verifies a scoped agent projects with a
+// scope-prefixed filename and carries a degrade info warning.
+func TestCursor_ScopedAgent(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Agents: []*model.Agent{
+			{
+				Name:      "reviewer",
+				ScopePath: "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/src/billing/agents/reviewer.md",
+					Body:       "scoped reviewer body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(ops) != 1 {
 		t.Fatalf("expected 1 op, got %d", len(ops))
 	}
+	op := ops[0]
+	wantPath := ".cursor/agents/src-billing-reviewer.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
 	found := false
-	for _, w := range ops[0].Warnings {
-		if strings.Contains(w.Message, "no subagent primitive") && strings.Contains(w.Message, "code-reviewer") {
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "Cursor agents are global") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected agent warning, got %#v", ops[0].Warnings)
+		t.Errorf("expected scoped-agent degrade warning, got %#v", op.Warnings)
 	}
 }
 
-// TestCursor_Hooks_Warning verifies that a Hook emits no file but
-// attaches an info warning to some op.
-func TestCursor_Hooks_Warning(t *testing.T) {
+// TestCursor_Hooks_Emit verifies global hooks land in .cursor/hooks.json
+// with the prism → Cursor event mapping applied (PreToolUse → preToolUse,
+// etc.). Verifies the JSON shape: {"version":1,"hooks":{"<evt>":[...]}}.
+func TestCursor_Hooks_Emit(t *testing.T) {
 	proj := &model.Project{
-		AgentsDir: "/tmp/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/.agents/context.md",
-			Body:       "ctx",
-		},
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
 		Hooks: []*model.Hook{
 			{
 				Event:      "PreToolUse",
 				Matcher:    "Bash",
-				ScriptPath: "/tmp/.agents/hooks/audit.sh",
+				ScriptPath: "/tmp/proj/.agents/hooks/audit.sh",
+			},
+			{
+				Event:      "PostToolUse",
+				Matcher:    "Edit",
+				ScriptPath: "/tmp/proj/.agents/hooks/log.sh",
+			},
+			{
+				Event:      "SessionStart",
+				ScriptPath: "/tmp/proj/.agents/hooks/welcome.sh",
 			},
 		},
 	}
@@ -375,22 +463,252 @@ func TestCursor_Hooks_Warning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
-	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".cursor/hooks.json" {
+			hooksOp = &ops[i]
+		}
 	}
+	if hooksOp == nil {
+		t.Fatalf("missing .cursor/hooks.json op; got: %v", opsPaths(ops))
+	}
+	if hooksOp.Kind != plugin.OpWrite {
+		t.Errorf("hooks op kind = %v, want OpWrite", hooksOp.Kind)
+	}
+	if hooksOp.Mode != plugin.ModeWrite {
+		t.Errorf("hooks op mode = %v, want ModeWrite", hooksOp.Mode)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(hooksOp.Content), &doc); err != nil {
+		t.Fatalf("hooks.json does not parse: %v\n---\n%s", err, hooksOp.Content)
+	}
+	if v, _ := doc["version"].(float64); v != 1 {
+		t.Errorf("version = %v, want 1", doc["version"])
+	}
+	hooks, ok := doc["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("hooks key missing or wrong type: %v", doc["hooks"])
+	}
+	for _, evt := range []string{"preToolUse", "postToolUse", "sessionStart"} {
+		entries, ok := hooks[evt].([]any)
+		if !ok || len(entries) == 0 {
+			t.Errorf("hooks[%q] missing or empty: %v", evt, hooks[evt])
+		}
+	}
+	// preToolUse entry should carry matcher="Bash" and the script absolute path.
+	preEntries, _ := hooks["preToolUse"].([]any)
+	if len(preEntries) != 1 {
+		t.Fatalf("preToolUse entries = %d, want 1", len(preEntries))
+	}
+	pre, _ := preEntries[0].(map[string]any)
+	if pre["matcher"] != "Bash" {
+		t.Errorf("preToolUse[0].matcher = %v, want Bash", pre["matcher"])
+	}
+	if pre["command"] != "/tmp/proj/.agents/hooks/audit.sh" {
+		t.Errorf("preToolUse[0].command = %v, want audit.sh path", pre["command"])
+	}
+	// sessionStart entry should omit empty matcher (no matcher → key absent).
+	startEntries, _ := hooks["sessionStart"].([]any)
+	if len(startEntries) != 1 {
+		t.Fatalf("sessionStart entries = %d, want 1", len(startEntries))
+	}
+	start, _ := startEntries[0].(map[string]any)
+	if _, has := start["matcher"]; has {
+		t.Errorf("sessionStart entry should omit matcher when empty, got %v", start)
+	}
+}
+
+// TestCursor_Hooks_UnsupportedEvent_Warns confirms events with no Cursor
+// analog (Notification, SubagentStop, PreCompact) are dropped with an
+// info warning, and do not appear in hooks.json.
+func TestCursor_Hooks_UnsupportedEvent_Warns(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "Notification",
+				ScriptPath: "/tmp/proj/.agents/hooks/notify.sh",
+			},
+			{
+				Event:      "PreToolUse",
+				ScriptPath: "/tmp/proj/.agents/hooks/audit.sh",
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".cursor/hooks.json" {
+			hooksOp = &ops[i]
+		}
+	}
+	if hooksOp == nil {
+		t.Fatalf("expected hooks.json op (one usable hook present)")
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(hooksOp.Content), &doc); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	hooks, _ := doc["hooks"].(map[string]any)
+	if _, has := hooks["Notification"]; has {
+		t.Errorf("Notification should not be in hooks.json")
+	}
+	// Warning must be present somewhere in the projection.
 	found := false
-	for _, w := range ops[0].Warnings {
-		if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "PreToolUse:Bash") {
-			found = true
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "Notification") && strings.Contains(w.Message, "no analog") {
+				found = true
+			}
 		}
 	}
 	if !found {
-		t.Errorf("expected hook warning, got %#v", ops[0].Warnings)
+		t.Errorf("expected info warning for dropped Notification hook")
+	}
+}
+
+// TestCursor_ScopedHook_WrapperEmitted verifies a scoped hook produces
+// both a wrapper script at .cursor/hooks/__scope-guard__/... AND a
+// hooks.json entry whose command points at the wrapper's absolute path.
+func TestCursor_ScopedHook_WrapperEmitted(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+	sourceScript := filepath.Join(agentsDir, "src", "billing", "hooks", "guard.sh")
+
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Edit",
+				ScriptPath: sourceScript,
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	wantWrapperRel := ".cursor/hooks/__scope-guard__/src-billing-preToolUse-guard.sh"
+	wantWrapperAbs := filepath.Join(root, wantWrapperRel)
+
+	var wrapperOp *plugin.Operation
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		switch ops[i].Path {
+		case wantWrapperRel:
+			wrapperOp = &ops[i]
+		case ".cursor/hooks.json":
+			hooksOp = &ops[i]
+		}
+	}
+	if wrapperOp == nil {
+		t.Fatalf("missing wrapper script at %q; got paths:\n%v", wantWrapperRel, opsPaths(ops))
+	}
+	if wrapperOp.Kind != plugin.OpWrite {
+		t.Errorf("wrapper kind = %v, want OpWrite", wrapperOp.Kind)
+	}
+	if wrapperOp.FileMode != 0o755 {
+		t.Errorf("wrapper FileMode = %o, want 0755", wrapperOp.FileMode)
+	}
+	if !strings.Contains(wrapperOp.Content, "prism scope-guard") {
+		t.Errorf("wrapper body missing scope-guard invocation:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "--scope 'src/billing'") {
+		t.Errorf("wrapper body missing --scope flag:\n%s", wrapperOp.Content)
+	}
+	relScript, _ := filepath.Rel(root, sourceScript)
+	if !strings.Contains(wrapperOp.Content, `--script "${PROJECT_DIR}"/'`+relScript+`'`) {
+		t.Errorf("wrapper body missing --script ${PROJECT_DIR}/<rel>:\n%s", wrapperOp.Content)
+	}
+
+	if hooksOp == nil {
+		t.Fatalf("missing hooks.json op; got paths: %v", opsPaths(ops))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(hooksOp.Content), &doc); err != nil {
+		t.Fatalf("parse hooks.json: %v", err)
+	}
+	hooks, _ := doc["hooks"].(map[string]any)
+	entries, _ := hooks["preToolUse"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("preToolUse entries = %d, want 1", len(entries))
+	}
+	entry, _ := entries[0].(map[string]any)
+	if entry["command"] != wantWrapperAbs {
+		t.Errorf("hook command = %v, want wrapper abs %v", entry["command"], wantWrapperAbs)
+	}
+	if entry["matcher"] != "Edit" {
+		t.Errorf("hook matcher = %v, want Edit", entry["matcher"])
+	}
+}
+
+// TestCursor_ScopedHook_DisableWrappers verifies that when
+// DisableHookWrappers is true, scoped hooks are emitted as global
+// (no wrapper) — hooks.json command points at the source script.
+func TestCursor_ScopedHook_DisableWrappers(t *testing.T) {
+	root := t.TempDir()
+	sourceScript := filepath.Join(root, ".agents", "hooks", "guard.sh")
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: filepath.Join(root, ".agents"),
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				ScriptPath: sourceScript,
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := &CursorPlugin{DisableHookWrappers: true}
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__scope-guard__") {
+			t.Errorf("unexpected wrapper with DisableHookWrappers=true: %s", op.Path)
+		}
+	}
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".cursor/hooks.json" {
+			hooksOp = &ops[i]
+		}
+	}
+	if hooksOp == nil {
+		t.Fatalf("missing hooks.json")
+	}
+	var doc map[string]any
+	_ = json.Unmarshal([]byte(hooksOp.Content), &doc)
+	hooks, _ := doc["hooks"].(map[string]any)
+	entries, _ := hooks["preToolUse"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	entry, _ := entries[0].(map[string]any)
+	if entry["command"] != sourceScript {
+		t.Errorf("command = %v, want source script %v", entry["command"], sourceScript)
 	}
 }
 
 // TestCursor_Permissions_Warning verifies that non-empty Permissions emit
-// no file but attach an info warning to some op.
+// no permissions file but attach an info warning to some op (Permissions
+// remain SupportUnsupported in v0.8.0; sandbox profile generator slated
+// for v0.8.1).
 func TestCursor_Permissions_Warning(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -490,7 +808,6 @@ func TestCursor_MCP(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 
-	// Find the mcp op.
 	var mcpOp *plugin.Operation
 	for i := range ops {
 		if ops[i].Path == ".cursor/mcp.json" {
@@ -511,8 +828,6 @@ func TestCursor_MCP(t *testing.T) {
 		t.Errorf("mcp op sources = %v, want [mcp.yaml]", mcpOp.Sources)
 	}
 
-	// Content must parse to JSON containing experimental=true AND
-	// mcpServers with both new servers.
 	mergedContent := mergeContent(t, root, mcpOp)
 	var out map[string]any
 	if err := json.Unmarshal([]byte(mergedContent), &out); err != nil {
@@ -547,7 +862,6 @@ func TestCursor_MCP(t *testing.T) {
 	if remote["url"] != "https://mcp.example.com/sse" {
 		t.Errorf("remote-tools.url = %v, want https://mcp.example.com/sse", remote["url"])
 	}
-	// Stale entry must be gone.
 	if _, exists := servers["stale"]; exists {
 		t.Errorf("stale server should have been replaced; got %v", servers["stale"])
 	}
@@ -589,9 +903,8 @@ func TestCursor_MCP_NoExisting(t *testing.T) {
 	}
 }
 
-// TestCursor_ScopedSkill verifies that a Skill with ScopePath produces a
-// scoped rule file with the scope slug as a filename prefix, the populated
-// globs in frontmatter, and the source path in the lockfile tag.
+// TestCursor_ScopedSkill verifies the new dedicated-format path includes
+// the scope-slug prefix to disambiguate same-named skills across scopes.
 func TestCursor_ScopedSkill(t *testing.T) {
 	proj := &model.Project{
 		Root:      "/tmp/proj",
@@ -618,12 +931,9 @@ func TestCursor_ScopedSkill(t *testing.T) {
 		t.Fatalf("expected 1 op, got %d", len(ops))
 	}
 	op := ops[0]
-	wantPath := ".cursor/rules/skill-src-billing-audit-trail.mdc"
+	wantPath := ".cursor/skills/src-billing-audit-trail/SKILL.md"
 	if op.Path != wantPath {
 		t.Errorf("path = %q, want %q", op.Path, wantPath)
-	}
-	if !strings.Contains(op.Content, `globs: ["src/billing/**"]`) {
-		t.Errorf("missing globs frontmatter\n---\n%s", op.Content)
 	}
 	if len(op.Sources) != 1 || !strings.Contains(op.Sources[0], "src/billing/skills/audit-trail/SKILL.md") {
 		t.Errorf("Sources = %v, want path containing src/billing/skills/audit-trail/SKILL.md", op.Sources)
@@ -631,8 +941,7 @@ func TestCursor_ScopedSkill(t *testing.T) {
 }
 
 // TestCursor_ScopedSkillCollision verifies that the same skill name in two
-// different scopes produces two distinct files, one per scope, with
-// different filename prefixes.
+// different scopes produces two distinct files, one per scope.
 func TestCursor_ScopedSkillCollision(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/proj/.agents",
@@ -669,99 +978,10 @@ func TestCursor_ScopedSkillCollision(t *testing.T) {
 	for _, op := range ops {
 		paths[op.Path] = true
 	}
-	if !paths[".cursor/rules/skill-src-billing-validator.mdc"] {
-		t.Errorf("missing billing-validator op, got paths: %v", paths)
+	if !paths[".cursor/skills/src-billing-validator/SKILL.md"] {
+		t.Errorf("missing billing-validator op, got: %v", paths)
 	}
-	if !paths[".cursor/rules/skill-src-auth-validator.mdc"] {
-		t.Errorf("missing auth-validator op, got paths: %v", paths)
-	}
-}
-
-// TestCursor_ScopedCommand_Warning verifies that a scoped command produces
-// a rule file under .cursor/rules/ with a scope-prefixed filename and an
-// info warning naming the scope.
-func TestCursor_ScopedCommand_Warning(t *testing.T) {
-	proj := &model.Project{
-		AgentsDir: "/tmp/proj/.agents",
-		Commands: []*model.Command{
-			{
-				Name:        "deploy",
-				Description: "Deploy billing service",
-				ScopePath:   "src/billing",
-				Document: &model.Document{
-					SourcePath: "/tmp/proj/.agents/src/billing/commands/deploy.md",
-					Body:       "deploy steps",
-				},
-			},
-		},
-	}
-	p := NewCursor()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
-	}
-	op := ops[0]
-	wantPath := ".cursor/rules/command-src-billing-deploy.mdc"
-	if op.Path != wantPath {
-		t.Errorf("path = %q, want %q", op.Path, wantPath)
-	}
-	if !strings.Contains(op.Content, `globs: ["src/billing/**"]`) {
-		t.Errorf("missing scope default globs\n---\n%s", op.Content)
-	}
-	found := false
-	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no slash-command primitive") && strings.Contains(w.Message, "src/billing") {
-			found = true
-			if w.Severity != "info" {
-				t.Errorf("warning severity = %q, want info", w.Severity)
-			}
-		}
-	}
-	if !found {
-		t.Errorf("expected scoped-command warning, got %#v", op.Warnings)
-	}
-}
-
-// TestCursor_ScopedHook_Warning verifies that a scoped hook produces no file
-// but does emit an info warning naming the scope.
-func TestCursor_ScopedHook_Warning(t *testing.T) {
-	proj := &model.Project{
-		AgentsDir: "/tmp/proj/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/proj/.agents/context.md",
-			Body:       "ctx",
-		},
-		Hooks: []*model.Hook{
-			{
-				Event:      "PreToolUse",
-				Matcher:    "Bash",
-				ScriptPath: "/tmp/proj/.agents/src/billing/hooks/audit.sh",
-				ScopePath:  "src/billing",
-			},
-		},
-	}
-	p := NewCursor()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "hooks") {
-			t.Errorf("unexpected hook file: %s", op.Path)
-		}
-	}
-	found := false
-	for _, op := range ops {
-		for _, w := range op.Warnings {
-			if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
+	if !paths[".cursor/skills/src-auth-validator/SKILL.md"] {
+		t.Errorf("missing auth-validator op, got: %v", paths)
 	}
 }

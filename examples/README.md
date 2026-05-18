@@ -11,7 +11,7 @@ run `prism compile` — no extra setup required.
 | [03-include-composition](03-include-composition) | `<!-- include: -->` to share markdown across contexts |
 | [04-mcp-servers](04-mcp-servers) | One MCP config, four per-plugin output shapes                 |
 | [05-hooks-with-scope-guard](05-hooks-with-scope-guard) | Scoped Claude hook + the generated scope-guard wrapper |
-| [06-permissions-wrappers](06-permissions-wrappers) | Native Claude perms vs. perms-guard wrappers for Gemini / Continue |
+| [06-permissions-wrappers](06-permissions-wrappers) | Native perms in Claude + Continue (since v0.8); perms-guard wrapper for Gemini |
 
 ## Running
 

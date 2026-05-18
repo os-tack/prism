@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,26 @@ import (
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
 )
+
+// findOpByPath is a small helper used throughout the cline tests to
+// locate the op for a specific projected path. Returns nil if absent.
+func findOpByPath(ops []plugin.Operation, path string) *plugin.Operation {
+	for i := range ops {
+		if ops[i].Path == path {
+			return &ops[i]
+		}
+	}
+	return nil
+}
+
+// opPathSet returns the set of projected paths for assertion errors.
+func opPathSet(ops []plugin.Operation) []string {
+	out := make([]string, len(ops))
+	for i := range ops {
+		out[i] = ops[i].Path
+	}
+	return out
+}
 
 // TestCline_RootContext: a project with only a root Context document
 // produces a single op at .clinerules/00-context.md whose body matches
@@ -28,7 +49,7 @@ func TestCline_RootContext(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opPathSet(ops))
 	}
 	op := ops[0]
 	if op.Path != ".clinerules/00-context.md" {
@@ -55,8 +76,10 @@ func TestCline_RootContext(t *testing.T) {
 }
 
 // TestCline_Scope: a scope with Description and Globs projects to a
-// scope rule file with a "When working in <path>" preamble, includes
-// the scope body, and emits the "no scope enforcement" info warning.
+// scope rule file with YAML frontmatter (`description:` + `paths:`),
+// the "When working in <path>" preamble, and the scope body. The
+// "no scope enforcement" warning is gone — scope is now native via
+// the `paths:` frontmatter.
 func TestCline_Scope(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/fake/.agents",
@@ -79,7 +102,7 @@ func TestCline_Scope(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opPathSet(ops))
 	}
 	op := ops[0]
 	wantPath := ".clinerules/10-scope-src-billing.md"
@@ -95,26 +118,27 @@ func TestCline_Scope(t *testing.T) {
 	if !strings.Contains(op.Content, "billing rules go here") {
 		t.Errorf("content missing body\n---\n%s", op.Content)
 	}
+	// Frontmatter native: scope is enforced via `paths:`.
+	if !strings.HasPrefix(op.Content, "---\n") {
+		t.Errorf("content should start with YAML frontmatter\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") {
+		t.Errorf("content missing paths: frontmatter\n---\n%s", op.Content)
+	}
 	if len(op.Sources) != 1 || op.Sources[0] != "src/billing/context.md" {
 		t.Errorf("sources = %v, want [src/billing/context.md]", op.Sources)
 	}
-	// Warning about no scope enforcement.
-	found := false
+	// No longer emits a "no scope enforcement" warning — scope is native.
 	for _, w := range op.Warnings {
 		if strings.Contains(w.Message, "no scope enforcement") {
-			found = true
-			if w.Severity != "info" {
-				t.Errorf("scope warning severity = %q, want info", w.Severity)
-			}
+			t.Errorf("unexpected legacy scope-enforcement warning: %#v", w)
 		}
-	}
-	if !found {
-		t.Errorf("expected scope-enforcement warning, got %#v", op.Warnings)
 	}
 }
 
 // TestCline_Scope_GlobsOnly: a scope with no Description but with Globs
-// renders the "Triggers:" preamble line.
+// renders the "Triggers:" preamble line in the body and `paths:` in the
+// frontmatter.
 func TestCline_Scope_GlobsOnly(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -139,6 +163,9 @@ func TestCline_Scope_GlobsOnly(t *testing.T) {
 	}
 	if !strings.Contains(ops[0].Content, "> Triggers: src/api/**, tests/api/**") {
 		t.Errorf("missing globs trigger line\n---\n%s", ops[0].Content)
+	}
+	if !strings.Contains(ops[0].Content, "paths:\n  - src/api/**\n  - tests/api/**") {
+		t.Errorf("missing paths: frontmatter\n---\n%s", ops[0].Content)
 	}
 }
 
@@ -286,35 +313,37 @@ func TestCline_DetectMarkers(t *testing.T) {
 	}
 }
 
-// TestCline_Capabilities: the matrix matches the contract.
+// TestCline_Capabilities: the v0.8.0 matrix flips ScopePaths,
+// ScopeSemantic, Commands, Hooks, MCP to native. Skills stay degraded
+// (no dedicated primitive). Agents + Permissions stay unsupported.
 func TestCline_Capabilities(t *testing.T) {
 	caps := NewCline().Capabilities()
 	if caps.Context != plugin.SupportNative {
 		t.Errorf("Context = %q, want native", caps.Context)
 	}
-	if caps.ScopePaths != plugin.SupportDegraded {
-		t.Errorf("ScopePaths = %q, want degraded", caps.ScopePaths)
+	if caps.ScopePaths != plugin.SupportNative {
+		t.Errorf("ScopePaths = %q, want native", caps.ScopePaths)
 	}
-	if caps.ScopeSemantic != plugin.SupportDegraded {
-		t.Errorf("ScopeSemantic = %q, want degraded", caps.ScopeSemantic)
+	if caps.ScopeSemantic != plugin.SupportNative {
+		t.Errorf("ScopeSemantic = %q, want native", caps.ScopeSemantic)
 	}
 	if caps.Skills != plugin.SupportDegraded {
 		t.Errorf("Skills = %q, want degraded", caps.Skills)
 	}
-	if caps.Commands != plugin.SupportDegraded {
-		t.Errorf("Commands = %q, want degraded", caps.Commands)
+	if caps.Commands != plugin.SupportNative {
+		t.Errorf("Commands = %q, want native", caps.Commands)
 	}
 	if caps.Agents != plugin.SupportUnsupported {
 		t.Errorf("Agents = %q, want unsupported", caps.Agents)
 	}
-	if caps.Hooks != plugin.SupportUnsupported {
-		t.Errorf("Hooks = %q, want unsupported", caps.Hooks)
+	if caps.Hooks != plugin.SupportNative {
+		t.Errorf("Hooks = %q, want native", caps.Hooks)
 	}
 	if caps.Permissions != plugin.SupportUnsupported {
 		t.Errorf("Permissions = %q, want unsupported", caps.Permissions)
 	}
-	if caps.MCP != plugin.SupportUnsupported {
-		t.Errorf("MCP = %q, want unsupported", caps.MCP)
+	if caps.MCP != plugin.SupportNative {
+		t.Errorf("MCP = %q, want native", caps.MCP)
 	}
 }
 
@@ -329,9 +358,12 @@ func TestCline_NilProject(t *testing.T) {
 	}
 }
 
-// TestCline_Command: a Command projects to .clinerules/30-command-<slug>.md
-// with a "Command /<name>" header, and emits the "no slash-command" warning.
-func TestCline_Command(t *testing.T) {
+// TestCline_Commands_AsWorkflows: a Command projects to
+// .clinerules/workflows/<name>.md (native slash command) with a YAML
+// `description:` frontmatter, and no longer emits the "no slash-command"
+// warning. The filename (sans .md) is the slash command Cline users
+// invoke with /<name>.
+func TestCline_Commands_AsWorkflows(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
 		Commands: []*model.Command{
@@ -351,11 +383,12 @@ func TestCline_Command(t *testing.T) {
 		t.Fatalf("Plan error: %v", err)
 	}
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d (%v)", len(ops), opPathSet(ops))
 	}
 	op := ops[0]
-	if op.Path != ".clinerules/30-command-deploy.md" {
-		t.Errorf("path = %q, want .clinerules/30-command-deploy.md", op.Path)
+	wantPath := ".clinerules/workflows/deploy.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
 	}
 	if !strings.Contains(op.Content, "## Command /deploy") {
 		t.Errorf("content missing command header\n---\n%s", op.Content)
@@ -366,58 +399,21 @@ func TestCline_Command(t *testing.T) {
 	if !strings.Contains(op.Content, "Run deploy script and verify.") {
 		t.Errorf("content missing body\n---\n%s", op.Content)
 	}
-	found := false
+	if !strings.HasPrefix(op.Content, "---\ndescription: Deploy to staging\n---\n") {
+		t.Errorf("content missing description frontmatter\n---\n%s", op.Content)
+	}
 	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no slash-command mechanism") {
-			found = true
+		if strings.Contains(w.Message, "no slash-command") {
+			t.Errorf("unexpected legacy no-slash-command warning: %#v", w)
 		}
-	}
-	if !found {
-		t.Errorf("expected slash-command warning, got %#v", op.Warnings)
-	}
-}
-
-// TestCline_MCPWarning: an MCP server emits no file but attaches the
-// VS Code settings warning to the first op.
-func TestCline_MCPWarning(t *testing.T) {
-	proj := &model.Project{
-		AgentsDir: "/tmp/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/.agents/context.md",
-			Body:       "ctx",
-		},
-		MCP: []*model.MCPServer{
-			{Name: "linear", Command: "npx"},
-		},
-	}
-	p := NewCline()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	if len(ops) != 1 {
-		t.Fatalf("expected 1 op, got %d", len(ops))
-	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "mcp") {
-			t.Errorf("unexpected mcp file: %s", op.Path)
-		}
-	}
-	found := false
-	for _, w := range ops[0].Warnings {
-		if strings.Contains(w.Message, "MCP via VS Code settings") && strings.Contains(w.Message, "linear") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected mcp warning, got %#v", ops[0].Warnings)
 	}
 }
 
 // TestCline_ScopedSkill: a Skill with a non-empty ScopePath projects to
 // .clinerules/20-skill-<scopeSlug>-<name>.md with a "When working in
-// <scopePath>" preamble before the Skill header, and emits the
-// "no scope enforcement" info warning naming the scope.
+// <scopePath>" preamble before the Skill header and a `paths:`
+// frontmatter scoped to the scope path's tree. No longer emits the
+// "no scope enforcement" warning since scope is native via paths.
 func TestCline_ScopedSkill(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -456,6 +452,9 @@ func TestCline_ScopedSkill(t *testing.T) {
 	if !strings.Contains(op.Content, "Append hash-chain entries to ledger.") {
 		t.Errorf("content missing body\n---\n%s", op.Content)
 	}
+	if !strings.Contains(op.Content, "paths:\n  - src/billing/**") {
+		t.Errorf("content missing paths: frontmatter\n---\n%s", op.Content)
+	}
 	// Scope must appear before the Skill header.
 	idxScope := strings.Index(op.Content, "## When working in src/billing")
 	idxSkill := strings.Index(op.Content, "## Skill: audit-trail")
@@ -465,22 +464,15 @@ func TestCline_ScopedSkill(t *testing.T) {
 	if len(op.Sources) != 1 || op.Sources[0] != "src/billing/skills/audit-trail/SKILL.md" {
 		t.Errorf("sources = %v, want [src/billing/skills/audit-trail/SKILL.md]", op.Sources)
 	}
-	found := false
 	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no scope enforcement at runtime") &&
-			strings.Contains(w.Message, "src/billing") &&
-			w.Severity == "info" {
-			found = true
+		if strings.Contains(w.Message, "no scope enforcement") {
+			t.Errorf("unexpected legacy scope-enforcement warning: %#v", w)
 		}
-	}
-	if !found {
-		t.Errorf("expected scoped-skill warning naming scope, got %#v", op.Warnings)
 	}
 }
 
 // TestCline_ScopedSkillCollision: same Skill.Name under two different
-// scopes must produce two distinct files (different filenames) without
-// either overwriting the other, both carrying the appropriate preamble.
+// scopes must produce two distinct files without overwriting either.
 func TestCline_ScopedSkillCollision(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -528,13 +520,7 @@ func TestCline_ScopedSkillCollision(t *testing.T) {
 			t.Errorf("missing expected path %q (got %v)", path, seenPaths)
 			continue
 		}
-		var op *plugin.Operation
-		for i := range ops {
-			if ops[i].Path == path {
-				op = &ops[i]
-				break
-			}
-		}
+		op := findOpByPath(ops, path)
 		if op == nil {
 			continue
 		}
@@ -545,8 +531,9 @@ func TestCline_ScopedSkillCollision(t *testing.T) {
 }
 
 // TestCline_ScopedCommand: a Command with a non-empty ScopePath projects
-// to .clinerules/30-command-<scopeSlug>-<name>.md with the scope preamble
-// and emits both the "no slash-command" and "no scope enforcement" warnings.
+// to .clinerules/workflows/<scopeSlug>-<name>.md with the scope
+// preamble in the body and a "workflows are global" warning explaining
+// the loss of path enforcement for the slash command.
 func TestCline_ScopedCommand(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -571,7 +558,7 @@ func TestCline_ScopedCommand(t *testing.T) {
 		t.Fatalf("expected 1 op, got %d", len(ops))
 	}
 	op := ops[0]
-	wantPath := ".clinerules/30-command-src-billing-deploy.md"
+	wantPath := ".clinerules/workflows/src-billing-deploy.md"
 	if op.Path != wantPath {
 		t.Errorf("path = %q, want %q", op.Path, wantPath)
 	}
@@ -583,13 +570,13 @@ func TestCline_ScopedCommand(t *testing.T) {
 	}
 	hasScopeWarn := false
 	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no scope enforcement at runtime") &&
+		if strings.Contains(w.Message, "workflows are global") &&
 			strings.Contains(w.Message, "src/billing") {
 			hasScopeWarn = true
 		}
 	}
 	if !hasScopeWarn {
-		t.Errorf("expected scoped-command warning, got %#v", op.Warnings)
+		t.Errorf("expected scoped-command workflows-are-global warning, got %#v", op.Warnings)
 	}
 }
 
@@ -630,4 +617,295 @@ func TestCline_ScopedAgentWarning(t *testing.T) {
 	if !found {
 		t.Errorf("expected scoped agent warning naming scope, got %#v", ops[0].Warnings)
 	}
+}
+
+// TestCline_MCP_Projects verifies an MCPServer projects to
+// .cline/cline_mcp_settings.json as an OpMerge whose Merger emits a
+// well-formed {mcpServers: {...}} document. Mirrors the Claude
+// .mcp.json contract.
+func TestCline_MCP_Projects(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		MCP: []*model.MCPServer{
+			{Name: "linear", Command: "npx", Args: []string{"@linear/mcp"}, Env: map[string]string{"LINEAR_KEY": "abc"}},
+			{Name: "github", URL: "https://example.invalid/sse"},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	wantPath := ".cline/cline_mcp_settings.json"
+	op := findOpByPath(ops, wantPath)
+	if op == nil {
+		t.Fatalf("missing %s op; got %v", wantPath, opPathSet(ops))
+	}
+	if op.Kind != plugin.OpMerge {
+		t.Errorf("kind = %v, want OpMerge (so existing settings are preserved)", op.Kind)
+	}
+	if op.Merger == nil {
+		t.Fatalf("merger should be non-nil for OpMerge")
+	}
+	// Run the merger against an empty existing file (file absent → engine
+	// hands the merger nil bytes).
+	out, err := op.Merger(nil)
+	if err != nil {
+		t.Fatalf("merger(nil) error: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("merger output is not valid JSON: %v\n%s", err, out)
+	}
+	servers, ok := doc["mcpServers"].(map[string]any)
+	if !ok || servers == nil {
+		t.Fatalf("mcpServers is not an object: %#v", doc["mcpServers"])
+	}
+	linear, ok := servers["linear"].(map[string]any)
+	if !ok {
+		t.Fatalf("linear entry missing: %#v", servers["linear"])
+	}
+	if linear["command"] != "npx" {
+		t.Errorf("linear.command = %v, want npx", linear["command"])
+	}
+	github, ok := servers["github"].(map[string]any)
+	if !ok {
+		t.Fatalf("github entry missing: %#v", servers["github"])
+	}
+	if github["url"] != "https://example.invalid/sse" {
+		t.Errorf("github.url = %v, want https://example.invalid/sse", github["url"])
+	}
+	// Merger must preserve unrelated keys in any existing file.
+	existing := `{"version":2,"mcpServers":{"linear":{"command":"old"}}}`
+	out2, err := op.Merger([]byte(existing))
+	if err != nil {
+		t.Fatalf("merger(existing) error: %v", err)
+	}
+	var doc2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &doc2); err != nil {
+		t.Fatalf("merger output (with existing) is not valid JSON: %v\n%s", err, out2)
+	}
+	if v, ok := doc2["version"]; !ok || v.(float64) != 2 {
+		t.Errorf("merger lost unrelated existing key 'version': %#v", doc2)
+	}
+	// The linear command should be overwritten by the projection.
+	servers2 := doc2["mcpServers"].(map[string]any)
+	linear2 := servers2["linear"].(map[string]any)
+	if linear2["command"] != "npx" {
+		t.Errorf("merger should overwrite linear.command with projection value; got %v", linear2["command"])
+	}
+}
+
+// TestCline_Hooks_Emit verifies hooks project to
+// .clinerules/hooks/<event>.json with one file per event, the
+// {hooks:[{matcher,hooks:[{type,command}]}]} schema, and the global
+// hook's command set to the raw script path (no wrapper, since it's
+// unscoped).
+func TestCline_Hooks_Emit(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Hooks: []*model.Hook{
+			{Event: "PreToolUse", Matcher: "Edit", ScriptPath: "/tmp/.agents/hooks/lint.sh"},
+			{Event: "PostToolUse", Matcher: "Bash", ScriptPath: "/tmp/.agents/hooks/audit.sh"},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	if preOp == nil {
+		t.Fatalf("missing PreToolUse.json op; got %v", opPathSet(ops))
+	}
+	postOp := findOpByPath(ops, ".clinerules/hooks/PostToolUse.json")
+	if postOp == nil {
+		t.Fatalf("missing PostToolUse.json op; got %v", opPathSet(ops))
+	}
+	if preOp.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", preOp.Kind)
+	}
+	// Parse PreToolUse JSON and assert structure.
+	var preDoc struct {
+		Hooks []struct {
+			Matcher string `json:"matcher"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(preOp.Content), &preDoc); err != nil {
+		t.Fatalf("invalid JSON for PreToolUse: %v\n%s", err, preOp.Content)
+	}
+	if len(preDoc.Hooks) != 1 {
+		t.Fatalf("expected 1 matcher group, got %d", len(preDoc.Hooks))
+	}
+	if preDoc.Hooks[0].Matcher != "Edit" {
+		t.Errorf("matcher = %q, want Edit", preDoc.Hooks[0].Matcher)
+	}
+	if len(preDoc.Hooks[0].Hooks) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(preDoc.Hooks[0].Hooks))
+	}
+	entry := preDoc.Hooks[0].Hooks[0]
+	if entry.Type != "command" {
+		t.Errorf("type = %q, want command", entry.Type)
+	}
+	if entry.Command != "/tmp/.agents/hooks/lint.sh" {
+		t.Errorf("command = %q, want raw script path /tmp/.agents/hooks/lint.sh", entry.Command)
+	}
+}
+
+// TestCline_ScopedHook_WrapperEmitted verifies that a hook with a
+// non-empty ScopePath produces both:
+//   - a scope-guard wrapper script at
+//     .clinerules/hooks/__scope-guard__/<scopeSlug>-<event>-<basename>.sh
+//   - the hook JSON command field pointing at that wrapper's absolute path
+//
+// This mirrors the Claude plugin's wrapper contract so users get
+// runtime scope enforcement even though Cline's hook engine doesn't
+// natively understand scope.
+func TestCline_ScopedHook_WrapperEmitted(t *testing.T) {
+	projRoot := "/tmp/p"
+	proj := &model.Project{
+		Root:      projRoot,
+		AgentsDir: filepath.Join(projRoot, ".agents"),
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Edit",
+				ScriptPath: filepath.Join(projRoot, ".agents", "src", "billing", "hooks", "verify.sh"),
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	wrapperRel := ".clinerules/hooks/__scope-guard__/src-billing-PreToolUse-verify.sh"
+	wrapperOp := findOpByPath(ops, wrapperRel)
+	if wrapperOp == nil {
+		t.Fatalf("missing scope-guard wrapper at %s; got %v", wrapperRel, opPathSet(ops))
+	}
+	if wrapperOp.FileMode != 0o755 {
+		t.Errorf("wrapper file mode = %v, want 0755", wrapperOp.FileMode)
+	}
+	if !strings.Contains(wrapperOp.Content, "prism scope-guard --scope 'src/billing'") {
+		t.Errorf("wrapper missing prism scope-guard invocation:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "set -euo pipefail") {
+		t.Errorf("wrapper missing strict-mode preamble:\n%s", wrapperOp.Content)
+	}
+
+	// The hook JSON's command should point at the wrapper's absolute path.
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	if preOp == nil {
+		t.Fatalf("missing PreToolUse.json op")
+	}
+	wantCmd := filepath.Join(projRoot, wrapperRel)
+	if !strings.Contains(preOp.Content, wantCmd) {
+		t.Errorf("hook JSON should reference wrapper at %s, got:\n%s", wantCmd, preOp.Content)
+	}
+
+	// DisableHookWrappers turns wrappers off and inlines the source script.
+	p2 := &ClinePlugin{DisableHookWrappers: true}
+	ops2, err := p2.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan(disable wrappers) error: %v", err)
+	}
+	if findOpByPath(ops2, wrapperRel) != nil {
+		t.Errorf("wrapper should not be emitted when DisableHookWrappers=true")
+	}
+	preOp2 := findOpByPath(ops2, ".clinerules/hooks/PreToolUse.json")
+	if preOp2 == nil {
+		t.Fatalf("missing PreToolUse.json op (disable wrappers)")
+	}
+	if !strings.Contains(preOp2.Content, "/tmp/p/.agents/src/billing/hooks/verify.sh") {
+		t.Errorf("disabled wrapper should inline raw script path; got:\n%s", preOp2.Content)
+	}
+}
+
+// TestCline_Rules_FrontmatterPaths verifies that scope and skill rule
+// files carry a YAML `paths:` frontmatter block — the v0.8.0 upgrade
+// from the legacy filename-prefix scheme to native frontmatter-based
+// scope enforcement.
+func TestCline_Rules_FrontmatterPaths(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:        "src/api",
+				Globs:       []string{"src/api/**/*.go", "tests/api/**"},
+				Description: "REST handler conventions",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/api/context.md",
+					Body:       "Body.",
+				},
+			},
+		},
+		Skills: []*model.Skill{
+			{
+				Name:        "trace-tagging",
+				Description: "Tag spans with request IDs",
+				Globs:       []string{"**/*.go"},
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/skills/trace-tagging/SKILL.md",
+					Body:       "Skill body.",
+				},
+			},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	scopeOp := findOpByPath(ops, ".clinerules/10-scope-src-api.md")
+	if scopeOp == nil {
+		t.Fatalf("missing scope op; got %v", opPathSet(ops))
+	}
+	fm := extractFrontmatter(t, scopeOp.Content)
+	if !strings.Contains(fm, "description: REST handler conventions") {
+		t.Errorf("scope frontmatter missing description:\n%s", fm)
+	}
+	if !strings.Contains(fm, "paths:\n  - src/api/**/*.go\n  - tests/api/**") {
+		t.Errorf("scope frontmatter missing paths array:\n%s", fm)
+	}
+
+	skillOp := findOpByPath(ops, ".clinerules/20-skill-trace-tagging.md")
+	if skillOp == nil {
+		t.Fatalf("missing skill op; got %v", opPathSet(ops))
+	}
+	sfm := extractFrontmatter(t, skillOp.Content)
+	if !strings.Contains(sfm, "description: Tag spans with request IDs") {
+		t.Errorf("skill frontmatter missing description:\n%s", sfm)
+	}
+	// `**/*.go` begins with `*` (a YAML alias indicator), so yamlScalar
+	// double-quotes it. Accept any of the three forms a sane YAML emitter
+	// might choose, so this test stays robust if the quoting rules change.
+	if !strings.Contains(sfm, `paths:`+"\n"+`  - "**/*.go"`) &&
+		!strings.Contains(sfm, `paths:`+"\n"+`  - '**/*.go'`) &&
+		!strings.Contains(sfm, `paths:`+"\n"+`  - **/*.go`) {
+		t.Errorf("skill frontmatter missing paths array (in any quoting form):\n%s", sfm)
+	}
+}
+
+// extractFrontmatter pulls the YAML block between the first two `---`
+// delimiters out of a markdown body. Fails the test if the body has no
+// frontmatter at all (helpful for callers asserting native paths:).
+func extractFrontmatter(t *testing.T, content string) string {
+	t.Helper()
+	if !strings.HasPrefix(content, "---\n") {
+		t.Fatalf("content has no frontmatter:\n%s", content)
+	}
+	rest := content[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		t.Fatalf("frontmatter end delimiter missing:\n%s", content)
+	}
+	return rest[:end+1] // include trailing newline of last key
 }

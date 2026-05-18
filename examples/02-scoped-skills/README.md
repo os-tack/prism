@@ -34,8 +34,11 @@ CLAUDE.md                               # root, symlink
 src/billing/CLAUDE.md                   # cascade — Claude reads it for files under src/billing/
 .claude/skills/stripe-webhook/SKILL.md  # native skill, globs preserved
 GEMINI.md                               # root
+src/billing/GEMINI.md                   # cascade (Gemini also walks up from cwd)
+.gemini/agents/stripe-webhook.md        # v0.8.0: skill projects AS a Gemini agent with trigger+globs in description
 .cursor/rules/_root.mdc                 # root rule, alwaysApply: true
 .cursor/rules/src-billing.mdc           # scoped rule, globs: src/billing/**
+.cursor/skills/stripe-webhook/SKILL.md  # v0.8.0: native Cursor 2.4+ skill format (was .cursor/rules/skill-*.mdc)
 AGENTS.md                               # root + scope sections concatenated
 ```
 
@@ -45,14 +48,16 @@ What each plugin does with the scope:
   for any file under that directory. The skill keeps `globs:` in its
   frontmatter and Claude evaluates them itself.
 - **Cursor** emits one `.mdc` file per scope with `globs:` in the
-  frontmatter — Cursor's native trigger mechanism. Skills also map to
-  scoped MDC rules.
-- **Gemini** has no path-scope primitive, so the plugin warns and emits
-  only the root `GEMINI.md`. The skill is dropped entirely (Gemini has
-  no skills primitive); look for an info-severity warning in compile
-  output.
+  frontmatter — Cursor's native trigger mechanism. Skills land at
+  `.cursor/skills/<name>/SKILL.md` (the Cursor 2.4+ native format that
+  v0.8.0 emits instead of the legacy `.cursor/rules/skill-*.mdc`).
+- **Gemini** now has scope cascade (multiple `GEMINI.md` walked from cwd).
+  Skills have no dedicated Gemini primitive, so the plugin projects each
+  skill as a Gemini agent at `.gemini/agents/<name>.md` with the trigger
+  and globs appended to the description. Auto-glob activation is lost
+  (info warning); manual activation via `@<name>` works.
 - **AGENTS.md** is a single concatenated file with one section per scope
-  — also degraded, but at least visible.
+  — degraded, but at least visible.
 
 ## Things to try
 

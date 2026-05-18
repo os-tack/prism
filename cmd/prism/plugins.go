@@ -15,10 +15,12 @@ import (
 //
 // noHookWrappers is plumbed through to ClaudePlugin.DisableHookWrappers (which
 // gates the __scope-guard__ wrapper for scoped Claude hooks) and to
-// GeminiPlugin/ContinuePlugin.DisableHookWrappers (which gate the
-// __perms-guard__ wrapper + sidecar policy emitted for permission projection
-// on those plugins). We construct each plugin directly instead of calling
-// the New* constructors so the field can be set at construction time.
+// GeminiPlugin.DisableHookWrappers (which gates the __perms-guard__ wrapper
+// + sidecar policy emitted for permission projection on that plugin).
+// We construct those plugins directly instead of calling the New*
+// constructors so the field can be set at construction time.
+// ContinuePlugin migrated to native permissions in v0.8 and no longer
+// participates in the wrapper path.
 func registerPlugins(reg *plugin.Registry, noHookWrappers bool) error {
 	toRegister := []plugin.Plugin{
 		&plugins.ClaudePlugin{DisableHookWrappers: noHookWrappers},
@@ -26,7 +28,7 @@ func registerPlugins(reg *plugin.Registry, noHookWrappers bool) error {
 		plugins.NewAgentsMD(),
 		&plugins.GeminiPlugin{DisableHookWrappers: noHookWrappers},
 		plugins.NewCline(),
-		&plugins.ContinuePlugin{DisableHookWrappers: noHookWrappers},
+		plugins.NewContinue(),
 		plugins.NewWindsurf(),
 		plugins.NewCopilot(),
 	}

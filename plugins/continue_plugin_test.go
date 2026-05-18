@@ -490,9 +490,9 @@ func TestContinue_ScopedSkillCollision(t *testing.T) {
 	}
 }
 
-// TestContinue_ScopedCommand_Warning verifies that a scoped command produces
-// a rule file under .continue/rules/ with the scope slug prefix and an info
-// warning naming the scope.
+// TestContinue_ScopedCommand_Warning verifies that a scoped command projects
+// as a prompt file under .continue/prompts/ with the scope slug prefix and
+// an info warning explaining Continue prompts have no per-scope attachment.
 func TestContinue_ScopedCommand_Warning(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/proj/.agents",
@@ -517,16 +517,19 @@ func TestContinue_ScopedCommand_Warning(t *testing.T) {
 		t.Fatalf("expected 1 op, got %d", len(ops))
 	}
 	op := ops[0]
-	wantPath := ".continue/rules/command-src-billing-deploy.md"
+	wantPath := ".continue/prompts/src-billing-deploy.md"
 	if op.Path != wantPath {
 		t.Errorf("path = %q, want %q", op.Path, wantPath)
 	}
-	if !strings.Contains(op.Content, `globs: ["src/billing/**"]`) {
-		t.Errorf("missing scope default globs in frontmatter\n---\n%s", op.Content)
+	if !strings.Contains(op.Content, "invokable: true") {
+		t.Errorf("missing invokable: true in prompt frontmatter\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "(scope: src/billing)") {
+		t.Errorf("scoped description marker missing\n---\n%s", op.Content)
 	}
 	found := false
 	for _, w := range op.Warnings {
-		if strings.Contains(w.Message, "no slash-command mechanism") && strings.Contains(w.Message, "src/billing") {
+		if strings.Contains(w.Message, "no per-scope attachment") && strings.Contains(w.Message, "src/billing") {
 			found = true
 			if w.Severity != "info" {
 				t.Errorf("warning severity = %q, want info", w.Severity)
@@ -576,116 +579,6 @@ func TestContinue_ScopedHook_Warning(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
-	}
-}
-
-// TestContinue_PermsGuard_GlobalNoHooks verifies that a global Permissions
-// block with no hooks projects a sidecar policy + a bare gate wrapper
-// under .continue/hooks/__perms-guard__/.
-func TestContinue_PermsGuard_GlobalNoHooks(t *testing.T) {
-	proj := &model.Project{
-		Root:      "/tmp/fake",
-		AgentsDir: "/tmp/fake/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/fake/.agents/context.md",
-			Body:       "x",
-		},
-		Permissions: &model.Permissions{
-			Allow: []string{"bash:ls *"},
-			Deny:  []string{"bash:rm -rf *"},
-		},
-	}
-	p := NewContinue()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	paths := map[string]plugin.Operation{}
-	for _, op := range ops {
-		paths[op.Path] = op
-	}
-	wantPolicy := filepath.Join(".continue", "hooks", "__perms-guard__", "policy.json")
-	wantGate := filepath.Join(".continue", "hooks", "__perms-guard__", "global-gate.sh")
-	if _, ok := paths[wantPolicy]; !ok {
-		t.Fatalf("missing policy at %q; have: %v", wantPolicy, opsPaths(ops))
-	}
-	if _, ok := paths[wantGate]; !ok {
-		t.Fatalf("missing gate at %q; have: %v", wantGate, opsPaths(ops))
-	}
-	if !strings.Contains(paths[wantPolicy].Content, `"bash:rm -rf *"`) {
-		t.Errorf("policy content missing deny:\n%s", paths[wantPolicy].Content)
-	}
-	if !strings.Contains(paths[wantGate].Content, "prism perms-guard") {
-		t.Errorf("gate doesn't exec perms-guard:\n%s", paths[wantGate].Content)
-	}
-}
-
-// TestContinue_PermsGuard_ScopedWithHook verifies scoped permissions +
-// scoped hook produces a scoped sidecar + wrapper that wires the source
-// script to the scope's policy.
-func TestContinue_PermsGuard_ScopedWithHook(t *testing.T) {
-	proj := &model.Project{
-		Root:      "/tmp/fake",
-		AgentsDir: "/tmp/fake/.agents",
-		Hooks: []*model.Hook{
-			{
-				Event:      "PreToolUse",
-				Matcher:    "Bash",
-				ScriptPath: "/tmp/fake/.agents/src/billing/hooks/audit.sh",
-				ScopePath:  "src/billing",
-			},
-		},
-		ScopedPermissions: []*model.Permissions{
-			{ScopePath: "src/billing", Deny: []string{"bash:rm *"}},
-		},
-	}
-	p := NewContinue()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	paths := map[string]plugin.Operation{}
-	for _, op := range ops {
-		paths[op.Path] = op
-	}
-	wantPolicy := filepath.Join(".continue", "hooks", "__perms-guard__", "src-billing.policy.json")
-	wantWrapper := filepath.Join(".continue", "hooks", "__perms-guard__", "src-billing-PreToolUse-audit.sh")
-	if _, ok := paths[wantPolicy]; !ok {
-		t.Fatalf("missing scoped policy at %q; have: %v", wantPolicy, opsPaths(ops))
-	}
-	wrapperOp, ok := paths[wantWrapper]
-	if !ok {
-		t.Fatalf("missing scoped wrapper at %q; have: %v", wantWrapper, opsPaths(ops))
-	}
-	if !strings.Contains(wrapperOp.Content, "src-billing.policy.json") {
-		t.Errorf("wrapper missing scoped-policy reference:\n%s", wrapperOp.Content)
-	}
-	if !strings.Contains(wrapperOp.Content, "audit.sh") {
-		t.Errorf("wrapper missing source script:\n%s", wrapperOp.Content)
-	}
-	if wrapperOp.FileMode != 0o755 {
-		t.Errorf("wrapper FileMode = %o, want 0755", wrapperOp.FileMode)
-	}
-}
-
-// TestContinue_PermsGuard_DisableHookWrappers verifies the disable knob
-// suppresses wrapper + policy emission entirely.
-func TestContinue_PermsGuard_DisableHookWrappers(t *testing.T) {
-	proj := &model.Project{
-		AgentsDir: "/tmp/.agents",
-		Permissions: &model.Permissions{
-			Allow: []string{"bash:ls *"},
-		},
-	}
-	p := &ContinuePlugin{DisableHookWrappers: true}
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "__perms-guard__") {
-			t.Errorf("unexpected perms-guard artifact with DisableHookWrappers=true: %s", op.Path)
-		}
 	}
 }
 
@@ -752,4 +645,268 @@ func opPaths(ops []plugin.Operation) []string {
 		out[i] = o.Path
 	}
 	return out
+}
+
+// TestContinue_Command_PromptFile verifies that a global (non-scoped) command
+// projects to .continue/prompts/<name>.md with the required prompt-file
+// frontmatter (name, description, invokable: true) followed by the body.
+func TestContinue_Command_PromptFile(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Commands: []*model.Command{
+			{
+				Name:        "release",
+				Description: "Cut a tagged release",
+				Document: &model.Document{
+					SourcePath: "/tmp/proj/.agents/commands/release.md",
+					Body:       "Step 1: bump the version.\nStep 2: tag and push.",
+				},
+			},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d (paths: %v)", len(ops), opsPaths(ops))
+	}
+	op := ops[0]
+	wantPath := ".continue/prompts/release.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if op.Plugin != "continue" {
+		t.Errorf("plugin = %q, want continue", op.Plugin)
+	}
+	if op.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", op.Kind)
+	}
+	// Frontmatter must contain name, description, and invokable: true.
+	if !strings.Contains(op.Content, `name: "release"`) {
+		t.Errorf("missing name field\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, `description: "Cut a tagged release"`) {
+		t.Errorf("missing description field\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "invokable: true") {
+		t.Errorf("missing invokable: true\n---\n%s", op.Content)
+	}
+	// Body must be preserved.
+	if !strings.Contains(op.Content, "Step 1: bump the version.") {
+		t.Errorf("missing body\n---\n%s", op.Content)
+	}
+	// Frontmatter must parse as valid YAML.
+	parts := strings.SplitN(op.Content, "---\n", 3)
+	if len(parts) < 3 {
+		t.Fatalf("frontmatter delimiters missing in:\n%s", op.Content)
+	}
+	var fm struct {
+		Name        string `yaml:"name"`
+		Description string `yaml:"description"`
+		Invokable   bool   `yaml:"invokable"`
+	}
+	if err := yaml.Unmarshal([]byte(parts[1]), &fm); err != nil {
+		t.Fatalf("prompt frontmatter is not valid YAML: %v\n---\n%s", err, parts[1])
+	}
+	if fm.Name != "release" {
+		t.Errorf("parsed name = %q, want release", fm.Name)
+	}
+	if fm.Description != "Cut a tagged release" {
+		t.Errorf("parsed description = %q", fm.Description)
+	}
+	if !fm.Invokable {
+		t.Errorf("parsed invokable = false, want true")
+	}
+}
+
+// TestContinue_NativePermissions_Emits verifies that Permissions and
+// ScopedPermissions project to a single .continue/permissions.yaml with
+// allow / ask / exclude keys, prism `tool:pattern` rules translated to
+// Continue's `Tool(pattern)` form. Scoped blocks are merged into the same
+// flat file (with an info warning per scoped block).
+func TestContinue_NativePermissions_Emits(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *", "read"},
+			Ask:   []string{"bash:git push *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{ScopePath: "src/billing", Deny: []string{"write:**/*.go"}},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	var permsOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".continue/permissions.yaml" {
+			permsOp = &ops[i]
+			break
+		}
+	}
+	if permsOp == nil {
+		t.Fatalf("missing .continue/permissions.yaml op; have: %v", opsPaths(ops))
+	}
+	if permsOp.Plugin != "continue" {
+		t.Errorf("plugin = %q, want continue", permsOp.Plugin)
+	}
+	if permsOp.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", permsOp.Kind)
+	}
+
+	// Parse the YAML and verify the flat shape.
+	type permsFile struct {
+		Allow   []string `yaml:"allow"`
+		Ask     []string `yaml:"ask"`
+		Exclude []string `yaml:"exclude"`
+	}
+	var parsed permsFile
+	if err := yaml.Unmarshal([]byte(permsOp.Content), &parsed); err != nil {
+		t.Fatalf("parse permissions yaml: %v\n---\n%s", err, permsOp.Content)
+	}
+	// Global allow: bash:ls * → Bash(ls *), read → Read.
+	wantAllow := map[string]bool{"Bash(ls *)": false, "Read": false}
+	for _, a := range parsed.Allow {
+		if _, ok := wantAllow[a]; ok {
+			wantAllow[a] = true
+		}
+	}
+	for k, seen := range wantAllow {
+		if !seen {
+			t.Errorf("allow missing %q; got %v", k, parsed.Allow)
+		}
+	}
+	// Global ask: bash:git push * → Bash(git push *).
+	if len(parsed.Ask) != 1 || parsed.Ask[0] != "Bash(git push *)" {
+		t.Errorf("ask = %v, want [Bash(git push *)]", parsed.Ask)
+	}
+	// Exclude combines global Deny + scoped Deny.
+	wantExclude := map[string]bool{"Bash(rm -rf *)": false, "Write(**/*.go)": false}
+	for _, e := range parsed.Exclude {
+		if _, ok := wantExclude[e]; ok {
+			wantExclude[e] = true
+		}
+	}
+	for k, seen := range wantExclude {
+		if !seen {
+			t.Errorf("exclude missing %q; got %v", k, parsed.Exclude)
+		}
+	}
+
+	// Scoped permissions must surface an info warning somewhere.
+	scopedFound := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "no per-scope permissions") && strings.Contains(w.Message, "src/billing") {
+				scopedFound = true
+				if w.Severity != "info" {
+					t.Errorf("scoped-perm warning severity = %q, want info", w.Severity)
+				}
+			}
+		}
+	}
+	if !scopedFound {
+		t.Errorf("expected scoped-permissions merge warning, got none")
+	}
+}
+
+// TestContinue_NativePermissions_NoWrapperScript verifies that the perms_wrapper.go
+// emitPermsGuardWrappers path is NO LONGER called by ContinuePlugin: no
+// __perms-guard__ artifacts (policy JSON, gate.sh, wrapper.sh) appear in
+// the projection, even when both global and scoped permissions are set.
+func TestContinue_NativePermissions_NoWrapperScript(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+		ScopedPermissions: []*model.Permissions{
+			{ScopePath: "src/billing", Deny: []string{"bash:rm *"}},
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/fake/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("unexpected perms-guard artifact in v0.8 native-permissions path: %s", op.Path)
+		}
+		if strings.Contains(op.Path, ".continue/hooks/") {
+			t.Errorf("unexpected .continue/hooks/ artifact: %s", op.Path)
+		}
+		if strings.Contains(op.Content, "prism perms-guard") {
+			t.Errorf("op %s contains perms-guard wrapper script content:\n%s", op.Path, op.Content)
+		}
+	}
+	// Native permissions.yaml MUST be present.
+	foundPerms := false
+	for _, op := range ops {
+		if op.Path == ".continue/permissions.yaml" {
+			foundPerms = true
+		}
+	}
+	if !foundPerms {
+		t.Errorf("expected .continue/permissions.yaml in native path, got paths: %v", opsPaths(ops))
+	}
+}
+
+// TestContinue_NativePermissions_UntranslatableGlobWarning verifies that
+// patterns Continue's matcher may not handle cleanly (mid-string `*`,
+// `?`, character classes) surface a deprecation info-warning so users
+// can review the projected rule.
+func TestContinue_NativePermissions_UntranslatableGlobWarning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:git *push*"}, // mid-string `*` — not a clean trailing wildcard
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "may not translate cleanly") && strings.Contains(w.Message, "bash:git *push*") {
+				found = true
+				if w.Severity != "info" {
+					t.Errorf("translation-warning severity = %q, want info", w.Severity)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected glob-translation deprecation warning, got ops=%#v", ops)
+	}
+}
+
+// TestContinue_Capabilities_NativeCommands verifies the matrix entry
+// Commands flips to SupportNative now that prompt files exist.
+func TestContinue_Capabilities_NativeCommands(t *testing.T) {
+	p := NewContinue()
+	if got := p.Capabilities().Commands; got != plugin.SupportNative {
+		t.Errorf("Capabilities().Commands = %v, want SupportNative", got)
+	}
 }

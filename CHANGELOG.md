@@ -4,6 +4,119 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.8.0
+
+Major plugin parity release. **Six of eight plugins** rewritten to match each
+tool's May 2026 feature surface. The capability matrix went from sparse
+"context-and-rules" coverage to honest "what the tool can actually accept"
+coverage. **17 cells flipped from `----` or `degr.` to `native`**.
+
+### The matrix, before and after
+
+```
+v0.7.3                                       v0.8.0
+PLUGIN     SKILLS CMDS AGENTS HOOKS MCP      PLUGIN     SKILLS CMDS AGENTS HOOKS MCP
+cline      degr.  degr.----   ----  ----     cline      degr.  nat. ----   nat.  nat.
+continue   degr.  degr.----   ----  nat.     continue   degr.  nat. ----   ----  nat.
+copilot    degr.  nat. ----   ----  ----     copilot    degr.  nat. nat.   ----  nat.
+cursor     degr.  degr.----   ----  nat.     cursor     nat.   nat. nat.   nat.  nat.
+gemini     ----   ----  ----  ----  nat.     gemini     degr.  nat. nat.   nat.  nat.
+windsurf   degr.  degr.----   ----  ----     windsurf   degr.  degr.----   nat.  nat.
+```
+
+(claude unchanged; agents-md unchanged — both already accurate.)
+
+### Added — per plugin
+
+- **gemini** (`plugins/gemini.go` full rewrite): `.gemini/agents/<name>.md`
+  (markdown + YAML frontmatter — `name`, `description`, `tools` with wildcards,
+  `model`, `temperature`, `max_turns`, `max_timeout`), `.gemini/commands/<name>.toml`
+  (TOML, not markdown — Gemini's slash-command format), and a `hooks` block in
+  `.gemini/settings.json` covering all 11 Cascade event types. Skills now
+  project AS agents with trigger + globs appended to the description (loses
+  auto-glob activation; emits info warning). Scoped hooks reuse the existing
+  `prism scope-guard` wrapper unchanged — Gemini's hook contract (JSON on
+  stdin, exit-2 blocks) matches Claude's exactly.
+- **cursor** (`plugins/cursor.go` full rewrite): `.cursor/hooks.json` (Cursor
+  2.4+ events: sessionStart/End, preToolUse/postToolUse, beforeShellExecution,
+  afterFileEdit, beforeSubmitPrompt, stop, plus Tab hooks), `.cursor/agents/<name>.md`
+  (frontmatter: name, description, model, readonly, is_background),
+  `.cursor/commands/<name>.md` (bare markdown — filename = slash command),
+  `.cursor/skills/<dir>/SKILL.md` (Cursor 2.4 native skills format with
+  YAML frontmatter). Phase F added `renderCursorSkillBody` to re-render
+  frontmatter from canonical Skill struct fields (parser strips frontmatter
+  into struct fields; plugin must reconstruct).
+- **cline** (`plugins/cline.go` full rewrite): MCP via
+  `.cline/cline_mcp_settings.json` (project-local; canonical user path is
+  `~/.cline/data/settings/cline_mcp_settings.json` — document the symlink
+  workaround), hooks via `.clinerules/hooks/<event>.json` (TaskStart/Resume,
+  UserPromptSubmit, PreToolUse/PostToolUse, TaskComplete/Cancel), workflows
+  via `.clinerules/workflows/<name>.md` (replaces `30-command-*` degraded form),
+  and YAML-frontmatter `paths:` globs on individual rule files (replaces
+  filename-prefix scope encoding for path targeting).
+- **windsurf** (`plugins/windsurf.go`): `.windsurf/hooks.json` with all 12
+  Cascade hook types (5 pre-hooks that can block, 4 post-hooks, plus
+  post_cascade_response, post_cascade_response_with_transcript,
+  post_setup_worktree). Claude's PreToolUse/PostToolUse map to Cascade events
+  via matcher inspection (bash→run, read→read, write→write, mcp→mcp).
+  `.windsurf/mcp_config.json` (project-local; canonical user path is
+  `~/.codeium/windsurf/mcp_config.json` — info warning with activation hint).
+- **copilot** (`plugins/copilot.go`): `.github/agents/<slug>.agent.md`
+  (GA in May 2026 — frontmatter: description, name, tools, model, agents,
+  user-invocable, handoffs), `.github/mcp.json` (CLI walks cwd→git-root
+  loading every `.mcp.json` it finds; closer wins). When `claude` target is
+  also enabled, suppresses agent emission per-agent with info warning
+  since VS Code/Copilot auto-discovers `.claude/agents/` already. Hooks
+  remain unsupported (preview status; deferred to v0.8.1).
+- **continue** (`plugins/continue_plugin.go` full rewrite): native
+  `.continue/permissions.yaml` (replaces the perms-guard wrapper for continue
+  — wrapper code path retained for gemini), native `.continue/prompts/<name>.md`
+  slash commands (frontmatter: name, description, invokable: true). Permissions
+  translation table: `bash:rm *` → `Bash(rm *)`, `read` → `Read`, etc., with
+  a deprecation warning when pattern syntax doesn't round-trip cleanly.
+
+### Changed
+
+- **Cursor skills format**: stopped emitting the legacy
+  `.cursor/rules/skill-<name>.mdc` degraded form. Cursor 2.4+ users get
+  `.cursor/skills/<dir>/SKILL.md` exclusively. Documented in plugin doc
+  comment; users on Cursor < 2.4 should pin v0.7.x or hand-author rules.
+- **Cline rules**: now use YAML frontmatter `paths:` glob arrays for path
+  targeting (was filename-prefix scope encoding). Backward compatible —
+  importer still reads the prefix scheme.
+- **Continue plugin no longer uses `plugins/perms_wrapper.go`**: native
+  `.continue/permissions.yaml` replaces the wrapper script. The wrapper
+  code stays in place for gemini until gemini's own native path matures.
+  `ContinuePlugin.DisableHookWrappers` field removed (no wrappers to disable).
+
+### Plugin-internal Capabilities() flips
+
+- cline: ScopePaths+ScopeSemantic degr→native; Commands degr→native;
+  Hooks ----→native; MCP ----→native.
+- continue: Commands degr→native; Permissions was native-labeled, now actually native.
+- copilot: Agents ----→native; MCP ----→native.
+- cursor: Skills degr→native; Commands degr→native; Agents ----→native;
+  Hooks ----→native.
+- gemini: Skills ----→degr (projected as agents); Commands ----→native;
+  Agents ----→native; Hooks ----→native.
+- windsurf: Hooks ----→native; MCP ----→native.
+
+### Known carryovers (v0.8.1+)
+
+- **Importer parity**: the new emissions need matching importer paths so
+  `prism init --from <tool>` picks up `.cursor/agents/`, `.cursor/skills/`,
+  `.cline/cline_mcp_settings.json`, etc. Today the importers only know about
+  the v0.7.x source shapes.
+- **Cursor PERMS via sandbox profile**: sandbox.json domain allowlists could
+  upgrade PERMS from `----` to `native`. Non-trivial — deferred.
+- **Cline + Copilot PERMS via hooks**: now that both have native hooks, perms
+  could be enforced via PreToolUse-hook wrappers (perms-guard pattern).
+- **Copilot hooks (preview)**: gate behind an `--enable-preview-hooks` flag
+  when GA lands.
+- **Continue subagents**: file-shape vs config-shape mismatch — Continue
+  agents live in `~/.continue/agents/*.yaml` (YAML, composing models +
+  rules + tools), not markdown. A real translator is non-trivial.
+
 ## v0.7.3
 
 Documentation + tooling round. README rewritten for v0.7.x features,

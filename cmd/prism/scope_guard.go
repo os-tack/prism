@@ -77,19 +77,38 @@ func newScopeGuardCmd() *cobra.Command {
 // known keys in order of likelihood and return the first match. Empty
 // string means "no file path in the payload" — the caller should treat
 // that as out-of-scope.
+//
+// Two envelope shapes are supported:
+//
+//   - Claude / Cursor / Gemini / Cline-style: file path lives under
+//     tool_input.file_path (or aliases path/filepath/notebook_path).
+//   - Windsurf Cascade Hooks: file path lives at the envelope root
+//     (e.g. pre_write_code emits {"file_path": "..."} directly).
+//
+// We probe tool_input first (Claude-style is the most common), then fall
+// back to the root-level keys.
 func extractToolFilePath(payload []byte) string {
 	if len(payload) == 0 {
 		return ""
 	}
-	var env struct {
-		ToolInput map[string]any `json:"tool_input"`
-	}
+	var env map[string]any
 	if err := json.Unmarshal(payload, &env); err != nil {
 		return ""
 	}
-	// Common keys observed across Edit / Write / Read / Bash tool_input shapes.
-	for _, key := range []string{"file_path", "path", "filepath", "notebook_path"} {
-		if v, ok := env.ToolInput[key]; ok {
+	keys := []string{"file_path", "path", "filepath", "notebook_path"}
+	// 1. tool_input.<key> (Claude-style envelope).
+	if ti, _ := env["tool_input"].(map[string]any); ti != nil {
+		for _, key := range keys {
+			if v, ok := ti[key]; ok {
+				if s, ok := v.(string); ok && s != "" {
+					return s
+				}
+			}
+		}
+	}
+	// 2. Root-level <key> (Windsurf Cascade envelope).
+	for _, key := range keys {
+		if v, ok := env[key]; ok {
 			if s, ok := v.(string); ok && s != "" {
 				return s
 			}

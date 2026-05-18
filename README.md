@@ -41,7 +41,7 @@ SHA-256 sidecars next to each binary.
 
 ```
 # darwin/arm64 example
-curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.7.2-darwin-arm64
+curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.8.0-darwin-arm64
 chmod +x prism
 ./prism --help
 ```
@@ -112,18 +112,19 @@ read path.
 PLUGIN     CONTEXT  PATHS   SEMANTIC  SKILLS  CMDS    AGENTS  HOOKS   PERMS   MCP
 agents-md  native   degr.   degr.     degr.   degr.   degr.   degr.   degr.   degr.
 claude     native   native  degr.     native  native  native  native  native  native
-cline      native   degr.   degr.     degr.   degr.   ----    ----    ----    ----
-continue   native   native  native    degr.   degr.   ----    ----    wrapper native
-copilot    native   native  degr.     degr.   native  ----    ----    ----    ----
-cursor     native   native  native    degr.   degr.   ----    ----    ----    native
-gemini     native   native  degr.     ----    ----    ----    ----    wrapper native
-windsurf   native   native  native    degr.   degr.   ----    ----    ----    ----
+cline      native   native  native    degr.   native  ----    native  ----    native
+continue   native   native  native    degr.   native  ----    ----    native  native
+copilot    native   native  degr.     degr.   native  native  ----    ----    native
+cursor     native   native  native    native  native  native  native  ----    native
+gemini     native   native  degr.     degr.   native  native  native  native  native
+windsurf   native   native  native    degr.   degr.   ----    native  ----    native
 ```
 
 - **native**: 1:1 mapping; full fidelity.
 - **degr.** (degraded): approximated in the target's nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
-- **wrapper**: enforced at runtime via a generated `prism perms-guard` wrapper script + sidecar JSON policy (the tool itself has no native permission primitive, but the wrapper gates hook execution against the policy).
 - **----** (unsupported): not projected. Plugin emits a warning naming the dropped item.
+
+As of v0.8.0, **17 cells flipped from `----` or `degr.` to `native`** when six of eight plugins were rewritten to match each tool's May 2026 feature surface. Cursor, Gemini, Cline, Continue, Copilot, and Windsurf all gained meaningful new emissions (hooks, agents, slash commands, MCP, dedicated skill formats, native permissions). See [CHANGELOG.md](CHANGELOG.md) for the per-plugin breakdown.
 
 Show the matrix with `prism capabilities`.
 
@@ -227,21 +228,25 @@ Some tools' hook contracts don't natively understand path-scoping or
 permission policies. `prism` ships two hidden subcommands that fill the gap
 via generated bash wrappers:
 
-- **`prism scope-guard`** — gates a Claude hook on a file-path scope. The
-  generated wrapper at `.claude/hooks/__scope-guard__/<scope>-<event>-<hook>.sh`
-  reads Claude's hook JSON from stdin, extracts `tool_input.file_path`, and
-  invokes the user's hook only if the path falls under the scope.
-- **`prism perms-guard`** — enforces an allow/deny/ask policy for tools that
-  have no native permission primitive (gemini, continue). The wrapper at
-  `.{plugin}/hooks/__perms-guard__/<...>.sh` reads the hook JSON, consults a
+- **`prism scope-guard`** — gates a hook on a file-path scope. The
+  generated wrapper at `.{plugin}/hooks/__scope-guard__/<scope>-<event>-<hook>.sh`
+  reads the tool's hook JSON from stdin, extracts `tool_input.file_path`, and
+  invokes the user's hook only if the path falls under the scope. Used by
+  claude / cursor / gemini / cline / windsurf — every tool whose hook
+  contract is JSON-on-stdin with exit-2-blocks semantics (which is most of
+  them after the v0.8.0 plugin upgrades).
+- **`prism perms-guard`** — enforces an allow/deny/ask policy for plugins
+  without a native permission primitive. After v0.8.0 this is just **gemini**
+  — continue moved to native `.continue/permissions.yaml`. The wrapper at
+  `.gemini/hooks/__perms-guard__/<...>.sh` reads the hook JSON, consults a
   sidecar `policy.json`, and either exec's the underlying script (allow),
   exits non-zero (deny), or prompts on TTY (ask). Policy rules use a
   `tool:pattern` grammar — `bash:rm -rf *` matches any bash command starting
   with `rm -rf `; `bash` (no colon) matches any bash action. Deny dominates
-  Allow, which dominates Ask. Claude users can still use the native
-  `Tool(pattern)` syntax in their `.agents/permissions.yaml` since the
-  claude plugin projects to `.claude/settings.json`'s Permissions block
-  natively — only the perms-guard wrapper uses the `tool:pattern` grammar.
+  Allow, which dominates Ask. Plugins with native enforcement (claude →
+  `.claude/settings.json`, continue → `.continue/permissions.yaml`) translate
+  the same canonical `.agents/permissions.yaml` directly to their native
+  format and don't go through perms-guard at all.
 
 Both wrappers resolve the project root at runtime via
 `${PRISM_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}}`,
@@ -341,6 +346,8 @@ engine-side so they're portable across macOS/Linux/Windows.
 
 [See CHANGELOG.md](CHANGELOG.md) for full release notes. Highlights:
 
+- **v0.8.0** — major plugin parity release: 17 capability cells flipped
+  to native across cursor / gemini / cline / continue / copilot / windsurf
 - **v0.7.x** — central registry, `--interactive` importers, perms-guard
   wrappers, OpMerge contract refactor, round-trip test coverage, path-portable
   wrappers, version package, nit sweep

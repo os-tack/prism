@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,21 +313,20 @@ func TestCopilot_Skill_AsInstructions(t *testing.T) {
 	}
 }
 
-// TestCopilot_AgentWarning verifies that an Agent produces no file but
-// emits an info warning attached to whatever the first op happens to be.
-func TestCopilot_AgentWarning(t *testing.T) {
+// TestCopilot_Agent_EmitsFile verifies that an Agent now produces a
+// .github/agents/<slug>.agent.md file with the expected frontmatter and
+// body — v0.8 promoted Copilot agents from SupportUnsupported (warning
+// only) to SupportNative.
+func TestCopilot_Agent_EmitsFile(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/.agents/context.md",
-			Body:       "ctx",
-		},
 		Agents: []*model.Agent{
 			{
 				Name:        "code-reviewer",
 				Description: "Reviews code",
 				Document: &model.Document{
 					SourcePath: "/tmp/.agents/agents/code-reviewer.md",
+					Body:       "system prompt body",
 				},
 			},
 		},
@@ -336,26 +336,25 @@ func TestCopilot_AgentWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
-	// Only the root context op exists.
 	if len(ops) != 1 {
-		t.Fatalf("expected 1 op (no agent file), got %d", len(ops))
+		t.Fatalf("expected 1 op, got %d", len(ops))
 	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "/agents/") || strings.Contains(op.Path, "code-reviewer") {
-			t.Errorf("unexpected agent file: %s", op.Path)
-		}
+	op := ops[0]
+	wantPath := ".github/agents/code-reviewer.agent.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
 	}
-	found := false
-	for _, w := range ops[0].Warnings {
-		if strings.Contains(w.Message, "no subagent primitive") && strings.Contains(w.Message, "code-reviewer") {
-			found = true
-			if w.Severity != "info" {
-				t.Errorf("warning severity = %q, want info", w.Severity)
-			}
-		}
+	if op.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", op.Kind)
 	}
-	if !found {
-		t.Errorf("expected agent warning, got %#v", ops[0].Warnings)
+	if !strings.Contains(op.Content, `name: "code-reviewer"`) {
+		t.Errorf("missing name frontmatter\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, `description: "Reviews code"`) {
+		t.Errorf("missing description frontmatter\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, "system prompt body") {
+		t.Errorf("missing body\n---\n%s", op.Content)
 	}
 }
 
@@ -409,8 +408,8 @@ func TestCopilot_Capabilities(t *testing.T) {
 	if caps.Commands != plugin.SupportNative {
 		t.Errorf("Commands = %v, want native", caps.Commands)
 	}
-	if caps.Agents != plugin.SupportUnsupported {
-		t.Errorf("Agents = %v, want unsupported", caps.Agents)
+	if caps.Agents != plugin.SupportNative {
+		t.Errorf("Agents = %v, want native", caps.Agents)
 	}
 	if caps.Hooks != plugin.SupportUnsupported {
 		t.Errorf("Hooks = %v, want unsupported", caps.Hooks)
@@ -418,8 +417,8 @@ func TestCopilot_Capabilities(t *testing.T) {
 	if caps.Permissions != plugin.SupportUnsupported {
 		t.Errorf("Permissions = %v, want unsupported", caps.Permissions)
 	}
-	if caps.MCP != plugin.SupportUnsupported {
-		t.Errorf("MCP = %v, want unsupported", caps.MCP)
+	if caps.MCP != plugin.SupportNative {
+		t.Errorf("MCP = %v, want native", caps.MCP)
 	}
 }
 
@@ -588,12 +587,322 @@ func TestCopilot_ScopedHook_Warning(t *testing.T) {
 	found := false
 	for _, op := range ops {
 		for _, w := range op.Warnings {
-			if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
+			if strings.Contains(w.Message, "hooks are in preview") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
 				found = true
 			}
 		}
 	}
 	if !found {
 		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
+	}
+}
+
+// TestCopilot_Agent_Projects verifies the full agent emission path: a
+// project with an Agent (and other capabilities mixed in) produces a
+// .github/agents/<slug>.agent.md file with frontmatter that passes through
+// non-canonical keys (tools, model) from the source document's frontmatter,
+// alongside the canonical name/description that the parser computed.
+func TestCopilot_Agent_Projects(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Agents: []*model.Agent{
+			{
+				Name:        "reviewer",
+				Description: "Reviews diffs",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/reviewer.md",
+					Body:       "Walk the diff line by line.",
+					Frontmatter: map[string]any{
+						"description":    "old description (overridden)",
+						"tools":          []any{"Read", "Grep"},
+						"model":          "claude-sonnet-4-5",
+						"user-invocable": true,
+						"agents":         []any{"summarizer"},
+						"handoffs":       []any{"code-fixer"},
+					},
+				},
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d: %+v", len(ops), ops)
+	}
+	op := ops[0]
+	wantPath := ".github/agents/reviewer.agent.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if op.Mode != plugin.ModeWrite {
+		t.Errorf("mode = %v, want ModeWrite", op.Mode)
+	}
+	// Canonical fields take precedence over source frontmatter.
+	if !strings.Contains(op.Content, `name: "reviewer"`) {
+		t.Errorf("missing name\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, `description: "Reviews diffs"`) {
+		t.Errorf("missing canonical description\n---\n%s", op.Content)
+	}
+	if strings.Contains(op.Content, "old description (overridden)") {
+		t.Errorf("source description should be overridden by canonical, got\n---\n%s", op.Content)
+	}
+	// Pass-through fields appear in the frontmatter.
+	for _, want := range []string{
+		`tools: ["Read", "Grep"]`,
+		`model: "claude-sonnet-4-5"`,
+		`user-invocable: true`,
+		`agents: ["summarizer"]`,
+		`handoffs: ["code-fixer"]`,
+	} {
+		if !strings.Contains(op.Content, want) {
+			t.Errorf("missing %q\n---\n%s", want, op.Content)
+		}
+	}
+	if !strings.Contains(op.Content, "Walk the diff line by line.") {
+		t.Errorf("missing body\n---\n%s", op.Content)
+	}
+	if len(op.Sources) != 1 || op.Sources[0] != "agents/reviewer.md" {
+		t.Errorf("Sources = %v, want [agents/reviewer.md]", op.Sources)
+	}
+}
+
+// TestCopilot_MCP_Projects + Merger preserves user keys verifies that an
+// MCP server in the canonical model produces a .github/mcp.json OpMerge
+// whose Merger preserves any user-authored keys (both top-level and inside
+// mcpServers) that the canonical model doesn't know about.
+func TestCopilot_MCP_Projects(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		MCP: []*model.MCPServer{
+			{
+				Name:    "filesystem",
+				Command: "npx",
+				Args:    []string{"@modelcontextprotocol/server-filesystem", "/tmp"},
+			},
+			{
+				Name: "remote",
+				URL:  "https://example.com/mcp",
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	var mcpOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".github/mcp.json" {
+			mcpOp = &ops[i]
+			break
+		}
+	}
+	if mcpOp == nil {
+		t.Fatalf("missing .github/mcp.json op; got: %+v", ops)
+	}
+	if mcpOp.Kind != plugin.OpMerge {
+		t.Errorf("kind = %v, want OpMerge", mcpOp.Kind)
+	}
+	if mcpOp.Mode != plugin.ModeWrite {
+		t.Errorf("mode = %v, want ModeWrite", mcpOp.Mode)
+	}
+	if mcpOp.Plugin != "copilot" {
+		t.Errorf("plugin = %q, want copilot", mcpOp.Plugin)
+	}
+	if mcpOp.Merger == nil {
+		t.Fatalf("Merger must be set for OpMerge")
+	}
+
+	// 1. Empty existing file → produces the two servers.
+	out, err := mcpOp.Merger(nil)
+	if err != nil {
+		t.Fatalf("merger(nil): %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("unmarshal: %v\ncontent:\n%s", err, out)
+	}
+	servers, _ := doc["mcpServers"].(map[string]any)
+	if servers == nil {
+		t.Fatalf("mcpServers missing\n%s", out)
+	}
+	if _, ok := servers["filesystem"]; !ok {
+		t.Errorf("filesystem missing in fresh merge: %v", servers)
+	}
+	remote, _ := servers["remote"].(map[string]any)
+	if got, want := remote["url"], "https://example.com/mcp"; got != want {
+		t.Errorf("remote.url = %v, want %v", got, want)
+	}
+
+	// 2. Existing file with a user-authored top-level key AND a user-authored
+	// mcpServer entry: both must survive the merge.
+	existing := []byte(`{
+  "inputs": [{"id": "github-token", "type": "promptString"}],
+  "mcpServers": {
+    "user-server": {"command": "user-cmd"}
+  }
+}`)
+	out2, err := mcpOp.Merger(existing)
+	if err != nil {
+		t.Fatalf("merger(existing): %v", err)
+	}
+	var doc2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &doc2); err != nil {
+		t.Fatalf("unmarshal merged: %v\ncontent:\n%s", err, out2)
+	}
+	// Top-level user key preserved.
+	if _, ok := doc2["inputs"]; !ok {
+		t.Errorf("top-level user key 'inputs' was dropped\n%s", out2)
+	}
+	srv2, _ := doc2["mcpServers"].(map[string]any)
+	if _, ok := srv2["user-server"]; !ok {
+		t.Errorf("user-authored mcpServer 'user-server' was dropped\n%s", out2)
+	}
+	if _, ok := srv2["filesystem"]; !ok {
+		t.Errorf("prism 'filesystem' server missing after merge\n%s", out2)
+	}
+}
+
+// TestCopilot_Semantic_ApplyToFrontmatter is a regression-style check that
+// scope projection emits applyTo: frontmatter (single-glob today). This is
+// the native semantic-targeting surface Copilot already supports, and the
+// test fixes the contract so we don't accidentally regress to a less
+// specific shape.
+func TestCopilot_Semantic_ApplyToFrontmatter(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:  "src/auth",
+				Globs: []string{"src/auth/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/auth/context.md",
+					Body:       "auth context",
+				},
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".github/instructions/src-auth.instructions.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	if !strings.HasPrefix(op.Content, "---\napplyTo: ") {
+		t.Errorf("content must lead with applyTo frontmatter\n---\n%s", op.Content)
+	}
+	if !strings.Contains(op.Content, `applyTo: "src/auth/**"`) {
+		t.Errorf("missing applyTo with scope glob\n---\n%s", op.Content)
+	}
+	// Make sure the body is delimited by the closing fence.
+	if !strings.Contains(op.Content, "---\nauth context") {
+		t.Errorf("body must follow closing --- fence\n---\n%s", op.Content)
+	}
+}
+
+// TestCopilot_ClaudeAgentsOverlap_InfoWarning verifies that when the Claude
+// target is also enabled, Copilot skips its own .github/agents/*.agent.md
+// emission (VS Code/Copilot auto-discovers .claude/agents/) and attaches
+// an info warning to the first emitted op explaining the suppression.
+func TestCopilot_ClaudeAgentsOverlap_InfoWarning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/.agents/context.md",
+			Body:       "ctx",
+		},
+		Agents: []*model.Agent{
+			{
+				Name:        "reviewer",
+				Description: "Reviews",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/reviewer.md",
+					Body:       "body",
+				},
+			},
+		},
+		Config: &model.Config{
+			Targets: []string{"claude", "copilot"},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	// Context op exists; no agent op.
+	for _, op := range ops {
+		if strings.Contains(op.Path, "/agents/") {
+			t.Errorf("Copilot must not emit agent files when claude is enabled: %s", op.Path)
+		}
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected exactly 1 op (context only), got %d: %+v", len(ops), ops)
+	}
+	found := false
+	for _, w := range ops[0].Warnings {
+		if strings.Contains(w.Message, "not emitted") && strings.Contains(w.Message, "reviewer") && strings.Contains(w.Message, ".claude/agents/") {
+			found = true
+			if w.Severity != "info" {
+				t.Errorf("warning severity = %q, want info", w.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected overlap warning, got %#v", ops[0].Warnings)
+	}
+}
+
+// TestCopilot_AgentScoped_Warns verifies that a scoped agent gets a
+// scope-slug-prefixed filename and a degradation info warning noting
+// Copilot has no per-path agent scoping.
+func TestCopilot_AgentScoped_Warns(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Agents: []*model.Agent{
+			{
+				Name:        "auditor",
+				Description: "Audit billing",
+				ScopePath:   "src/billing",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/src/billing/agents/auditor.md",
+					Body:       "audit body",
+				},
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(ops))
+	}
+	op := ops[0]
+	wantPath := ".github/agents/src-billing-auditor.agent.md"
+	if op.Path != wantPath {
+		t.Errorf("path = %q, want %q", op.Path, wantPath)
+	}
+	found := false
+	for _, w := range op.Warnings {
+		if strings.Contains(w.Message, "no path scoping") && strings.Contains(w.Message, "src/billing") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected scoped-agent degradation warning, got %#v", op.Warnings)
 	}
 }

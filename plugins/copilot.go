@@ -8,11 +8,16 @@ package plugins
 //                                                   (frontmatter: applyTo)
 //   - .github/prompts/<name>.prompt.md           — prompt files (slash-command analog)
 //                                                   (frontmatter: description, mode)
+//   - .github/agents/<name>.agent.md             — Copilot custom agents (GA)
+//                                                   (frontmatter: name, description,
+//                                                   tools, model, agents, etc.)
+//   - .github/mcp.json                           — Copilot-discovered MCP servers
+//                                                   (same {mcpServers: {...}} schema
+//                                                   the Claude/MCP ecosystem uses)
 //
 // Copilot's `applyTo` is a single glob string (not a list); when a Scope or
 // Skill has multiple globs we use the first and emit a degradation warning
-// naming the dropped patterns. Copilot has no subagent, hook, permission, or
-// project-local MCP primitive — those emit warnings only and produce no files.
+// naming the dropped patterns.
 //
 // Scoped skills include the scope slug as a filename prefix (skill-<scopeSlug>-<name>)
 // so same-named skills across scopes don't collide; the parser populates
@@ -22,11 +27,18 @@ package plugins
 // Scoped commands are projected as scoped prompt files; Copilot prompts have
 // no path scoping mechanism (no applyTo on prompts) so a warning notes the
 // degradation alongside the filename-only disambiguation.
+//
+// Hook emission is intentionally not implemented: Copilot hooks are in
+// public preview at the time of writing, so Hooks remains SupportUnsupported
+// and hook-bearing projects get an info warning per hook. A future flag
+// (e.g. --enable-preview-hooks on the compile command) can flip this on.
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"agents.dev/agents/internal/model"
@@ -64,11 +76,15 @@ func (p *CopilotPlugin) Detect(root string) bool {
 // Capabilities returns Copilot's capability matrix.
 //
 // Copilot natively supports a repo-wide instructions file (Context), per-glob
-// instruction attachment (ScopePaths), and prompt files / slash commands
-// (Commands). ScopeSemantic is degraded — Copilot's `applyTo` is glob-only,
-// with no description-driven trigger. Skills degrade to either instructions or
-// prompts. Agents, Hooks, Permissions, and MCP are unsupported (project-local
-// MCP config is not read by Copilot).
+// instruction attachment (ScopePaths), prompt files / slash commands
+// (Commands), custom agents via `.github/agents/<name>.agent.md` (Agents,
+// GA as of 2026), and project-local MCP via `.github/mcp.json` (MCP).
+//
+// ScopeSemantic stays degraded — `applyTo` is glob-only, with no
+// description-driven trigger. Skills degrade to scoped instructions. Hooks
+// are SupportUnsupported pending the public-preview hook surface; a future
+// `--enable-preview-hooks` flag can flip this. Permissions have no Copilot
+// analog.
 func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
@@ -76,10 +92,10 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 		ScopeSemantic: plugin.SupportDegraded,
 		Skills:        plugin.SupportDegraded,
 		Commands:      plugin.SupportNative,
-		Agents:        plugin.SupportUnsupported,
-		Hooks:         plugin.SupportUnsupported,
+		Agents:        plugin.SupportNative,
+		Hooks:         plugin.SupportUnsupported, // preview; defer
 		Permissions:   plugin.SupportUnsupported,
-		MCP:           plugin.SupportUnsupported,
+		MCP:           plugin.SupportNative,
 	}
 }
 
@@ -90,6 +106,8 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 // write mode for everything. Per-scope/per-skill files and prompts are
 // ALWAYS write mode because they inject frontmatter the canonical source
 // does not contain; symlinking those would point at byte-different content.
+// Agent files are also ALWAYS write mode (frontmatter is rebuilt). MCP is
+// always write/merge.
 // Any other mode value returns an error.
 func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plugin.Operation, error) {
 	if proj == nil {
@@ -273,33 +291,102 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		ops = append(ops, op)
 	}
 
-	// 5. Capability gaps that produce no files: collect warnings.
-	var warnings []plugin.Warning
+	// 5. Agents → .github/agents/<name>.agent.md (GA Copilot custom agents).
+	//
+	// Frontmatter pulls from the source document's existing frontmatter for
+	// `tools`, `model`, `agents`, `user-invocable`, `handoffs`, and any other
+	// fields the user authored; `name` and `description` come from the
+	// model.Agent (which the parser populated from frontmatter or filename).
+	// The body is the document body verbatim.
+	//
+	// Overlap handling: VS Code/Copilot also auto-discovers `.claude/agents/`
+	// when that directory exists. To avoid emitting two copies of the same
+	// agent, we skip Copilot agent emission entirely when the Claude target
+	// is enabled in proj.Config.Targets and just emit an info warning. We do
+	// NOT inspect the filesystem for `.claude/agents/` — the canonical signal
+	// is the target list (config), and that keeps Plan pure.
+	claudeAlsoEnabled := false
+	if proj.Config != nil {
+		for _, t := range proj.Config.Targets {
+			if t == "claude" {
+				claudeAlsoEnabled = true
+				break
+			}
+		}
+	}
 	for _, agent := range proj.Agents {
 		if agent == nil {
 			continue
 		}
-		src := ""
+		body := ""
+		var sources []string
+		var srcTag string
 		if agent.Document != nil {
-			src = proj.SourceTag(agent.Document.SourcePath)
+			body = agent.Document.Body
+			srcTag = proj.SourceTag(agent.Document.SourcePath)
+			sources = []string{srcTag}
+			for _, inc := range agent.Document.Includes {
+				sources = append(sources, proj.SourceTag(inc))
+			}
 		}
-		msg := fmt.Sprintf("Copilot has no subagent primitive; %s not projected.", agent.Name)
+		if claudeAlsoEnabled {
+			// Drop the file but keep a trace warning that lands on the
+			// first emitted op (see warnings flush below). We synthesize
+			// a warning here and attach it via the global warnings bucket.
+			// Doing this inside the agent loop keeps per-agent attribution.
+			ops = appendAgentOverlapWarning(ops, agent, srcTag)
+			continue
+		}
+
+		var fname string
 		if agent.ScopePath != "" {
-			msg = fmt.Sprintf("Copilot has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+			fname = scopedSkillSlug(agent.ScopePath, agent.Name) + ".agent.md"
+		} else {
+			fname = skillSlug(agent.Name) + ".agent.md"
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   src,
-			Message:  msg,
-			Severity: "info",
-		})
+		path := filepath.ToSlash(filepath.Join(".github", "agents", fname))
+		op := plugin.Operation{
+			Kind:    plugin.OpWrite,
+			Path:    path,
+			Content: renderCopilotAgent(agent, body),
+			Mode:    plugin.ModeWrite,
+			Plugin:  p.Name(),
+			Sources: sources,
+		}
+		if agent.ScopePath != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("Copilot agents have no path scoping; scoped agent %q (scope: %s) projected without applyTo", agent.Name, agent.ScopePath),
+				Severity: "info",
+			})
+		}
+		ops = append(ops, op)
 	}
+
+	// 6. MCP → .github/mcp.json (merge with existing keys preserved).
+	//
+	// Schema is the standard {mcpServers: {<name>: {command, args, env, url}}}
+	// shape that Copilot, Claude, and the rest of the MCP ecosystem share.
+	// The CLI walks from cwd to git root loading every `.mcp.json` it finds
+	// (closer wins) — so `.github/mcp.json` at project root is the right
+	// target for repo-scoped MCP wiring.
+	//
+	// Scoped MCP servers are merged into the same map as global ones (Copilot
+	// has no per-path MCP) with one info warning per scoped server.
+	if hasMCPServers(proj.MCP) {
+		mcpOp := buildCopilotMCPOp(proj)
+		ops = append(ops, mcpOp)
+	}
+
+	// 7. Capability gaps that produce no files: collect warnings.
+	var warnings []plugin.Warning
 	for _, hook := range proj.Hooks {
 		if hook == nil {
 			continue
 		}
-		msg := fmt.Sprintf("Copilot has no hook primitive; %s:%s not projected.", hook.Event, hook.Matcher)
+		msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected.", hook.Event, hook.Matcher)
 		if hook.ScopePath != "" {
-			msg = fmt.Sprintf("Copilot has no hook primitive; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
+			msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
 		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   hook.ScriptPath,
@@ -329,20 +416,6 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			Severity: "info",
 		})
 	}
-	for _, srv := range proj.MCP {
-		if srv == nil {
-			continue
-		}
-		msg := fmt.Sprintf("Copilot does not read project-local MCP config; %s not projected", srv.Name)
-		if srv.ScopePath != "" {
-			msg = fmt.Sprintf("Copilot does not read project-local MCP config; scoped server %q (scope: %s) not projected", srv.Name, srv.ScopePath)
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "mcp.yaml",
-			Message:  msg,
-			Severity: "info",
-		})
-	}
 
 	// Attach warnings without a host op to the first emitted op. If no op
 	// exists, the warnings have nowhere to land — drop them rather than
@@ -352,6 +425,38 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 	}
 
 	return ops, nil
+}
+
+// appendAgentOverlapWarning attaches an info-warn explaining that a Copilot
+// agent file was suppressed because the Claude target is also enabled (so
+// VS Code/Copilot will already pick up the agent from `.claude/agents/`).
+// The warning lands on the first available op; if no op exists yet we drop
+// the warning rather than synthesize a carrier op — same policy used for
+// the unsupported-capability warnings below.
+func appendAgentOverlapWarning(ops []plugin.Operation, agent *model.Agent, srcTag string) []plugin.Operation {
+	msg := fmt.Sprintf("Copilot agent %q not emitted: Claude target also enabled and VS Code/Copilot auto-discovers .claude/agents/", agent.Name)
+	if agent.ScopePath != "" {
+		msg = fmt.Sprintf("Copilot agent %q (scope: %s) not emitted: Claude target also enabled and VS Code/Copilot auto-discovers .claude/agents/", agent.Name, agent.ScopePath)
+	}
+	w := plugin.Warning{Source: srcTag, Message: msg, Severity: "info"}
+	if len(ops) == 0 {
+		return ops // dropped — no carrier
+	}
+	ops[0].Warnings = append(ops[0].Warnings, w)
+	return ops
+}
+
+// hasMCPServers reports whether there is at least one non-nil, non-empty
+// MCP server in the slice. Used to skip the `.github/mcp.json` op entirely
+// when the canonical model has no servers — avoids writing an empty
+// `{"mcpServers": {}}` file that would be lockfile-tracked but useless.
+func hasMCPServers(servers []*model.MCPServer) bool {
+	for _, s := range servers {
+		if s != nil && s.Name != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // pickApplyTo selects a single applyTo glob from a list of canonical globs
@@ -426,6 +531,124 @@ func renderCopilotPrompt(description, promptMode, body string) string {
 	return b.String()
 }
 
+// renderCopilotAgent formats a `.agent.md` file with frontmatter that
+// Copilot's GA custom-agent spec recognizes. Required keys: `name`,
+// `description`. Optional keys passed through from the source document's
+// frontmatter: `tools`, `model`, `agents` (subagent list), `user-invocable`,
+// `handoffs`, and any other scalar/list/map the user authored. The body is
+// the agent's system prompt verbatim.
+//
+// The merge rule: model.Agent's Name and Description override whatever was
+// in the source frontmatter (those are the canonical values the parser
+// computed), but every other key in agent.Document.Frontmatter is
+// pass-through. Keys are emitted in a stable order: name, description, then
+// the rest sorted alphabetically — so byte output is deterministic across
+// runs even though Go maps aren't.
+func renderCopilotAgent(agent *model.Agent, body string) string {
+	var b strings.Builder
+	b.WriteString("---\n")
+
+	// Canonical keys first.
+	b.WriteString("name: ")
+	b.WriteString(yamlQuote(agent.Name))
+	b.WriteString("\n")
+	b.WriteString("description: ")
+	b.WriteString(yamlQuote(agent.Description))
+	b.WriteString("\n")
+
+	// Pass-through everything else from the source frontmatter, alpha order.
+	if agent.Document != nil && agent.Document.Frontmatter != nil {
+		fm := agent.Document.Frontmatter
+		keys := make([]string, 0, len(fm))
+		for k := range fm {
+			if k == "name" || k == "description" {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(renderYAMLValue(fm[k]))
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("---\n")
+	if body != "" {
+		b.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// renderYAMLValue serializes a single frontmatter value into YAML-ish text
+// suitable for inline placement after `key: `. Strings are double-quoted
+// for safety; numbers and bools are emitted raw; slices become bracketed
+// flow-style lists (`[a, b, c]`); maps become flow-style objects
+// (`{k: v, ...}`); nil becomes the empty string. This keeps the rendered
+// frontmatter on a single line per key, which is what Copilot's agent spec
+// shows in its docs and which lets us hash output byte-for-byte for the
+// lockfile.
+//
+// For deeply nested or oddball values we fall back to %v formatting; the
+// goal isn't a full YAML emitter (the canonical model already restricts
+// what we'll see) but a deterministic round-trip for the common Copilot
+// agent fields: `tools: [...]`, `model: "..."`, `user-invocable: true`,
+// `handoffs: [...]`, `agents: [...]`.
+func renderYAMLValue(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return `""`
+	case string:
+		return yamlQuote(x)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case int:
+		return fmt.Sprintf("%d", x)
+	case int64:
+		return fmt.Sprintf("%d", x)
+	case float64:
+		// YAML doesn't distinguish int / float; trim trailing zero if exact int.
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x))
+		}
+		return fmt.Sprintf("%g", x)
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			parts = append(parts, renderYAMLValue(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case []string:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			parts = append(parts, yamlQuote(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s: %s", k, renderYAMLValue(x[k])))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		// Best-effort fallback.
+		return yamlQuote(fmt.Sprintf("%v", x))
+	}
+}
+
 // yamlQuote returns a double-quoted YAML scalar with the minimal escaping
 // needed for the kinds of strings we emit (globs and descriptions). It
 // always quotes — even when the string is "safe" — to avoid surprises with
@@ -433,6 +656,94 @@ func renderCopilotPrompt(description, promptMode, body string) string {
 func yamlQuote(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 	return `"` + r.Replace(s) + `"`
+}
+
+// copilotMCPServerJSON is the schema Copilot expects under `.github/mcp.json`'s
+// `mcpServers` map. Identical in shape to Claude's `.mcp.json` schema; the
+// MCP ecosystem has converged on this layout.
+type copilotMCPServerJSON struct {
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+}
+
+// buildCopilotMCPOp returns an OpMerge for `.github/mcp.json`. The Merger
+// closure parses any existing file (preserving user-authored keys at the
+// top level and inside `mcpServers`) and writes a merged document. Plan
+// itself does no filesystem I/O — the merger pattern keeps the plugin pure
+// and reproducible from `proj` alone, which mirrors the
+// `buildSettingsOp` Merger pattern in claude.go (and is the contract the
+// engine expects for OpMerge).
+//
+// Scoped servers are merged into the same map as globals (Copilot has no
+// per-path MCP) with one info warning per scoped server, attached to the
+// MCP op so `agents which` can trace it.
+func buildCopilotMCPOp(proj *model.Project) plugin.Operation {
+	const relPath = ".github/mcp.json"
+
+	// Deterministic ordering: take a snapshot of proj.MCP at Plan time so
+	// the Merger closure (invoked later by the engine) sees a stable list.
+	servers := make([]*model.MCPServer, 0, len(proj.MCP))
+	servers = append(servers, proj.MCP...)
+
+	var warnings []plugin.Warning
+	for _, srv := range servers {
+		if srv == nil || srv.ScopePath == "" {
+			continue
+		}
+		warnings = append(warnings, plugin.Warning{
+			Source:   srv.ScopePath + "/mcp.yaml",
+			Message:  fmt.Sprintf("scoped MCP server %q from %s/mcp.yaml applied project-wide; Copilot has no per-scope MCP", srv.Name, srv.ScopePath),
+			Severity: "info",
+		})
+	}
+
+	merger := func(existing []byte) (string, error) {
+		doc := map[string]any{}
+		if len(existing) > 0 {
+			if err := json.Unmarshal(existing, &doc); err != nil {
+				return "", fmt.Errorf("copilot: parsing existing %s: %w", relPath, err)
+			}
+		}
+
+		serversMap, _ := doc["mcpServers"].(map[string]any)
+		if serversMap == nil {
+			serversMap = map[string]any{}
+		}
+
+		for _, srv := range servers {
+			if srv == nil || srv.Name == "" {
+				continue
+			}
+			entry := copilotMCPServerJSON{
+				Command: srv.Command,
+				Args:    srv.Args,
+				Env:     srv.Env,
+			}
+			if srv.Command == "" && srv.URL != "" {
+				entry.URL = srv.URL
+			}
+			serversMap[srv.Name] = entry
+		}
+		doc["mcpServers"] = serversMap
+
+		out, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(out) + "\n", nil
+	}
+
+	return plugin.Operation{
+		Kind:     plugin.OpMerge,
+		Path:     relPath,
+		Mode:     plugin.ModeWrite,
+		Sources:  []string{"mcp.yaml"},
+		Plugin:   "copilot",
+		Warnings: warnings,
+		Merger:   merger,
+	}
 }
 
 // Compile-time check that CopilotPlugin satisfies plugin.Plugin.

@@ -309,8 +309,10 @@ func TestRoundTrip_Cursor(t *testing.T) {
 		t.Errorf("%s globs = %v, want to start with src/billing", billingOut, globs)
 	}
 
-	// 3. Extension-glob rule → skill → .cursor/rules/skill-pdf-skill.mdc.
-	pdfOut := ".cursor/rules/skill-pdf-skill.mdc"
+	// 3. Extension-glob rule → skill → .cursor/skills/<slug>/SKILL.md
+	//    (Cursor 2.4+ dedicated skills format; v0.8.0 emits this instead of
+	//    the legacy .cursor/rules/skill-<name>.mdc path.)
+	pdfOut := ".cursor/skills/pdf-skill/SKILL.md"
 	pdfBody := readBody(t, root, pdfOut)
 	assertBodyContains(t, pdfOut+" body", pdfBody, "Use pdftk for PDF manipulation tasks.")
 	pdfFM := readFrontmatter(t, root, pdfOut)
@@ -337,7 +339,8 @@ func TestRoundTrip_Cursor(t *testing.T) {
 
 	// Sanity: every original body line should still be findable in some
 	// output file (catches silent content drops).
-	allOutputs := concatAllRuleBodies(t, root, ".cursor/rules")
+	allOutputs := concatAllRuleBodies(t, root, ".cursor/rules") +
+		"\n" + concatAllBodiesRecursive(t, root, []string{".cursor/skills"}, []string{".md"})
 	for relPath, content := range original {
 		if !strings.HasPrefix(relPath, ".cursor/rules/") || !strings.HasSuffix(relPath, ".mdc") {
 			continue
@@ -611,22 +614,27 @@ func TestRoundTrip_Continue(t *testing.T) {
 			mcpPath, args, string(mcpData))
 	}
 
-	// 4. Command round-trip. The Continue plugin degrades commands to
-	// rules at .continue/rules/command-<name>.md (no slash-command
-	// mechanism). The description prefix becomes
-	//   "Command /deploy: Ship a release: cuts a tag, ..."
-	// — three colons, all inside the quoted JSON-encoded description.
-	cmdOut := ".continue/rules/command-deploy.md"
+	// 4. Command round-trip. In v0.8 the Continue plugin emits commands
+	// as native invokable prompt files at .continue/prompts/<name>.md
+	// (frontmatter: name, description, invokable: true). The seeded
+	// description carries a colon ("Ship a release: cuts a tag...") so
+	// the YAML frontmatter exercises the renderContinuePrompt colon-
+	// quoting fix.
+	cmdOut := ".continue/prompts/deploy.md"
 	cmdBody := readBody(t, root, cmdOut)
 	assertBodyContains(t, cmdOut, cmdBody,
 		"Run the release script with --confirm and wait for green CI.")
 	cmdFM := readFrontmatter(t, root, cmdOut)
-	cmdDesc, _ := cmdFM["description"].(string)
-	if !strings.Contains(cmdDesc, "Command /deploy") {
-		t.Errorf("%s description = %q, want to contain %q", cmdOut, cmdDesc, "Command /deploy")
+	cmdName, _ := cmdFM["name"].(string)
+	if cmdName != "deploy" {
+		t.Errorf("%s name = %q, want %q", cmdOut, cmdName, "deploy")
 	}
+	cmdDesc, _ := cmdFM["description"].(string)
 	if !strings.Contains(cmdDesc, "Ship a release: cuts a tag") {
 		t.Errorf("%s description = %q, want to preserve original colon-bearing text", cmdOut, cmdDesc)
+	}
+	if v, _ := cmdFM["invokable"].(bool); !v {
+		t.Errorf("%s invokable = %v, want true", cmdOut, cmdFM["invokable"])
 	}
 
 	// 5. Sanity: every original input body still appears somewhere in the
@@ -648,11 +656,15 @@ func TestRoundTrip_Continue(t *testing.T) {
 	}
 	// The command body was seeded after Init, not via the source-tool
 	// fixture map, so it would not appear in `original` — assert
-	// explicitly that it survived to the output tree.
+	// explicitly that it survived to the output tree. In v0.8 commands
+	// emit as prompt files under .continue/prompts/, not as degraded
+	// rules, so we search both directories for the body.
 	cmdBodyNeedle := "Run the release script with --confirm and wait for green CI."
-	if !strings.Contains(normalizeSpace(allOutputs), normalizeSpace(cmdBodyNeedle)) {
-		t.Errorf("continue round-trip: seeded command body %q not present in any output rule:\nall outputs:\n%s",
-			cmdBodyNeedle, allOutputs)
+	allPromptBodies := concatAllRuleBodies(t, root, ".continue/prompts")
+	combined := normalizeSpace(allOutputs) + " " + normalizeSpace(allPromptBodies)
+	if !strings.Contains(combined, normalizeSpace(cmdBodyNeedle)) {
+		t.Errorf("continue round-trip: seeded command body %q not present in any rule/prompt:\nrules:\n%s\nprompts:\n%s",
+			cmdBodyNeedle, allOutputs, allPromptBodies)
 	}
 }
 
@@ -906,13 +918,16 @@ func TestRoundTrip_Cline(t *testing.T) {
 		"Use pdftk for PDF manipulation tasks.",
 		"Skill: pdf")
 
-	cmdOut := ".clinerules/30-command-deploy.md"
+	// v0.8.0: commands project to .clinerules/workflows/<name>.md (native
+	// Cline slash commands) instead of the legacy 30-command-*.md rules.
+	cmdOut := ".clinerules/workflows/deploy.md"
 	cmdBody := readBody(t, root, cmdOut)
 	assertBodyContains(t, cmdOut, cmdBody,
 		"Run the release script with --confirm.",
 		"Command /deploy")
 
-	allOutputs := concatAllRuleBodies(t, root, ".clinerules")
+	allOutputs := concatAllRuleBodies(t, root, ".clinerules") +
+		"\n" + concatAllRuleBodies(t, root, ".clinerules/workflows")
 	for relPath, content := range original {
 		if !strings.HasPrefix(relPath, ".clinerules/") || !strings.HasSuffix(relPath, ".md") {
 			continue

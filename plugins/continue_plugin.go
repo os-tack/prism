@@ -6,17 +6,22 @@
 //   - `.continue/rules/<name>.md` — rule files with YAML frontmatter
 //     (`description`, `globs`, `alwaysApply`) followed by a markdown body.
 //     Continue uses the frontmatter to decide when to auto-attach a rule.
+//   - `.continue/prompts/<name>.md` — invokable prompt files with YAML
+//     frontmatter (`name`, `description`, `invokable: true`) followed by a
+//     markdown body. Continue surfaces these as `/<name>` slash commands.
+//   - `.continue/permissions.yaml` — flat allow/ask/exclude lists at the
+//     project root, overriding `~/.continue/permissions.yaml`. Entries are
+//     translated from prism's `tool:pattern` form to Continue's
+//     `Tool(pattern)` form (e.g. `bash:rm -rf *` → `Bash(rm -rf *)`).
 //   - `.continue/mcpServers/<name>.yaml` — one YAML file per MCP server
 //     (Continue's per-file mcpServers convention) containing `name`,
 //     `command`, `args`, `env`, `url` (only the non-empty fields).
 //
-// Continue has no native primitive for slash-commands, sub-agents, hooks, or
-// permissions, so those degrade to warnings. Skills are projected as scoped
-// rule files (no script execution). Scoped skills include their scope slug as
-// a filename prefix to avoid collisions when same-named skills live in two
-// scopes; their globs come from the parser (frontmatter override or the
-// scope's default). Scoped commands degrade to scoped rule files with the
-// scope's default globs plus an info warning.
+// As of v0.8, permissions enforce natively via Continue's own permissions
+// layer (replacing the prism perms-guard wrapper), and slash commands emit
+// natively as prompt files. Skills still degrade to scoped rule files (no
+// dedicated skill primitive in Continue). Sub-agents and hooks are
+// unsupported and emit info warnings.
 package plugins
 
 import (
@@ -24,23 +29,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
-	"agents.dev/agents/internal/scope"
 )
 
-// ContinuePlugin projects Project state into `.continue/rules/*.md` and
+// ContinuePlugin projects Project state into `.continue/rules/*.md`,
+// `.continue/prompts/*.md`, `.continue/permissions.yaml`, and
 // `.continue/mcpServers/*.yaml` files.
-type ContinuePlugin struct {
-	// DisableHookWrappers, when true, suppresses the perms-guard wrapper
-	// script + sidecar policy emission used to enforce prism permissions.
-	// Default false (wrappers ON). Mirrors ClaudePlugin.DisableHookWrappers.
-	DisableHookWrappers bool
-}
+type ContinuePlugin struct{}
 
 // NewContinue constructs a ContinuePlugin.
 //
@@ -64,20 +65,20 @@ func (p *ContinuePlugin) Detect(root string) bool {
 // Capabilities returns Continue's capability matrix.
 //
 // Continue natively supports per-glob rule attachment (ScopePaths),
-// description-triggered attachment (ScopeSemantic), and per-file MCP server
-// configuration. Skills and Commands degrade to scoped rule files (no script
-// execution and no slash-command mechanism). Agents, Hooks, and Permissions
-// are unsupported.
+// description-triggered attachment (ScopeSemantic), invokable prompt files
+// (Commands), permissions.yaml (Permissions), and per-file MCP server
+// configuration. Skills degrade to scoped rule files (no dedicated skill
+// primitive). Agents and Hooks are unsupported.
 func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
 		ScopeSemantic: plugin.SupportNative,
 		Skills:        plugin.SupportDegraded,
-		Commands:      plugin.SupportDegraded,
+		Commands:      plugin.SupportNative, // .continue/prompts/<name>.md with invokable: true
 		Agents:        plugin.SupportUnsupported,
 		Hooks:         plugin.SupportUnsupported,
-		Permissions:   plugin.SupportNative, // via prism perms-guard wrapper + sidecar policy
+		Permissions:   plugin.SupportNative, // .continue/permissions.yaml (project-local override)
 		MCP:           plugin.SupportNative,
 	}
 }
@@ -183,13 +184,13 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		ops = append(ops, op)
 	}
 
-	// Commands → degraded rule files at .continue/rules/command-<slug>.md.
-	// The body documents the command; Continue has no slash-command mechanism
-	// so each command also gets an info warning attached to its own op.
+	// Commands → .continue/prompts/<slug>.md (invokable prompt files).
 	//
-	// Scoped commands (ScopePath != "") get the scope slug prefixed and use
-	// the scope's default globs in the rule frontmatter; the warning notes
-	// the scope and explains the degradation.
+	// Each command becomes a prompt file with YAML frontmatter (`name`,
+	// `description`, `invokable: true`) and the command body as the prompt
+	// body. Scoped commands get the scope slug prefixed in the filename and
+	// a `(scope: ...)` note in the description (Continue's prompt files have
+	// no per-scope attachment mechanism).
 	for _, cmd := range proj.Commands {
 		if cmd == nil {
 			continue
@@ -200,32 +201,38 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = cmd.Document.Body
 			sources = []string{proj.SourceTag(cmd.Document.SourcePath)}
 		}
-		var globs []string
-		desc := fmt.Sprintf("Command /%s: %s", cmd.Name, cmd.Description)
-		warningMsg := "Continue has no slash-command mechanism; documented as a rule"
+		desc := cmd.Description
 		if cmd.ScopePath != "" {
-			globs = scope.DefaultGlobs(cmd.ScopePath)
-			desc = fmt.Sprintf("Command /%s (scoped to %s): %s", cmd.Name, cmd.ScopePath, cmd.Description)
-			warningMsg = fmt.Sprintf("Continue has no slash-command mechanism; scoped command %q projected as a rule (scope: %s)", cmd.Name, cmd.ScopePath)
+			if desc == "" {
+				desc = fmt.Sprintf("(scope: %s)", cmd.ScopePath)
+			} else {
+				desc = fmt.Sprintf("%s (scope: %s)", desc, cmd.ScopePath)
+			}
 		}
-		content := renderContinueRule(desc, globs, false, body)
-		fname := "command-" + scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".md"
+		var fname string
+		if cmd.ScopePath != "" {
+			fname = scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".md"
+		} else {
+			fname = skillSlug(cmd.Name) + ".md"
+		}
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", fname)),
-			Content: content,
+			Path:    filepath.ToSlash(filepath.Join(".continue", "prompts", fname)),
+			Content: renderContinuePrompt(cmd.Name, desc, body),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
 		}
-		op.Warnings = append(op.Warnings, plugin.Warning{
-			Source:   "",
-			Message:  warningMsg,
-			Severity: "info",
-		})
-		// Attach the source path to the warning if available.
-		if len(sources) > 0 {
-			op.Warnings[len(op.Warnings)-1].Source = sources[0]
+		if cmd.ScopePath != "" {
+			src := ""
+			if len(sources) > 0 {
+				src = sources[0]
+			}
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Continue prompt files have no per-scope attachment; scoped command %q (scope: %s) projected as a global slash command", cmd.Name, cmd.ScopePath),
+				Severity: "info",
+			})
 		}
 		ops = append(ops, op)
 	}
@@ -265,16 +272,23 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Severity: "info",
 		})
 	}
-	// Permissions (global + scoped) project via prism perms-guard wrappers.
-	// Each non-empty Permissions block becomes a sidecar JSON policy plus
-	// either per-hook wrappers (when hooks exist) or a bare gate wrapper.
-	// The CHANGELOG documents the on-disk layout and JSON policy schema.
-	wrapperOps, wrapperWarnings, err := emitPermsGuardWrappers(p.Name(), proj, p.DisableHookWrappers)
+
+	// Native permissions → .continue/permissions.yaml.
+	//
+	// Continue's permissions schema is a flat three-key map (allow / ask /
+	// exclude) with `Tool(pattern)` entries. Prism's global block and any
+	// ScopedPermissions are merged into the same file: Continue has no
+	// per-scope permission attachment, so each scoped block gets an info
+	// warning when it's folded in. Patterns that don't translate cleanly
+	// (mid-string `*`, `?`, character classes) get a deprecation warning.
+	permsOp, permsWarnings, err := buildContinuePermissionsOp(p, proj)
 	if err != nil {
 		return nil, err
 	}
-	ops = append(ops, wrapperOps...)
-	warnings = append(warnings, wrapperWarnings...)
+	if permsOp != nil {
+		ops = append(ops, *permsOp)
+	}
+	warnings = append(warnings, permsWarnings...)
 
 	// MCP servers → one .continue/mcpServers/<slug>.yaml per server.
 	// Scoped MCP servers project to the same global file set with an info
@@ -306,6 +320,250 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	return ops, nil
+}
+
+// buildContinuePermissionsOp builds the .continue/permissions.yaml op (or
+// returns nil if no permissions are set). It also returns any deprecation
+// warnings for rules that don't translate cleanly into Continue's format,
+// plus info warnings for scoped blocks that get merged into the flat file.
+func buildContinuePermissionsOp(p *ContinuePlugin, proj *model.Project) (*plugin.Operation, []plugin.Warning, error) {
+	hasGlobal := proj.Permissions != nil && (len(proj.Permissions.Allow)+len(proj.Permissions.Deny)+len(proj.Permissions.Ask) > 0)
+	var scopedNonEmpty []*model.Permissions
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		if len(sp.Allow)+len(sp.Deny)+len(sp.Ask) == 0 {
+			continue
+		}
+		scopedNonEmpty = append(scopedNonEmpty, sp)
+	}
+	if !hasGlobal && len(scopedNonEmpty) == 0 {
+		return nil, nil, nil
+	}
+
+	var warnings []plugin.Warning
+	var allow, ask, exclude []string
+	sources := []string{}
+
+	// translateRule converts a prism `tool:pattern` rule into a Continue
+	// `Tool(pattern)` rule. Tool names are PascalCased (bash → Bash,
+	// edit → Edit, etc.). Rules with mid-string wildcards beyond a single
+	// trailing `*` produce a deprecation warning since Continue's pattern
+	// matcher uses its own glob dialect.
+	translate := func(rule, sourceTag string) (string, []plugin.Warning) {
+		var local []plugin.Warning
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			return "", nil
+		}
+		idx := strings.Index(rule, ":")
+		var tool, pattern string
+		if idx < 0 {
+			tool = rule
+			pattern = ""
+		} else {
+			tool = rule[:idx]
+			pattern = rule[idx+1:]
+		}
+		tool = pascalToolName(tool)
+		// Detect potentially-lossy patterns: anything with a `?`,
+		// character class, or interior `*` that isn't a clean trailing
+		// wildcard. Continue accepts globbing but its dialect differs
+		// from prism's prefix-only matching; warn so users review.
+		if pattern != "" && hasUntranslatableGlob(pattern) {
+			local = append(local, plugin.Warning{
+				Source:   sourceTag,
+				Message:  fmt.Sprintf("permission rule %q uses a glob pattern that may not translate cleanly to Continue's permissions.yaml format", rule),
+				Severity: "info",
+			})
+		}
+		if pattern == "" {
+			return tool, local
+		}
+		return tool + "(" + pattern + ")", local
+	}
+
+	addBlock := func(perms *model.Permissions, sourceTag string) {
+		for _, r := range perms.Allow {
+			t, ws := translate(r, sourceTag)
+			warnings = append(warnings, ws...)
+			if t != "" {
+				allow = append(allow, t)
+			}
+		}
+		for _, r := range perms.Ask {
+			t, ws := translate(r, sourceTag)
+			warnings = append(warnings, ws...)
+			if t != "" {
+				ask = append(ask, t)
+			}
+		}
+		for _, r := range perms.Deny {
+			t, ws := translate(r, sourceTag)
+			warnings = append(warnings, ws...)
+			if t != "" {
+				exclude = append(exclude, t)
+			}
+		}
+	}
+
+	if hasGlobal {
+		addBlock(proj.Permissions, "permissions.yaml")
+		sources = append(sources, "permissions.yaml")
+	}
+	for _, sp := range scopedNonEmpty {
+		tag := filepath.ToSlash(filepath.Join(sp.ScopePath, "permissions.yaml"))
+		addBlock(sp, tag)
+		sources = append(sources, tag)
+		warnings = append(warnings, plugin.Warning{
+			Source:   tag,
+			Message:  fmt.Sprintf("Continue has no per-scope permissions; scoped permissions for %q merged into .continue/permissions.yaml", sp.ScopePath),
+			Severity: "info",
+		})
+	}
+
+	// Render YAML with stable key order: allow, ask, exclude. Each list is
+	// emitted even when empty so consumers see the canonical shape (Continue
+	// itself accepts `exclude: []`).
+	root := &yaml.Node{Kind: yaml.MappingNode}
+	appendSeq := func(key string, items []string) {
+		seq := &yaml.Node{Kind: yaml.SequenceNode}
+		seq.Style = yaml.FlowStyle
+		if len(items) > 0 {
+			seq.Style = 0 // block style when populated, flow when empty
+		}
+		for _, it := range items {
+			seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: it})
+		}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+			seq,
+		)
+	}
+	appendSeq("allow", allow)
+	appendSeq("ask", ask)
+	appendSeq("exclude", exclude)
+
+	raw, err := yaml.Marshal(root)
+	if err != nil {
+		return nil, nil, fmt.Errorf("continue: marshal permissions: %w", err)
+	}
+
+	op := &plugin.Operation{
+		Kind:    plugin.OpWrite,
+		Path:    ".continue/permissions.yaml",
+		Content: string(raw),
+		Mode:    plugin.ModeWrite,
+		Plugin:  p.Name(),
+		Sources: sources,
+	}
+	return op, warnings, nil
+}
+
+// pascalToolName converts a prism tool token (`bash`, `edit`, `multiEdit`)
+// into Continue's PascalCase convention (`Bash`, `Edit`, `MultiEdit`). The
+// rules engine in prism is case-insensitive so the canonical form on disk
+// can differ; Continue's matcher is also tolerant but the docs use
+// PascalCase exclusively.
+func pascalToolName(tool string) string {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		return ""
+	}
+	// Known short forms map directly. Anything else gets a simple
+	// uppercase-first-letter rewrite.
+	switch strings.ToLower(tool) {
+	case "bash":
+		return "Bash"
+	case "read":
+		return "Read"
+	case "write":
+		return "Write"
+	case "edit":
+		return "Edit"
+	case "multiedit":
+		return "MultiEdit"
+	case "list":
+		return "List"
+	case "search":
+		return "Search"
+	case "fetch":
+		return "Fetch"
+	case "diff":
+		return "Diff"
+	case "askquestion":
+		return "AskQuestion"
+	case "checklist":
+		return "Checklist"
+	case "status":
+		return "Status"
+	}
+	// Fallback: uppercase the first ASCII letter, keep the rest.
+	r := []rune(tool)
+	if r[0] >= 'a' && r[0] <= 'z' {
+		r[0] -= 'a' - 'A'
+	}
+	return string(r)
+}
+
+// hasUntranslatableGlob reports whether a prism permission pattern uses
+// glob features that don't map 1:1 onto Continue's pattern matcher. Prism's
+// matcher only supports a single trailing `*`; anything richer needs a
+// deprecation warning so users review.
+func hasUntranslatableGlob(pattern string) bool {
+	if strings.ContainsAny(pattern, "?[]") {
+		return true
+	}
+	// More than one `*`, or `*` not at the end.
+	if idx := strings.Index(pattern, "*"); idx >= 0 {
+		if idx != len(pattern)-1 {
+			return true
+		}
+		// Trailing-only `*` is fine. Check there's no other `*` (cheap
+		// double-check on the byte slice).
+		if strings.Count(pattern, "*") > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// renderContinuePrompt formats a `.continue/prompts/<name>.md` file with
+// YAML frontmatter (`name`, `description`, `invokable: true`) followed by
+// the prompt body. The encoding/json shim is used to escape the
+// description and name strings safely (JSON strings are valid YAML
+// scalars, including the colon-in-description case).
+func renderContinuePrompt(name, description, body string) string {
+	var b strings.Builder
+	b.WriteString("---\n")
+	if name != "" {
+		raw, err := json.Marshal(name)
+		if err != nil {
+			raw = []byte("\"\"")
+		}
+		b.WriteString("name: ")
+		b.Write(raw)
+		b.WriteString("\n")
+	}
+	if description != "" {
+		raw, err := json.Marshal(description)
+		if err != nil {
+			raw = []byte("\"\"")
+		}
+		b.WriteString("description: ")
+		b.Write(raw)
+		b.WriteString("\n")
+	}
+	b.WriteString("invokable: true\n")
+	b.WriteString("---\n")
+	if body != "" {
+		b.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }
 
 // buildContinueMCPOp constructs the OpWrite for a single MCP server file at
@@ -345,7 +603,7 @@ func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operati
 		for k := range srv.Env {
 			keys = append(keys, k)
 		}
-		sortStrings(keys)
+		sort.Strings(keys)
 		for _, k := range keys {
 			envNode.Content = append(envNode.Content,
 				&yaml.Node{Kind: yaml.ScalarNode, Value: k},
@@ -411,17 +669,6 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 		}
 	}
 	return b.String()
-}
-
-// sortStrings is a tiny shim to avoid importing "sort" twice in the package
-// (cursor.go and claude.go already import their own). Inlines insertion sort
-// — env maps are always small.
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 // Compile-time check that ContinuePlugin satisfies plugin.Plugin.

@@ -75,11 +75,11 @@ func TestPermsGuardWrapper_ScopedHookNoAbsolutePath(t *testing.T) {
 			{ScopePath: "src/billing", Deny: []string{"bash:rm *"}},
 		},
 	}
-	ops, _, err := emitPermsGuardWrappers("continue", proj, false)
+	ops, _, err := emitPermsGuardWrappers("gemini", proj, false)
 	if err != nil {
 		t.Fatalf("emitPermsGuardWrappers: %v", err)
 	}
-	wrapperPath := filepath.Join(".continue", "hooks", "__perms-guard__", "src-billing-PreToolUse-audit.sh")
+	wrapperPath := filepath.Join(".gemini", "hooks", "__perms-guard__", "src-billing-PreToolUse-audit.sh")
 	var wrapper *plugin.Operation
 	for i := range ops {
 		if ops[i].Path == wrapperPath {
@@ -166,7 +166,7 @@ func TestPermsGuardWrapper_HookWrapperOrderDeterministic(t *testing.T) {
 	}
 	var first []string
 	for i := 0; i < 20; i++ {
-		ops, _, err := emitPermsGuardWrappers("continue", proj, false)
+		ops, _, err := emitPermsGuardWrappers("gemini", proj, false)
 		if err != nil {
 			t.Fatalf("iter %d: %v", i, err)
 		}

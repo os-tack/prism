@@ -40,6 +40,24 @@ func TestExtractToolFilePath(t *testing.T) {
 			payload: `{"tool_input":{"notebook_path":"/abs/nb.ipynb"}}`,
 			want:    "/abs/nb.ipynb",
 		},
+		{
+			// Windsurf Cascade envelope: file_path at root, no tool_input wrapper.
+			// v0.8.1 (review item 2) widened the extractor to handle this.
+			name:    "windsurf root-level file_path",
+			payload: `{"event":"pre_write_code","file_path":"/abs/src/api/handler.go"}`,
+			want:    "/abs/src/api/handler.go",
+		},
+		{
+			// tool_input takes precedence over root-level when both present.
+			name:    "tool_input wins over root-level",
+			payload: `{"tool_input":{"file_path":"/from/tool_input"},"file_path":"/from/root"}`,
+			want:    "/from/tool_input",
+		},
+		{
+			name:    "windsurf root-level path key",
+			payload: `{"event":"pre_read_code","path":"/abs/foo"}`,
+			want:    "/abs/foo",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,12 +1,14 @@
 package plugins
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"agents.dev/agents/internal/model"
+	"agents.dev/agents/internal/plugin"
 
 	"gopkg.in/yaml.v3"
 )
@@ -409,47 +411,6 @@ func TestWindsurf_ScopedCommand_Warning(t *testing.T) {
 	}
 }
 
-// TestWindsurf_ScopedHook_Warning verifies that a scoped hook produces no
-// file but emits an info warning naming the scope.
-func TestWindsurf_ScopedHook_Warning(t *testing.T) {
-	proj := &model.Project{
-		AgentsDir: "/tmp/proj/.agents",
-		Context: &model.Document{
-			SourcePath: "/tmp/proj/.agents/context.md",
-			Body:       "ctx",
-		},
-		Hooks: []*model.Hook{
-			{
-				Event:      "PreToolUse",
-				Matcher:    "Bash",
-				ScriptPath: "/tmp/proj/.agents/src/billing/hooks/audit.sh",
-				ScopePath:  "src/billing",
-			},
-		},
-	}
-	p := NewWindsurf()
-	ops, err := p.Plan(proj, model.TargetOption{})
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-	for _, op := range ops {
-		if strings.Contains(op.Path, "hooks") {
-			t.Errorf("unexpected hook file: %s", op.Path)
-		}
-	}
-	found := false
-	for _, op := range ops {
-		for _, w := range op.Warnings {
-			if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
-	}
-}
-
 func TestWindsurf_Skill_DescriptionWithColon_YAMLValid(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -488,4 +449,479 @@ func TestWindsurf_Skill_DescriptionWithColon_YAMLValid(t *testing.T) {
 	if fm.Description != "Ship a release: cuts a tag, builds artifacts, publishes" {
 		t.Errorf("description = %q after YAML round-trip, want full string", fm.Description)
 	}
+}
+
+// TestWindsurf_Hooks_Emit verifies that proj.Hooks → .windsurf/hooks.json
+// with the expected event mapping, JSON schema, and that the Merger
+// preserves user-authored top-level keys on re-projection.
+func TestWindsurf_Hooks_Emit(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/proj/.agents/hooks/lint.sh",
+			},
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Read",
+				ScriptPath: "/tmp/proj/.agents/hooks/audit-read.sh",
+			},
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Write",
+				ScriptPath: "/tmp/proj/.agents/hooks/audit-write.sh",
+			},
+			{
+				Event:      "PostToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/proj/.agents/hooks/post-run.sh",
+			},
+			{
+				// Canonical Windsurf event name → pass-through.
+				Event:      "post_cascade_response",
+				ScriptPath: "/tmp/proj/.agents/hooks/transcript.sh",
+			},
+			{
+				// Claude UserPromptSubmit → pre_user_prompt.
+				Event:      "UserPromptSubmit",
+				ScriptPath: "/tmp/proj/.agents/hooks/prompt-cap.sh",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".windsurf/hooks.json" {
+			hooksOp = &ops[i]
+			break
+		}
+	}
+	if hooksOp == nil {
+		t.Fatalf(".windsurf/hooks.json op missing; got paths: %s", opsPaths(ops))
+	}
+	if hooksOp.Kind != plugin.OpMerge {
+		t.Errorf("hooks op Kind = %q, want %q", hooksOp.Kind, plugin.OpMerge)
+	}
+	if hooksOp.Merger == nil {
+		t.Fatalf("hooks op missing Merger closure")
+	}
+	if hooksOp.Plugin != "windsurf" {
+		t.Errorf("hooks op Plugin = %q, want windsurf", hooksOp.Plugin)
+	}
+
+	// Render the merge against nil to inspect the emitted JSON.
+	rendered, err := hooksOp.Merger(nil)
+	if err != nil {
+		t.Fatalf("Merger error: %v", err)
+	}
+	var doc struct {
+		Hooks map[string][]struct {
+			Command    string `json:"command"`
+			ShowOutput bool   `json:"show_output"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered hooks.json is not valid JSON: %v\n---\n%s", err, rendered)
+	}
+
+	want := map[string]string{
+		"pre_run_command":       "lint.sh",
+		"pre_read_code":         "audit-read.sh",
+		"pre_write_code":        "audit-write.sh",
+		"post_run_command":      "post-run.sh",
+		"post_cascade_response": "transcript.sh",
+		"pre_user_prompt":       "prompt-cap.sh",
+	}
+	for event, wantBasename := range want {
+		entries, ok := doc.Hooks[event]
+		if !ok {
+			t.Errorf("expected event %q in hooks.json, present: %v", event, mapKeys(doc.Hooks))
+			continue
+		}
+		if len(entries) == 0 {
+			t.Errorf("event %q has no entries", event)
+			continue
+		}
+		if !strings.Contains(entries[0].Command, wantBasename) {
+			t.Errorf("event %q command = %q, want to contain %q", event, entries[0].Command, wantBasename)
+		}
+		// Hooks should be invoked via `bash <path>` for cross-platform safety.
+		if !strings.HasPrefix(entries[0].Command, "bash ") {
+			t.Errorf("event %q command should start with 'bash ', got %q", event, entries[0].Command)
+		}
+	}
+
+	// Re-merge: feed back the rendered output as "existing" and add a
+	// user-authored top-level key. The Merger MUST preserve it.
+	withUser := strings.Replace(rendered, "{\n", "{\n  \"custom_user_key\": \"keep-me\",\n", 1)
+	merged, err := hooksOp.Merger([]byte(withUser))
+	if err != nil {
+		t.Fatalf("re-merge error: %v", err)
+	}
+	if !strings.Contains(merged, "custom_user_key") || !strings.Contains(merged, "keep-me") {
+		t.Errorf("Merger dropped user-authored top-level key:\n%s", merged)
+	}
+}
+
+// TestWindsurf_Hooks_UnmappableEventWarns verifies that a prism Hook with
+// an event Windsurf cannot express (e.g. SessionStart) is dropped with an
+// info-severity warning rather than crashing or silently disappearing.
+func TestWindsurf_Hooks_UnmappableEventWarns(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "SessionStart",
+				ScriptPath: "/tmp/proj/.agents/hooks/session-start.sh",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if op.Path == ".windsurf/hooks.json" {
+			t.Errorf("expected no hooks.json op when every hook is unmappable, got one")
+		}
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "SessionStart") && w.Severity == "info" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected info warning for unmappable SessionStart hook, got ops=%s", opsPaths(ops))
+	}
+}
+
+// TestWindsurf_MCP_Projects verifies that proj.MCP → .windsurf/mcp_config.json
+// using the standard {mcpServers: {...}} schema, that the canonical-path
+// warning is attached, and that the Merger preserves user-authored entries
+// (both top-level keys and unrelated entries under mcpServers).
+func TestWindsurf_MCP_Projects(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		MCP: []*model.MCPServer{
+			{
+				Name:    "stripe",
+				Command: "node",
+				Args:    []string{"--", "stripe-mcp.js"},
+				Env:     map[string]string{"STRIPE_KEY": "sk_test"},
+			},
+			{
+				Name: "remote-sse",
+				URL:  "https://example.com/mcp",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	var mcpOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".windsurf/mcp_config.json" {
+			mcpOp = &ops[i]
+			break
+		}
+	}
+	if mcpOp == nil {
+		t.Fatalf(".windsurf/mcp_config.json op missing; got paths: %s", opsPaths(ops))
+	}
+	if mcpOp.Kind != plugin.OpMerge {
+		t.Errorf("mcp op Kind = %q, want %q", mcpOp.Kind, plugin.OpMerge)
+	}
+	if mcpOp.Merger == nil {
+		t.Fatalf("mcp op missing Merger closure")
+	}
+
+	// Canonical-path warning must be present.
+	hasCanonical := false
+	for _, w := range mcpOp.Warnings {
+		if strings.Contains(w.Message, "~/.codeium/windsurf/mcp_config.json") {
+			hasCanonical = true
+			if w.Severity != "info" {
+				t.Errorf("canonical-path warning severity = %q, want info", w.Severity)
+			}
+		}
+	}
+	if !hasCanonical {
+		t.Errorf("expected canonical-path warning on MCP op, got %#v", mcpOp.Warnings)
+	}
+
+	// Render the merge against nil and verify the schema.
+	rendered, err := mcpOp.Merger(nil)
+	if err != nil {
+		t.Fatalf("Merger error: %v", err)
+	}
+	var doc struct {
+		MCPServers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+			URL     string            `json:"url"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered mcp_config.json is not valid JSON: %v\n---\n%s", err, rendered)
+	}
+	stripe, ok := doc.MCPServers["stripe"]
+	if !ok {
+		t.Fatalf("stripe server missing from mcp_config.json:\n%s", rendered)
+	}
+	if stripe.Command != "node" {
+		t.Errorf("stripe command = %q, want node", stripe.Command)
+	}
+	if len(stripe.Args) != 2 || stripe.Args[1] != "stripe-mcp.js" {
+		t.Errorf("stripe args = %v, want [-- stripe-mcp.js]", stripe.Args)
+	}
+	if stripe.Env["STRIPE_KEY"] != "sk_test" {
+		t.Errorf("stripe env missing STRIPE_KEY: %v", stripe.Env)
+	}
+	sse, ok := doc.MCPServers["remote-sse"]
+	if !ok {
+		t.Fatalf("remote-sse server missing from mcp_config.json:\n%s", rendered)
+	}
+	if sse.URL != "https://example.com/mcp" {
+		t.Errorf("remote-sse url = %q, want https://example.com/mcp", sse.URL)
+	}
+
+	// Re-merge: simulate a user-authored mcp_config.json that has its own
+	// server plus an unrelated top-level key. Both must survive.
+	existing := `{
+  "user_custom": "preserve-me",
+  "mcpServers": {
+    "user-authored": {"command": "/usr/local/bin/my-mcp"}
+  }
+}`
+	merged, err := mcpOp.Merger([]byte(existing))
+	if err != nil {
+		t.Fatalf("re-merge error: %v", err)
+	}
+	if !strings.Contains(merged, "user_custom") || !strings.Contains(merged, "preserve-me") {
+		t.Errorf("Merger dropped user-authored top-level key:\n%s", merged)
+	}
+	if !strings.Contains(merged, "user-authored") || !strings.Contains(merged, "/usr/local/bin/my-mcp") {
+		t.Errorf("Merger dropped user-authored mcpServers entry:\n%s", merged)
+	}
+	// And the new entries must be present.
+	if !strings.Contains(merged, "stripe") || !strings.Contains(merged, "remote-sse") {
+		t.Errorf("Merger dropped projected entries:\n%s", merged)
+	}
+}
+
+// TestWindsurf_MCP_ScopedWarning verifies that a scoped MCP server triggers
+// the per-scope info warning (Windsurf has no per-scope MCP) in addition
+// to the canonical-path warning.
+func TestWindsurf_MCP_ScopedWarning(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		MCP: []*model.MCPServer{
+			{
+				Name:      "billing-db",
+				Command:   "psql",
+				ScopePath: "src/billing",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	var mcpOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".windsurf/mcp_config.json" {
+			mcpOp = &ops[i]
+		}
+	}
+	if mcpOp == nil {
+		t.Fatalf(".windsurf/mcp_config.json op missing")
+	}
+	found := false
+	for _, w := range mcpOp.Warnings {
+		if strings.Contains(w.Message, "no per-scope MCP") && strings.Contains(w.Message, "src/billing") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected per-scope MCP warning, got %#v", mcpOp.Warnings)
+	}
+}
+
+// TestWindsurf_ScopedHook_WrapperEmitted verifies that a scoped hook
+// produces (1) a wrapper script under .windsurf/hooks/__scope-guard__/,
+// (2) a hooks.json entry whose command points at the wrapper's absolute
+// path (not the source script), and (3) NO "no hook primitive" warning
+// (since Windsurf hooks are now Native).
+func TestWindsurf_ScopedHook_WrapperEmitted(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/proj/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := NewWindsurf()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	// (1) Wrapper script under .windsurf/hooks/__scope-guard__/.
+	var wrapperOp *plugin.Operation
+	for i := range ops {
+		if strings.HasPrefix(ops[i].Path, ".windsurf/hooks/__scope-guard__/") {
+			wrapperOp = &ops[i]
+		}
+	}
+	if wrapperOp == nil {
+		t.Fatalf("scope-guard wrapper op missing; got paths: %s", opsPaths(ops))
+	}
+	if wrapperOp.FileMode == 0 {
+		t.Errorf("wrapper op FileMode = 0, want 0755 (executable)")
+	}
+	if !strings.Contains(wrapperOp.Content, "prism scope-guard") {
+		t.Errorf("wrapper script missing prism scope-guard exec line:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "src/billing") {
+		t.Errorf("wrapper script missing scope path:\n%s", wrapperOp.Content)
+	}
+	if !strings.Contains(wrapperOp.Content, "audit.sh") {
+		t.Errorf("wrapper script missing source script reference:\n%s", wrapperOp.Content)
+	}
+
+	// (2) hooks.json entry points at the wrapper's absolute path (not the
+	// source script path).
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".windsurf/hooks.json" {
+			hooksOp = &ops[i]
+		}
+	}
+	if hooksOp == nil {
+		t.Fatalf(".windsurf/hooks.json op missing; got paths: %s", opsPaths(ops))
+	}
+	rendered, err := hooksOp.Merger(nil)
+	if err != nil {
+		t.Fatalf("Merger error: %v", err)
+	}
+	wantWrapperAbs := "/tmp/proj/.windsurf/hooks/__scope-guard__/src-billing-audit.sh"
+	if !strings.Contains(rendered, wantWrapperAbs) {
+		t.Errorf("hooks.json should reference wrapper at %s, got:\n%s", wantWrapperAbs, rendered)
+	}
+	if strings.Contains(rendered, "/tmp/proj/.agents/src/billing/hooks/audit.sh") {
+		t.Errorf("hooks.json should NOT reference the source script directly (must go through wrapper):\n%s", rendered)
+	}
+
+	// (3) No "no hook primitive" warning (legacy behavior, now Native).
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "no hook primitive") {
+				t.Errorf("unexpected legacy 'no hook primitive' warning: %s", w.Message)
+			}
+		}
+	}
+}
+
+// TestWindsurf_ScopedHook_DisableWrappers verifies the DisableHookWrappers
+// knob: when true, no wrapper script is emitted and hooks.json points
+// directly at the source script (matching the Claude behavior).
+func TestWindsurf_ScopedHook_DisableWrappers(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Bash",
+				ScriptPath: "/tmp/proj/.agents/src/billing/hooks/audit.sh",
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := &WindsurfPlugin{DisableHookWrappers: true}
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.HasPrefix(op.Path, ".windsurf/hooks/__scope-guard__/") {
+			t.Errorf("wrapper emitted despite DisableHookWrappers=true: %s", op.Path)
+		}
+	}
+	var hooksOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".windsurf/hooks.json" {
+			hooksOp = &ops[i]
+		}
+	}
+	if hooksOp == nil {
+		t.Fatalf(".windsurf/hooks.json op missing")
+	}
+	rendered, err := hooksOp.Merger(nil)
+	if err != nil {
+		t.Fatalf("Merger error: %v", err)
+	}
+	if !strings.Contains(rendered, "/tmp/proj/.agents/src/billing/hooks/audit.sh") {
+		t.Errorf("hooks.json should reference source script directly when wrappers disabled:\n%s", rendered)
+	}
+}
+
+// TestWindsurf_Capabilities_HooksAndMCPNative verifies the capability
+// matrix flip from Unsupported to Native for both Hooks and MCP. Guards
+// against accidental regressions.
+func TestWindsurf_Capabilities_HooksAndMCPNative(t *testing.T) {
+	caps := NewWindsurf().Capabilities()
+	if caps.Hooks != plugin.SupportNative {
+		t.Errorf("Hooks = %q, want native", caps.Hooks)
+	}
+	if caps.MCP != plugin.SupportNative {
+		t.Errorf("MCP = %q, want native", caps.MCP)
+	}
+	// Unchanged neighbors — guard against accidental flips of the other
+	// capability cells.
+	if caps.Agents != plugin.SupportUnsupported {
+		t.Errorf("Agents = %q, want unsupported", caps.Agents)
+	}
+	if caps.Permissions != plugin.SupportUnsupported {
+		t.Errorf("Permissions = %q, want unsupported", caps.Permissions)
+	}
+}
+
+// mapKeys returns the keys of a string-keyed map in sorted order (test
+// helper for diagnostic output only).
+func mapKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
