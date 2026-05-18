@@ -43,6 +43,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // CopilotPlugin projects Project state into `.github/` files Copilot reads.
@@ -113,6 +114,110 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 		hooks = plugin.SupportNative
 		perms = plugin.SupportNative
 	}
+
+	// v2 per-field capabilities (SPEC §12 Copilot column). Absent
+	// fields default to FieldNative; we only enumerate the non-native
+	// cells. The Extensions slot declares that this plugin reads
+	// extensions.copilot.* pass-through (including the
+	// `extensions.copilot.preview_hooks: true` opt-in marker some
+	// projects carry to keep the flag out of CLI flags).
+	agentFields := plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"DisallowedTools": plugin.FieldDegraded,
+			"ReadOnly":        plugin.FieldDegraded,
+			"Background":      plugin.FieldSilent,
+			"MaxTurns":        plugin.FieldSilent,
+			"Temperature":     plugin.FieldSilent,
+			"InitialPrompt":   plugin.FieldUnsupported,
+			"ScopePath":       plugin.FieldDegraded,
+		},
+		Extensions: []string{"copilot"},
+	}
+
+	skillFields := plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"WhenToUse":                 plugin.FieldDegraded,
+			"Activation.Modes={Always}": plugin.FieldDegraded,
+			"Activation.ContentRegex":   plugin.FieldUnsupported,
+			"Activation.UserInvocable":  plugin.FieldSilent,
+			"Activation.ModelInvocable": plugin.FieldSilent,
+			"ScopePath":                 plugin.FieldDegraded,
+		},
+		Extensions: []string{"copilot"},
+	}
+
+	commandFields := plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"AutoInvoke": plugin.FieldSilent,
+			"ScopePath":  plugin.FieldDegraded,
+		},
+		Extensions: []string{"copilot"},
+	}
+
+	// Hook — entire primitive only flips Supported=true on the
+	// preview-hooks opt-in. The field overrides describe what the
+	// preview surface CAN'T express even when on.
+	hookFields := plugin.FieldCapabilities{
+		Supported: p.EnablePreviewHooks,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":                plugin.FieldSilent,
+			"Description":         plugin.FieldSilent,
+			"Event (Claude-only)": plugin.FieldUnsupported,
+			"Handlers (mcp_tool)": plugin.FieldUnsupported,
+			"Handlers (prompt)":   plugin.FieldDegraded,
+			"Handlers (agent)":    plugin.FieldUnsupported,
+			"Sequential":          plugin.FieldSilent,
+			"StatusMessage":       plugin.FieldSilent,
+			"Async":               plugin.FieldUnsupported,
+			"FailClosed":          plugin.FieldUnsupported,
+			"Once":                plugin.FieldUnsupported,
+			"If":                  plugin.FieldUnsupported,
+			"ScopePath":           plugin.FieldNative, // scope-guard wrapper
+		},
+		Extensions: []string{"copilot"},
+	}
+
+	mcpServerFields := plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Cwd":               plugin.FieldSilent,
+			"Auth.Scheme=oauth": plugin.FieldDegraded,
+			"TimeoutMs":         plugin.FieldUnsupported,
+			"AutoApprove":       plugin.FieldUnsupported,
+			"Trust":             plugin.FieldUnsupported,
+			"IncludeTools":      plugin.FieldUnsupported,
+			"ExcludeTools":      plugin.FieldUnsupported,
+			"ScopePath":         plugin.FieldDegraded,
+		},
+		Extensions: []string{"copilot"},
+	}
+
+	// Permissions — native via the preview perms-guard sidecar when
+	// EnablePreviewHooks is on; unsupported otherwise. Every
+	// sub-cell in SPEC §12 collapses to FieldNative on the wrapper
+	// so we leave the Fields map empty (defaults to FieldNative).
+	permsFields := plugin.FieldCapabilities{
+		Supported:  p.EnablePreviewHooks,
+		Extensions: []string{"copilot"},
+	}
+
+	scopeFields := plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Path (cascade)":       plugin.FieldDegraded,
+			"Activation=Cascade":   plugin.FieldDegraded,
+			"Activation=Manual":    plugin.FieldUnsupported,
+			"Activation=ModelDec.": plugin.FieldUnsupported,
+			"Priority":             plugin.FieldSilent,
+			"Tags":                 plugin.FieldSilent,
+			"IsOverride":           plugin.FieldUnsupported,
+		},
+		Extensions: []string{"copilot"},
+	}
+
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
@@ -123,6 +228,14 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 		Hooks:         hooks,
 		Permissions:   perms,
 		MCP:           plugin.SupportNative,
+
+		AgentFields:       agentFields,
+		SkillFields:       skillFields,
+		CommandFields:     commandFields,
+		HookFields:        hookFields,
+		MCPServerFields:   mcpServerFields,
+		PermissionsFields: permsFields,
+		ScopeFields:       scopeFields,
 	}
 }
 
@@ -246,7 +359,15 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			body = skill.Document.Body
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
-		applyTo, globWarn := pickApplyTo(skill.Globs, skill.Document)
+		// v2-additive: prefer the v0.8 Skill.Globs when populated, fall
+		// back to Activation.Globs (SPEC §4.2.2). The parser mirrors
+		// both shapes, but a v2-only producer might leave the v0.8
+		// slot empty.
+		globs := skill.Globs
+		if len(globs) == 0 {
+			globs = skill.Activation.Globs
+		}
+		applyTo, globWarn := pickApplyTo(globs, skill.Document)
 		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".instructions.md"
 		path := filepath.ToSlash(filepath.Join(".github", "instructions", fname))
 		op := plugin.Operation{
@@ -424,9 +545,10 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			if hook == nil {
 				continue
 			}
-			msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected (pass --enable-preview-hooks to opt in).", hook.Event, hook.Matcher)
+			eventName := copilotHookEventName(hook)
+			msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected (pass --enable-preview-hooks to opt in).", eventName, hook.Matcher)
 			if hook.ScopePath != "" {
-				msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected (pass --enable-preview-hooks to opt in).", hook.Event, hook.Matcher, hook.ScopePath)
+				msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected (pass --enable-preview-hooks to opt in).", eventName, hook.Matcher, hook.ScopePath)
 			}
 			warnings = append(warnings, plugin.Warning{
 				Source:   hook.ScriptPath,
@@ -597,21 +719,32 @@ func renderCopilotAgent(agent *model.Agent, body string) string {
 	b.WriteString(renderYAMLScalar(agent.Description))
 	b.WriteString("\n")
 
-	// Pass-through everything else from the source frontmatter, alpha order.
-	if agent.Document != nil && agent.Document.Frontmatter != nil {
-		fm := agent.Document.Frontmatter
-		keys := make([]string, 0, len(fm))
-		for k := range fm {
+	// Merge pass-through frontmatter: source document Frontmatter first,
+	// then extensions.copilot.* keys (which win on conflict — they are
+	// the explicit per-plugin override slot per SPEC §5.1). Keys are
+	// emitted in alpha order so byte output stays deterministic.
+	merged := map[string]any{}
+	if agent.Document != nil {
+		for k, v := range agent.Document.Frontmatter {
 			if k == "name" || k == "description" {
 				continue
 			}
+			merged[k] = v
+		}
+	}
+	for k, v := range copilotExtensionKeys(agent.Extensions) {
+		merged[k] = v
+	}
+	if len(merged) > 0 {
+		keys := make([]string, 0, len(merged))
+		for k := range merged {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
 			b.WriteString(k)
 			b.WriteString(": ")
-			b.WriteString(renderYAMLValue(fm[k]))
+			b.WriteString(renderYAMLValue(merged[k]))
 			b.WriteString("\n")
 		}
 	}
@@ -778,6 +911,10 @@ func buildCopilotMCPOp(proj *model.Project) plugin.Operation {
 	}
 }
 
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *CopilotPlugin) SchemaVersion() int { return version.SchemaVersion }
+
 // Compile-time check that CopilotPlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*CopilotPlugin)(nil)
 
@@ -816,6 +953,48 @@ func mapCopilotHookEvent(event string) (string, bool) {
 	return "", false
 }
 
+// copilotHookEventName picks the v0.8 Hook.Event when populated, otherwise
+// falls back to the v2 EventCanonical typed enum (SPEC §4.4.2). The parser
+// mirrors both shapes today, but a v2-only producer might populate only
+// EventCanonical. Returns "" when neither is set.
+func copilotHookEventName(h *model.Hook) string {
+	if h == nil {
+		return ""
+	}
+	if h.Event != "" {
+		return h.Event
+	}
+	return string(h.EventCanonical)
+}
+
+// copilotExtensionKeys extracts the `extensions.copilot` map from a
+// primitive's Extensions slot for verbatim pass-through into emitted
+// frontmatter (SPEC §5.1). Returns nil when the namespace is absent or
+// not a map (an info warning is the caller's responsibility, not ours).
+// Reserved canonical keys (name, description) are filtered so the
+// extension cannot override the parser-computed canonical fields.
+func copilotExtensionKeys(ext map[string]any) map[string]any {
+	if ext == nil {
+		return nil
+	}
+	raw, ok := ext["copilot"]
+	if !ok {
+		return nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if k == "name" || k == "description" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // copilotHookEntry mirrors a single hook command entry inside hooks.json.
 // Schema is {type: "command", command: "<path>"} matching Claude's contract
 // (Copilot picked the same shape for cross-tool compatibility).
@@ -847,7 +1026,7 @@ func (p *CopilotPlugin) planPreviewHooks(proj *model.Project) ([]plugin.Operatio
 		if h == nil || h.ScopePath == "" || p.DisableHookWrappers {
 			continue
 		}
-		mappedEvent, ok := mapCopilotHookEvent(h.Event)
+		mappedEvent, ok := mapCopilotHookEvent(copilotHookEventName(h))
 		if !ok {
 			continue
 		}
@@ -881,15 +1060,16 @@ func (p *CopilotPlugin) planPreviewHooks(proj *model.Project) ([]plugin.Operatio
 
 	permsHookWrappers := map[*model.Hook]string{}
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		eventName := copilotHookEventName(h)
+		if h == nil || eventName == "" {
 			continue
 		}
 		base := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
 		var wrapperName string
 		if h.ScopePath == "" {
-			wrapperName = h.Event + "-" + base + ".sh"
+			wrapperName = eventName + "-" + base + ".sh"
 		} else {
-			wrapperName = permsScopeSlug(h.ScopePath) + "-" + h.Event + "-" + base + ".sh"
+			wrapperName = permsScopeSlug(h.ScopePath) + "-" + eventName + "-" + base + ".sh"
 		}
 		wrapperRel := filepath.Join(".github", "hooks", "__perms-guard__", wrapperName)
 		for _, op := range permsOps {
@@ -939,14 +1119,15 @@ func (p *CopilotPlugin) planPreviewHooks(proj *model.Project) ([]plugin.Operatio
 	}
 
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		eventName := copilotHookEventName(h)
+		if h == nil || eventName == "" {
 			continue
 		}
-		mappedEvent, ok := mapCopilotHookEvent(h.Event)
+		mappedEvent, ok := mapCopilotHookEvent(eventName)
 		if !ok {
 			warnings = append(warnings, plugin.Warning{
 				Source:   proj.SourceTag(h.ScriptPath),
-				Message:  fmt.Sprintf("Copilot has no preview event for %q; hook not projected.", h.Event),
+				Message:  fmt.Sprintf("Copilot has no preview event for %q; hook not projected.", eventName),
 				Severity: "info",
 			})
 			continue

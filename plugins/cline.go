@@ -62,6 +62,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // ClinePlugin projects Project state into `.clinerules/` rule files,
@@ -76,6 +77,10 @@ type ClinePlugin struct {
 
 // NewCline constructs a ClinePlugin.
 func NewCline() *ClinePlugin { return &ClinePlugin{} }
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *ClinePlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that ClinePlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*ClinePlugin)(nil)
@@ -93,9 +98,15 @@ func (p *ClinePlugin) Detect(root string) bool {
 	return false
 }
 
-// Capabilities returns Cline's capability matrix (v0.8.0).
+// Capabilities returns Cline's capability matrix.
+//
+// The v0.8 coarse cells (Context..MCP) are preserved unchanged for
+// backward-compatibility with callers that read the flat shape. The v2
+// per-primitive FieldCapabilities cells (AgentFields..ScopeFields) are
+// populated per SPEC §12 (Cline column, `cli`).
 func (p *ClinePlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
+		// v0.8 coarse cells (unchanged).
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
 		ScopeSemantic: plugin.SupportNative,
@@ -105,6 +116,225 @@ func (p *ClinePlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportNative,
 		Permissions:   plugin.SupportNative, // wrapper-implemented via prism perms-guard (v0.8.2)
 		MCP:           plugin.SupportNative,
+
+		// v2 per-primitive declarations (SPEC §12, `cli` column).
+		AgentFields:       clineAgentFields(),
+		SkillFields:       clineSkillFields(),
+		CommandFields:     clineCommandFields(),
+		HookFields:        clineHookFields(),
+		MCPServerFields:   clineMCPServerFields(),
+		PermissionsFields: clinePermissionsFields(),
+		ScopeFields:       clineScopeFields(),
+	}
+}
+
+// clineAgentFields encodes the SPEC §12 Agent table, Cline column. Cline
+// has no subagent primitive; the entire Agent primitive is dropped
+// (Supported=false). Per-field cells are declared explicitly so callers
+// that consult FieldCapabilities can distinguish "unsupported" fields
+// (warn-level) from "silent" ones (ModelFallbacks) per SPEC §6.2.
+func clineAgentFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: false,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":             plugin.FieldUnsupported,
+			"Description":      plugin.FieldUnsupported,
+			"SystemPrompt":     plugin.FieldUnsupported,
+			"Model":            plugin.FieldUnsupported,
+			"ModelFallbacks":   plugin.FieldSilent,
+			"Tools":            plugin.FieldUnsupported,
+			"DisallowedTools":  plugin.FieldUnsupported,
+			"ReadOnly":         plugin.FieldUnsupported,
+			"Background":       plugin.FieldUnsupported,
+			"MaxTurns":         plugin.FieldUnsupported,
+			"Temperature":      plugin.FieldUnsupported,
+			"MCPServers":       plugin.FieldUnsupported,
+			"AllowedSubagents": plugin.FieldUnsupported,
+			"UserInvocable":    plugin.FieldUnsupported,
+			"ModelInvocable":   plugin.FieldUnsupported,
+			"InitialPrompt":    plugin.FieldUnsupported,
+			"ScopePath":        plugin.FieldUnsupported,
+			"Extensions":       plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clineSkillFields encodes the SPEC §12 Skill table, Cline column.
+// Skills project to rule files (no dedicated primitive), so Description
+// and WhenToUse degrade, and Scripts/References/Model/Subagent/ScopePath
+// drop. Activation.Globs is native via the frontmatter `paths:` array.
+func clineSkillFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":                      plugin.FieldNative,
+			"Description":               plugin.FieldDegraded,
+			"WhenToUse":                 plugin.FieldDegraded,
+			"Activation.Modes.Always":   plugin.FieldNative,
+			"Activation.Modes.ModelDec": plugin.FieldUnsupported,
+			"Activation.Modes.Glob":     plugin.FieldNative,
+			"Activation.Modes.Manual":   plugin.FieldNative,
+			"Activation.Globs":          plugin.FieldNative,
+			"Activation.ContentRegex":   plugin.FieldUnsupported,
+			"Activation.UserInvocable":  plugin.FieldNative,
+			"Activation.ModelInvocable": plugin.FieldSilent,
+			"AllowedTools":              plugin.FieldUnsupported,
+			"Arguments":                 plugin.FieldUnsupported,
+			"Scripts":                   plugin.FieldUnsupported,
+			"References":                plugin.FieldUnsupported,
+			"Model":                     plugin.FieldUnsupported,
+			"Subagent":                  plugin.FieldUnsupported,
+			"ScopePath":                 plugin.FieldUnsupported,
+			"Extensions":                plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clineCommandFields encodes the SPEC §12 Command table, Cline column.
+// Workflows are native, but Description degrades (no native description
+// surface), Arguments degrade, and several Claude-only fields drop or
+// silence.
+func clineCommandFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":         plugin.FieldNative,
+			"Description":  plugin.FieldDegraded,
+			"ArgumentHint": plugin.FieldSilent,
+			"Arguments":    plugin.FieldDegraded,
+			"Model":        plugin.FieldUnsupported,
+			"Tools":        plugin.FieldUnsupported,
+			"Agent":        plugin.FieldDegraded,
+			"AutoInvoke":   plugin.FieldSilent,
+			"ScopePath":    plugin.FieldDegraded,
+			"Extensions":   plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clineHookFields encodes the SPEC §12 Hook table, Cline column. The
+// core ≥4-tool event subset is native; Matcher exact/regex degrade
+// (filename-dispatch model — see SPEC §4.4.5 and the Phase 2.5 TODO in
+// buildClineHookOps). ScopePath is native via the perms-guard /
+// scope-guard wrapper family (SPEC §12 footnote ¹).
+func clineHookFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":              plugin.FieldSilent,
+			"Description":       plugin.FieldSilent,
+			"Event.Core":        plugin.FieldNative,
+			"Event.ClaudeOnly":  plugin.FieldUnsupported,
+			"Matcher.Exact":     plugin.FieldDegraded,
+			"Matcher.Regex":     plugin.FieldDegraded,
+			"Handlers.Command":  plugin.FieldNative,
+			"Handlers.HTTP":     plugin.FieldUnsupported,
+			"Handlers.MCPTool":  plugin.FieldUnsupported,
+			"Handlers.Prompt":   plugin.FieldUnsupported,
+			"Handlers.Agent":    plugin.FieldUnsupported,
+			"Sequential":        plugin.FieldSilent,
+			"Disabled":          plugin.FieldNative,
+			"TimeoutMs":         plugin.FieldDegraded,
+			"StatusMessage":     plugin.FieldSilent,
+			"Async":             plugin.FieldUnsupported,
+			"FailClosed":        plugin.FieldUnsupported,
+			"Once":              plugin.FieldUnsupported,
+			"If":                plugin.FieldUnsupported,
+			"Cwd":               plugin.FieldSilent,
+			"Env":               plugin.FieldUnsupported,
+			"BashAndPowershell": plugin.FieldUnsupported,
+			"ScopePath":         plugin.FieldNative, // perms-guard / scope-guard wrapper family (SPEC §12 footnote ¹)
+			"Extensions":        plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clineMCPServerFields encodes the SPEC §12 MCPServer table, Cline
+// column. All transports + bearer/header auth are native; AutoApprove
+// and TimeoutMs are native (Cline-specific richness); Cwd is silent;
+// Trust and the include/exclude tool filters drop.
+func clineMCPServerFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Name":            plugin.FieldNative,
+			"Transport.Stdio": plugin.FieldNative,
+			"Transport.HTTP":  plugin.FieldNative,
+			"Transport.SSE":   plugin.FieldNative,
+			"Command":         plugin.FieldNative,
+			"Args":            plugin.FieldNative,
+			"Env":             plugin.FieldNative,
+			"Cwd":             plugin.FieldSilent,
+			"URL":             plugin.FieldNative,
+			"Headers":         plugin.FieldNative,
+			"Auth.Bearer":     plugin.FieldNative,
+			"Auth.Header":     plugin.FieldNative,
+			"Auth.OAuth":      plugin.FieldDegraded,
+			"TimeoutMs":       plugin.FieldNative,
+			"Disabled":        plugin.FieldNative,
+			"AutoApprove":     plugin.FieldNative,
+			"Trust":           plugin.FieldUnsupported,
+			"IncludeTools":    plugin.FieldUnsupported,
+			"ExcludeTools":    plugin.FieldUnsupported,
+			"ScopePath":       plugin.FieldDegraded,
+			"Extensions":      plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clinePermissionsFields encodes the SPEC §12 Permissions table, Cline
+// column. Native via the perms-guard wrapper (SPEC §12 footnote ¹).
+func clinePermissionsFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Allow.Global":         plugin.FieldNative,
+			"Ask.Global":           plugin.FieldNative,
+			"Deny.Global":          plugin.FieldNative,
+			"Allow.Scoped":         plugin.FieldNative,
+			"Ask.Scoped":           plugin.FieldNative,
+			"Deny.Scoped":          plugin.FieldNative,
+			"Target.Bash":          plugin.FieldNative,
+			"Target.EditReadWrite": plugin.FieldNative,
+			"Target.FS":            plugin.FieldNative,
+			"Target.Network":       plugin.FieldNative,
+			"Target.MCP":           plugin.FieldNative,
+			"Glob.Recursive":       plugin.FieldNative,
+			"Negation":             plugin.FieldNative,
+			"Extensions":           plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
+	}
+}
+
+// clineScopeFields encodes the SPEC §12 Scope table, Cline column.
+// Path cascades degrade; Globs / glob-activation are native (via the
+// frontmatter `paths:` array on rule files).
+func clineScopeFields() plugin.FieldCapabilities {
+	return plugin.FieldCapabilities{
+		Supported: true,
+		Fields: map[string]plugin.FieldSupport{
+			"Path.Cascade":        plugin.FieldDegraded,
+			"Path.Empty":          plugin.FieldNative,
+			"Name":                plugin.FieldNative,
+			"Description":         plugin.FieldNative,
+			"Globs":               plugin.FieldNative,
+			"Activation.Always":   plugin.FieldNative,
+			"Activation.Cascade":  plugin.FieldDegraded,
+			"Activation.Glob":     plugin.FieldNative,
+			"Activation.Manual":   plugin.FieldUnsupported,
+			"Activation.ModelDec": plugin.FieldUnsupported,
+			"Priority":            plugin.FieldSilent,
+			"Tags":                plugin.FieldSilent,
+			"IsOverride":          plugin.FieldUnsupported,
+			"Extensions":          plugin.FieldNative,
+		},
+		Extensions: []string{"cline"},
 	}
 }
 
@@ -118,6 +348,38 @@ var clineHookEvents = map[string]struct{}{
 	"PostToolUse":      {},
 	"TaskComplete":     {},
 	"TaskCancel":       {},
+}
+
+// hookEventFor returns the Cline-native event string for h, preferring
+// the v2 typed EventCanonical when set and falling back to the v0.8
+// Event string. ADDITIVE read (SPEC §6.2 transition): plugins are
+// expected to read both shapes for the duration of the v0.8 → v2
+// migration; the parser populates EventCanonical from Event for every
+// hook source, so this helper sees the same data through either path.
+func hookEventFor(h *model.Hook) string {
+	if h == nil {
+		return ""
+	}
+	if h.EventCanonical != "" {
+		return string(h.EventCanonical)
+	}
+	return h.Event
+}
+
+// skillGlobsFor returns the glob list for sk, preferring the v2
+// Activation.Globs when set and falling back to the v0.8 top-level
+// Globs slice. ADDITIVE read — the parser mirrors sk.Globs into
+// sk.Activation.Globs at parse time, so both paths observe the same
+// data; the helper exists so the renderer can survive sources that
+// populate only one shape (e.g. future direct-v2 inputs).
+func skillGlobsFor(sk *model.Skill) []string {
+	if sk == nil {
+		return nil
+	}
+	if len(sk.Activation.Globs) > 0 {
+		return sk.Activation.Globs
+	}
+	return sk.Globs
 }
 
 // mapClineEvent translates a prism Hook.Event into a Cline-native event
@@ -282,7 +544,8 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			continue
 		}
 		hookName := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
-		wrapperFile := scopeSlug(h.ScopePath) + "-" + mapClineEvent(h.Event) + "-" + hookName + ".sh"
+		// v2 additive read: prefer EventCanonical via hookEventFor.
+		wrapperFile := scopeSlug(h.ScopePath) + "-" + mapClineEvent(hookEventFor(h)) + "-" + hookName + ".sh"
 		wrapperRel := filepath.ToSlash(filepath.Join(".clinerules", "hooks", "__scope-guard__", wrapperFile))
 		wrapperAbs := filepath.Join(proj.Root, wrapperRel)
 
@@ -430,6 +693,22 @@ type clineHookFile struct {
 	Hooks []clineHookGroup `json:"hooks"`
 }
 
+// TODO(prism v0.9 Phase 2.5 — filename-dispatch hooks): SPEC §4.4.5 and
+// IMPLEMENTATION_PLAN.md §5 Phase 2 (cline note, lines 505-511) call for
+// a hook-emission REWRITE: Cline does NOT consume the
+// `.clinerules/hooks/<event>.json` shape this function emits today (see
+// the upstream Cline issue cited in the plan). The canonical shape is
+// one EXECUTABLE script per (event, matcher) pair at
+// `.clinerules/hooks/<EventName>` (no extension), with matcher guard
+// clauses inlined at the top of each script (stdin → tool_name parse →
+// exit 0 on miss), and multi-handler events collapsing into a
+// dispatcher script that fans out sequentially.
+//
+// That rewrite is deferred to Phase 2.5 because it requires regenerating
+// every cline hook golden test in the repository. This Phase 2a refresh
+// touches only Capabilities() and additive v2 reads — emission shape is
+// preserved verbatim per the task brief ("No emission shape changes").
+//
 // buildClineHookOps emits one OpWrite per Hook.Event. The known events
 // are: TaskStart, TaskResume, UserPromptSubmit, PreToolUse, PostToolUse,
 // TaskComplete, TaskCancel. We do not validate the event name here —
@@ -467,10 +746,15 @@ func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string,
 		buckets[ev][matcher] = append(buckets[ev][matcher], entry)
 	}
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		// v2 additive read (SPEC §6.2): consult EventCanonical alongside
+		// the v0.8 Event string. The parser mirrors Event → EventCanonical
+		// at parse time, so both shapes observe the same data; this
+		// guards future direct-v2 inputs that populate only the typed
+		// field.
+		if h == nil || hookEventFor(h) == "" {
 			continue
 		}
-		ev := mapClineEvent(h.Event)
+		ev := mapClineEvent(hookEventFor(h))
 		cmdPath := h.ScriptPath
 		if w, ok := wrapperPaths[h]; ok {
 			cmdPath = w
@@ -612,6 +896,12 @@ func renderClineScope(scope *model.Scope, body string) string {
 			fmt.Fprintf(&b, "  - %s\n", renderYAMLScalar(g))
 		}
 	}
+	// extensions.cline.* verbatim passthrough (SPEC §5.1). Emitted
+	// after the structured keys so user-supplied keys do not collide
+	// with prism-generated ones.
+	if ext := renderClineExtensions(scope.Extensions); ext != "" {
+		b.WriteString(ext)
+	}
 	b.WriteString("---\n\n")
 	fmt.Fprintf(&b, "## When working in %s\n\n", scope.Path)
 	if scope.Description != "" {
@@ -633,15 +923,21 @@ func renderClineScope(scope *model.Scope, body string) string {
 // the skill has a non-empty Globs slice (or inherits a scope), the
 // frontmatter carries them as `paths:` so the rule loads only on
 // matching files; otherwise no frontmatter is emitted.
+//
+// v2 additive read: globs are sourced via skillGlobsFor, which prefers
+// the typed Activation.Globs over the v0.8 top-level Globs slice. The
+// parser keeps both in sync, so existing inputs behave identically.
 func renderClineSkill(skill *model.Skill, body string) string {
 	var b strings.Builder
-	hasFrontmatter := skill.Description != "" || len(skill.Globs) > 0 || skill.ScopePath != ""
+	skillGlobs := skillGlobsFor(skill)
+	extLines := renderClineExtensions(skill.Extensions)
+	hasFrontmatter := skill.Description != "" || len(skillGlobs) > 0 || skill.ScopePath != "" || extLines != ""
 	if hasFrontmatter {
 		b.WriteString("---\n")
 		if skill.Description != "" {
 			fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(skill.Description))
 		}
-		globs := skill.Globs
+		globs := skillGlobs
 		if len(globs) == 0 && skill.ScopePath != "" {
 			globs = []string{skill.ScopePath + "/**"}
 		}
@@ -650,6 +946,10 @@ func renderClineSkill(skill *model.Skill, body string) string {
 			for _, g := range globs {
 				fmt.Fprintf(&b, "  - %s\n", renderYAMLScalar(g))
 			}
+		}
+		// extensions.cline.* verbatim passthrough (SPEC §5.1).
+		if extLines != "" {
+			b.WriteString(extLines)
 		}
 		b.WriteString("---\n\n")
 	}
@@ -681,10 +981,17 @@ func renderClineSkill(skill *model.Skill, body string) string {
 // is self-describing when read directly.
 func renderClineWorkflow(cmd *model.Command, body string) string {
 	var b strings.Builder
-	hasFrontmatter := cmd.Description != ""
+	extLines := renderClineExtensions(cmd.Extensions)
+	hasFrontmatter := cmd.Description != "" || extLines != ""
 	if hasFrontmatter {
 		b.WriteString("---\n")
-		fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(cmd.Description))
+		if cmd.Description != "" {
+			fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(cmd.Description))
+		}
+		// extensions.cline.* verbatim passthrough (SPEC §5.1).
+		if extLines != "" {
+			b.WriteString(extLines)
+		}
 		b.WriteString("---\n\n")
 	}
 	if cmd.ScopePath != "" {
@@ -724,4 +1031,72 @@ func sourceOrEmpty(sources []string) string {
 		return ""
 	}
 	return sources[0]
+}
+
+// renderClineExtensions returns the YAML frontmatter lines (each ending
+// with \n) that pass `extensions.cline.*` verbatim into the emitted
+// rule / workflow file. Returns "" when the primitive carries no
+// cline-namespaced extensions block.
+//
+// SPEC §5.1: extensions are plugin-namespaced opaque pass-through. The
+// renderer only touches the `cline` namespace and emits whatever scalar
+// or list values the user wrote — it does NOT validate or transform.
+// Nested maps / structured values are emitted via a minimal YAML
+// flow-style fallback (json.Marshal) so they remain syntactically valid
+// even when the user supplies a deeper shape.
+//
+// Keys are sorted for deterministic output (so golden tests stay
+// stable). The slice of lines is the caller's to insert between
+// `description:` / `paths:` and the closing `---`.
+func renderClineExtensions(ext map[string]any) string {
+	if len(ext) == 0 {
+		return ""
+	}
+	raw, ok := ext["cline"].(map[string]any)
+	if !ok || len(raw) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		v := raw[k]
+		switch tv := v.(type) {
+		case string:
+			fmt.Fprintf(&b, "%s: %s\n", k, renderYAMLScalar(tv))
+		case bool:
+			fmt.Fprintf(&b, "%s: %t\n", k, tv)
+		case int, int32, int64, float32, float64:
+			fmt.Fprintf(&b, "%s: %v\n", k, tv)
+		case []any:
+			// Render as YAML block-style list of scalars; complex items
+			// fall through to JSON.
+			fmt.Fprintf(&b, "%s:\n", k)
+			for _, item := range tv {
+				switch iv := item.(type) {
+				case string:
+					fmt.Fprintf(&b, "  - %s\n", renderYAMLScalar(iv))
+				case bool:
+					fmt.Fprintf(&b, "  - %t\n", iv)
+				case int, int32, int64, float32, float64:
+					fmt.Fprintf(&b, "  - %v\n", iv)
+				default:
+					if raw, err := json.Marshal(item); err == nil {
+						fmt.Fprintf(&b, "  - %s\n", raw)
+					}
+				}
+			}
+		default:
+			// Map or other structured value — fall back to JSON
+			// (flow-style YAML is a JSON superset).
+			if raw, err := json.Marshal(v); err == nil {
+				fmt.Fprintf(&b, "%s: %s\n", k, raw)
+			}
+		}
+	}
+	return b.String()
 }

@@ -12,6 +12,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // ClaudePlugin projects a model.Project into Claude Code's on-disk layout:
@@ -59,6 +60,17 @@ func (p *ClaudePlugin) Detect(root string) bool {
 }
 
 // Capabilities returns the capability matrix entry for Claude Code.
+//
+// The v0.8 coarse fields (Context, ScopePaths, Skills, Commands, Agents,
+// Hooks, Permissions, MCP) are retained for back-compat with older
+// callers (validator and `prism capabilities` may still consult them).
+//
+// The v2 per-field tables (AgentFields, SkillFields, ...) declare every
+// non-native cell from SPEC §12's Claude column. Native cells are
+// absent from the Fields map and default to FieldNative per the
+// FieldCapabilities contract. Field keys use the canonical
+// dot-notation paths from SPEC §4.x.y per-plugin field-mapping tables
+// (e.g. "Activation.Globs", "Auth.Scheme").
 func (p *ClaudePlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
@@ -70,6 +82,96 @@ func (p *ClaudePlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportNative,
 		Permissions:   plugin.SupportNative,
 		MCP:           plugin.SupportNative,
+
+		// v2 per-primitive declarations (SPEC §12, "cla" column).
+		AgentFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// Non-native cells from §12 Agent table.
+				"ModelFallbacks": plugin.FieldSilent,
+				"ReadOnly":       plugin.FieldDegraded, // → permissionMode: plan
+				"Temperature":    plugin.FieldSilent,
+				"UserInvocable":  plugin.FieldDegraded, // → non-scanned dir convention
+				"ModelInvocable": plugin.FieldDegraded, // → permissions.deny rule
+				"ScopePath":      plugin.FieldDegraded, // → <slug>-<name> prefix
+			},
+		},
+		SkillFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// Non-native cells from §12 Skill table.
+				"Activation.Modes.Always": plugin.FieldDegraded, // body persists; no native always
+				"Activation.ContentRegex": plugin.FieldUnsupported,
+				"ScopePath":               plugin.FieldDegraded,
+			},
+		},
+		CommandFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				"ScopePath": plugin.FieldDegraded,
+			},
+		},
+		HookFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// Non-native cells from §12 Hook table.
+				"Name":                     plugin.FieldSilent,
+				"Description":              plugin.FieldSilent,
+				"Sequential":               plugin.FieldSilent,
+				"Cwd":                      plugin.FieldDegraded,
+				"Env":                      plugin.FieldUnsupported,
+				"Handlers.bash_powershell": plugin.FieldUnsupported,
+				"FailClosed":               plugin.FieldUnsupported,
+				"ScopePath":                plugin.FieldDegraded,
+			},
+		},
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// Non-native cells from §12 MCPServer table.
+				"Cwd":          plugin.FieldSilent,
+				"Auth.Scheme":  plugin.FieldDegraded, // oauth → informational warn
+				"TimeoutMs":    plugin.FieldUnsupported,
+				"AutoApprove":  plugin.FieldUnsupported,
+				"Trust":        plugin.FieldUnsupported,
+				"IncludeTools": plugin.FieldUnsupported,
+				"ExcludeTools": plugin.FieldUnsupported,
+				"ScopePath":    plugin.FieldDegraded,
+			},
+		},
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// "Global"/"Scoped" special keys per SPEC §6.2.
+				"Scoped":         plugin.FieldDegraded,
+				"fs":             plugin.FieldDegraded, // fans out to Edit+Read+Write
+				"network":        plugin.FieldDegraded, // → WebFetch(domain:...)
+				"mcp":            plugin.FieldDegraded, // → mcp__server__tool
+				"recursive_glob": plugin.FieldDegraded, // **; deny-only fallback
+				"negation":       plugin.FieldDegraded, // ! splits to allow+deny
+			},
+		},
+		ScopeFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"claude"},
+			Fields: map[string]plugin.FieldSupport{
+				// Non-native cells from §12 Scope table.
+				"Name":                     plugin.FieldDegraded,
+				"Description":              plugin.FieldSilent,
+				"Activation.Always":        plugin.FieldDegraded, // root-only implicit
+				"Activation.Manual":        plugin.FieldUnsupported,
+				"Activation.ModelDecision": plugin.FieldUnsupported,
+				"Priority":                 plugin.FieldDegraded, // synthesized as cascade depth
+				"Tags":                     plugin.FieldSilent,
+				"IsOverride":               plugin.FieldUnsupported, // leading comment fallback
+			},
+		},
 	}
 }
 
@@ -138,13 +240,13 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		ops = append(ops, op)
 	}
 
-	// Per-scope CLAUDE.md files.
+	// Per-scope CLAUDE.md files. Pass extensions.claude.* through.
 	for _, sc := range proj.Scopes {
 		if sc == nil || sc.Document == nil {
 			continue
 		}
 		path := filepath.Join(sc.Path, "CLAUDE.md")
-		op, err := buildOp(proj, sc.Document, path, mode)
+		op, err := buildOpExt(proj, sc.Document, path, mode, claudeExtensions(sc.Extensions))
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +263,7 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		dirName := scopedName(sk.ScopePath, sk.Name)
 		skillDir := filepath.Join(".claude", "skills", dirName)
 		skillPath := filepath.Join(skillDir, "SKILL.md")
-		op, err := buildOp(proj, sk.Document, skillPath, mode)
+		op, err := buildOpExt(proj, sk.Document, skillPath, mode, claudeExtensions(sk.Extensions))
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +291,7 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		}
 		fileName := scopedName(cmd.ScopePath, cmd.Name) + ".md"
 		path := filepath.Join(".claude", "commands", fileName)
-		op, err := buildOp(proj, cmd.Document, path, mode)
+		op, err := buildOpExt(proj, cmd.Document, path, mode, claudeExtensions(cmd.Extensions))
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +313,7 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		}
 		fileName := scopedName(ag.ScopePath, ag.Name) + ".md"
 		path := filepath.Join(".claude", "agents", fileName)
-		op, err := buildOp(proj, ag.Document, path, mode)
+		op, err := buildOpExt(proj, ag.Document, path, mode, claudeExtensions(ag.Extensions))
 		if err != nil {
 			return nil, err
 		}
@@ -360,10 +462,30 @@ func sanitizeBashComment(s string) string {
 // included file's source tag is appended to op.Sources so lockfile /
 // `agents which` traces flow back to the included content too.
 func buildOp(proj *model.Project, doc *model.Document, targetPath string, mode plugin.Mode) (plugin.Operation, error) {
+	return buildOpExt(proj, doc, targetPath, mode, nil)
+}
+
+// buildOpExt is buildOp + an optional extensions map sourced from the
+// primitive's Extensions["claude"]. When the map is non-empty its keys
+// are hoisted to top-level frontmatter on the projected file. Hoisting
+// forces a write-mode emission (no symlink): the projected file must
+// carry the merged frontmatter, which differs from the on-disk source.
+// When the map is empty/nil this is exactly buildOp.
+//
+// Hoisting policy (SPEC §5.1, §12 "Extensions[plugin] = N"): the v2
+// contract says extensions.claude.* passes through verbatim to the
+// projected frontmatter. Keys that collide with an existing frontmatter
+// key are preserved at top level (extension wins); the original keys
+// remain alongside any non-colliding ones. Plugins MUST NOT interpret
+// the values — they are opaque pass-through.
+func buildOpExt(proj *model.Project, doc *model.Document, targetPath string, mode plugin.Mode, claudeExt map[string]any) (plugin.Operation, error) {
 	downgraded := false
-	if doc.NeedsWrite() && mode == plugin.ModeSymlink {
+	hoist := len(claudeExt) > 0
+	if (doc.NeedsWrite() || hoist) && mode == plugin.ModeSymlink {
 		mode = plugin.ModeWrite
-		downgraded = true
+		if doc.NeedsWrite() {
+			downgraded = true
+		}
 	}
 
 	sources := []string{proj.SourceTag(doc.SourcePath)}
@@ -388,7 +510,11 @@ func buildOp(proj *model.Project, doc *model.Document, targetPath string, mode p
 		op.LinkTarget = filepath.ToSlash(linkTarget)
 	} else {
 		op.Kind = plugin.OpWrite
-		op.Content = doc.Body
+		if hoist {
+			op.Content = renderBodyWithExtensions(doc, claudeExt)
+		} else {
+			op.Content = doc.Body
+		}
 	}
 
 	if downgraded {
@@ -400,6 +526,80 @@ func buildOp(proj *model.Project, doc *model.Document, targetPath string, mode p
 	}
 
 	return op, nil
+}
+
+// renderBodyWithExtensions hoists claudeExt keys into the projected
+// frontmatter on top of doc's existing frontmatter, then concatenates
+// doc.Body. Existing frontmatter keys not present in claudeExt are
+// preserved; colliding keys take the extension value (extensions are
+// authored intentionally to override). Returns "---\n…\n---\n<body>".
+//
+// Marshaling uses encoding/json with stable key order: existing
+// frontmatter keys first (sorted), then extension-only keys (sorted).
+// JSON encoding produces valid YAML flow scalars/maps for the value
+// types extensions carry (string, number, bool, list, map). Plugins
+// never invent values — they only stream what the parser already
+// validated as YAML, so a round-trip through JSON cannot lose
+// precision for the legal extension value types.
+func renderBodyWithExtensions(doc *model.Document, claudeExt map[string]any) string {
+	merged := map[string]any{}
+	for k, v := range doc.Frontmatter {
+		merged[k] = v
+	}
+	for k, v := range claudeExt {
+		merged[k] = v
+	}
+
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString("---\n")
+	for _, k := range keys {
+		raw, err := json.Marshal(merged[k])
+		if err != nil {
+			// Fall back to an empty value rather than dropping the key
+			// silently; the projected file remains valid YAML and the
+			// user can inspect the discrepancy via `prism diff`.
+			b.WriteString(k)
+			b.WriteString(": \"\"\n")
+			continue
+		}
+		b.WriteString(k)
+		b.WriteString(": ")
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	b.WriteString("---\n")
+	body := doc.Body
+	if body == "" {
+		return b.String()
+	}
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// claudeExtensions extracts the `claude` namespace from a primitive's
+// Extensions map, returning nil when absent or shaped wrong. Used by the
+// Plan() call sites for Agent/Skill/Command/Scope to feed buildOpExt.
+func claudeExtensions(ext map[string]any) map[string]any {
+	if ext == nil {
+		return nil
+	}
+	v, ok := ext["claude"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if len(v) == 0 {
+		return nil
+	}
+	return v
 }
 
 // buildScriptOp constructs an Operation that places a skill script under
@@ -489,18 +689,31 @@ func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (
 	buckets := map[string]map[string][]hookEntry{}
 	eventOrder := []string{}
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		if h == nil {
 			continue
 		}
-		if _, ok := buckets[h.Event]; !ok {
-			buckets[h.Event] = map[string][]hookEntry{}
-			eventOrder = append(eventOrder, h.Event)
+		// v2 additive read: prefer h.Event (v0.8 shape) but fall back to
+		// h.EventCanonical (v2 typed enum) when only the v2 path is set.
+		// The parser populates both for v0.8-shape inputs; v2-only inputs
+		// will arrive with Event == "" once Phase 2.5 retires the v0.8
+		// shape, so this fallback keeps Plan() compatible across both
+		// importer shapes.
+		event := h.Event
+		if event == "" && h.EventCanonical != "" {
+			event = string(h.EventCanonical)
+		}
+		if event == "" {
+			continue
+		}
+		if _, ok := buckets[event]; !ok {
+			buckets[event] = map[string][]hookEntry{}
+			eventOrder = append(eventOrder, event)
 		}
 		cmdPath := h.ScriptPath
 		if w, ok := wrapperPaths[h]; ok {
 			cmdPath = w
 		}
-		buckets[h.Event][h.Matcher] = append(buckets[h.Event][h.Matcher], hookEntry{
+		buckets[event][h.Matcher] = append(buckets[event][h.Matcher], hookEntry{
 			Type:    "command",
 			Command: cmdPath,
 		})
@@ -655,6 +868,11 @@ func buildMCPOp(proj *model.Project) (plugin.Operation, error) {
 		Warnings: warnings,
 	}, nil
 }
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4). In-tree plugins always return the current
+// version constant.
+func (p *ClaudePlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that ClaudePlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*ClaudePlugin)(nil)

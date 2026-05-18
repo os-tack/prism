@@ -43,6 +43,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // WindsurfPlugin projects Project state into `.windsurf/rules/*.md`,
@@ -84,6 +85,7 @@ func (p *WindsurfPlugin) Detect(root string) bool {
 // unsupported.
 func (p *WindsurfPlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
+		// v0.8 coarse cells (unchanged for back-compat).
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
 		ScopeSemantic: plugin.SupportNative,
@@ -93,6 +95,192 @@ func (p *WindsurfPlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportNative,
 		Permissions:   plugin.SupportUnsupported,
 		MCP:           plugin.SupportNative,
+
+		// v2 per-field cells per SPEC §12 (Windsurf / `win` column).
+
+		// Agent: Windsurf has no subagent primitive — every field U.
+		AgentFields: plugin.FieldCapabilities{
+			Supported: false,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldUnsupported,
+				"Description":        plugin.FieldUnsupported,
+				"SystemPrompt":       plugin.FieldUnsupported,
+				"Model":              plugin.FieldUnsupported,
+				"ModelFallbacks":     plugin.FieldSilent,
+				"Tools":              plugin.FieldUnsupported,
+				"DisallowedTools":    plugin.FieldUnsupported,
+				"ReadOnly":           plugin.FieldUnsupported,
+				"Background":         plugin.FieldUnsupported,
+				"MaxTurns":           plugin.FieldUnsupported,
+				"Temperature":        plugin.FieldUnsupported,
+				"MCPServers":         plugin.FieldUnsupported,
+				"AllowedSubagents":   plugin.FieldUnsupported,
+				"UserInvocable":      plugin.FieldUnsupported,
+				"ModelInvocable":     plugin.FieldUnsupported,
+				"InitialPrompt":      plugin.FieldUnsupported,
+				"ScopePath":          plugin.FieldUnsupported,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
+
+		// Skill: rules-file projection with trigger: glob /
+		// model_decision. Scripts/Refs/AllowedTools/Arguments/Model/
+		// Subagent unsupported (no script execution, no per-skill model).
+		SkillFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":                             plugin.FieldNative,
+				"Description":                      plugin.FieldNative,
+				"WhenToUse":                        plugin.FieldDegraded,
+				"Activation.Modes={Always}":        plugin.FieldNative,
+				"Activation.Modes={ModelDecision}": plugin.FieldNative,
+				"Activation.Modes={Glob}":          plugin.FieldNative,
+				"Activation.Modes={Manual}":        plugin.FieldNative,
+				"Activation.Globs":                 plugin.FieldNative,
+				"Activation.ContentRegex":          plugin.FieldUnsupported,
+				"Activation.UserInvocable":         plugin.FieldSilent,
+				"Activation.ModelInvocable":        plugin.FieldSilent,
+				"AllowedTools":                     plugin.FieldUnsupported,
+				"Arguments":                        plugin.FieldUnsupported,
+				"Scripts":                          plugin.FieldUnsupported,
+				"References":                      plugin.FieldUnsupported,
+				"Model":                            plugin.FieldUnsupported,
+				"Subagent":                         plugin.FieldUnsupported,
+				"ScopePath":                        plugin.FieldUnsupported,
+				"Extensions[plugin]":               plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
+
+		// Command: degrades to a model_decision rule. Description is
+		// dropped per SPEC §12 win column.
+		CommandFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldNative,
+				"Description":        plugin.FieldUnsupported,
+				"ArgumentHint":       plugin.FieldSilent,
+				"Arguments":          plugin.FieldDegraded,
+				"Model":              plugin.FieldUnsupported,
+				"Tools":              plugin.FieldUnsupported,
+				"Agent":              plugin.FieldDegraded,
+				"AutoInvoke":         plugin.FieldSilent,
+				"ScopePath":          plugin.FieldDegraded,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
+
+		// Hook: Cascade Hooks native; per-action events (pre_run_command
+		// etc.) 1:1. Matcher regex unsupported, FailClosed unsupported,
+		// Claude-only events (SessionStart etc.) unsupported.
+		HookFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldSilent,
+				"Description":        plugin.FieldSilent,
+				"Event":              plugin.FieldNative,
+				"EventClaudeOnly":    plugin.FieldUnsupported,
+				"Matcher":            plugin.FieldDegraded,
+				"MatcherRegex":       plugin.FieldUnsupported,
+				"Handlers.command":   plugin.FieldNative,
+				"Handlers.http":      plugin.FieldUnsupported,
+				"Handlers.mcp_tool":  plugin.FieldUnsupported,
+				"Handlers.prompt":    plugin.FieldUnsupported,
+				"Handlers.agent":     plugin.FieldUnsupported,
+				"Sequential":         plugin.FieldSilent,
+				"Disabled":           plugin.FieldNative,
+				"TimeoutMs":          plugin.FieldUnsupported,
+				"StatusMessage":      plugin.FieldSilent,
+				"Async":              plugin.FieldDegraded,
+				"FailClosed":         plugin.FieldUnsupported,
+				"Once":               plugin.FieldUnsupported,
+				"If":                 plugin.FieldUnsupported,
+				"Cwd":                plugin.FieldNative,
+				"Env":                plugin.FieldUnsupported,
+				"Bash+Powershell":    plugin.FieldNative,
+				"ScopePath":          plugin.FieldDegraded,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
+
+		// MCPServer: .windsurf/mcp_config.json. Most fields native;
+		// Cwd silent, TimeoutMs/AutoApprove/Trust/Include-Exclude
+		// unsupported per SPEC §12 win column.
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldNative,
+				"Transport.stdio":    plugin.FieldNative,
+				"Transport.http":     plugin.FieldNative,
+				"Transport.sse":      plugin.FieldNative,
+				"Command":            plugin.FieldNative,
+				"Args":               plugin.FieldNative,
+				"Env":                plugin.FieldNative,
+				"Cwd":                plugin.FieldSilent,
+				"URL":                plugin.FieldNative,
+				"Headers":            plugin.FieldNative,
+				"Auth.Scheme=bearer": plugin.FieldNative,
+				"Auth.Scheme=header": plugin.FieldNative,
+				"Auth.Scheme=oauth":  plugin.FieldDegraded,
+				"TimeoutMs":          plugin.FieldUnsupported,
+				"Disabled":           plugin.FieldNative,
+				"AutoApprove":        plugin.FieldUnsupported,
+				"Trust":              plugin.FieldUnsupported,
+				"IncludeTools":       plugin.FieldUnsupported,
+				"ExcludeTools":       plugin.FieldUnsupported,
+				"ScopePath":          plugin.FieldDegraded,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
+
+		// Permissions: Windsurf has no permissions primitive — every
+		// field unsupported (no perms-guard wrapper today).
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported: false,
+			Fields: map[string]plugin.FieldSupport{
+				"Allow":                plugin.FieldUnsupported,
+				"Ask":                  plugin.FieldUnsupported,
+				"Deny":                 plugin.FieldUnsupported,
+				"AllowScoped":          plugin.FieldUnsupported,
+				"AskScoped":            plugin.FieldUnsupported,
+				"DenyScoped":           plugin.FieldUnsupported,
+				"Target.bash":          plugin.FieldUnsupported,
+				"Target.editreadwrite": plugin.FieldUnsupported,
+				"Target.fs":            plugin.FieldUnsupported,
+				"Target.network":       plugin.FieldUnsupported,
+				"Target.mcp":           plugin.FieldUnsupported,
+				"GlobRecursive":        plugin.FieldUnsupported,
+				"GlobNegation":         plugin.FieldUnsupported,
+				"Extensions[plugin]":   plugin.FieldUnsupported,
+			},
+		},
+
+		// Scope: rule files via trigger glob/model_decision/manual; full
+		// activation matrix supported.
+		ScopeFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Path":                     plugin.FieldDegraded,
+				"PathEmpty":                plugin.FieldNative,
+				"Name":                     plugin.FieldNative,
+				"Description":              plugin.FieldNative,
+				"Globs":                    plugin.FieldNative,
+				"Activation=Always":        plugin.FieldNative,
+				"Activation=Cascade":       plugin.FieldDegraded,
+				"Activation=Glob":          plugin.FieldNative,
+				"Activation=Manual":        plugin.FieldNative,
+				"Activation=ModelDecision": plugin.FieldNative,
+				"Priority":                 plugin.FieldSilent,
+				"Tags":                     plugin.FieldSilent,
+				"IsOverride":               plugin.FieldUnsupported,
+				"Extensions[plugin]":       plugin.FieldNative,
+			},
+			Extensions: []string{"windsurf"},
+		},
 	}
 }
 
@@ -140,10 +328,17 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = sc.Document.Body
 			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
+		// v2 read (additive, SPEC §4.7.2): fall back to Activation.Globs
+		// when the v0.8 Scope.Globs slice is empty. Same emission shape.
+		globs := sc.Globs
+		// Note: Scope.Activation is a scalar ScopeActivation, not a struct
+		// — Globs live only on Scope.Globs in the v2 model. No-op here for
+		// scopes; the skill loop below carries the Activation.Globs read.
 		fm := windsurfFrontmatter{
 			Trigger:     "glob",
-			Globs:       sc.Globs,
+			Globs:       globs,
 			Description: sc.Description,
+			Extensions:  pluginExtensions(sc.Extensions, "windsurf"),
 		}
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
@@ -171,12 +366,22 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = skill.Document.Body
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
+		// v2 read (additive, SPEC §4.2.2): fall back to Activation.Globs
+		// when v0.8 Skill.Globs is empty. The parser already mirrors them,
+		// but reading both makes the plugin robust to direct-API callers
+		// that only populate the v2 field. No emission shape change.
+		skillGlobs := skill.Globs
+		if len(skillGlobs) == 0 {
+			skillGlobs = skill.Activation.Globs
+		}
+		skillExts := pluginExtensions(skill.Extensions, "windsurf")
 		var fm windsurfFrontmatter
-		if len(skill.Globs) > 0 {
+		if len(skillGlobs) > 0 {
 			fm = windsurfFrontmatter{
 				Trigger:     "glob",
-				Globs:       skill.Globs,
+				Globs:       skillGlobs,
 				Description: skill.Description,
+				Extensions:  skillExts,
 			}
 		} else {
 			desc := skill.Description
@@ -186,6 +391,7 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			fm = windsurfFrontmatter{
 				Trigger:     "model_decision",
 				Description: desc,
+				Extensions:  skillExts,
 			}
 		}
 		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".md"
@@ -237,6 +443,7 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		fm := windsurfFrontmatter{
 			Trigger:     "model_decision",
 			Description: desc,
+			Extensions:  pluginExtensions(cmd.Extensions, "windsurf"),
 		}
 		fname := "command-" + scopedSkillSlug(cmd.ScopePath, cmd.Name) + ".md"
 		op := plugin.Operation{
@@ -377,11 +584,19 @@ func sourceFromCommand(proj *model.Project, cmd *model.Command) string {
 // windsurfFrontmatter holds the fields renderWindsurfRule emits. Trigger is
 // required for every rule; Globs is required when Trigger == "glob";
 // Description is required when Trigger == "model_decision" and optional
-// otherwise.
+// otherwise. Extensions carries the v2 `extensions.windsurf.*` pass-through
+// payload (SPEC §4.x); when non-empty it is rendered verbatim into the
+// frontmatter under sorted keys.
+//
+// TODO(v0.9, SPEC §2): Windsurf has a 12,000 char per-workflow / per-scope
+// cap on rule bodies (see windsurf.com docs). Phase 2a does not enforce
+// this; a subsequent phase should surface a warn-severity warning when the
+// emitted body exceeds 12000 chars.
 type windsurfFrontmatter struct {
 	Trigger     string
 	Globs       []string
 	Description string
+	Extensions  map[string]any
 }
 
 // renderWindsurfRule formats the YAML frontmatter + markdown body for a
@@ -405,6 +620,26 @@ func renderWindsurfRule(fm windsurfFrontmatter, body string) string {
 		b.WriteString(renderYAMLScalar(fm.Description))
 		b.WriteString("\n")
 	}
+	if len(fm.Extensions) > 0 {
+		// Deterministic key order: sort then emit each as a JSON-flow
+		// scalar. A JSON-encoded value is a valid YAML flow scalar/map,
+		// so this round-trips cleanly through yaml.v3.
+		keys := make([]string, 0, len(fm.Extensions))
+		for k := range fm.Extensions {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			raw, err := json.Marshal(fm.Extensions[k])
+			if err != nil {
+				continue
+			}
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
 	b.WriteString("---\n")
 	if body != "" {
 		b.WriteString(body)
@@ -413,6 +648,26 @@ func renderWindsurfRule(fm windsurfFrontmatter, body string) string {
 		}
 	}
 	return b.String()
+}
+
+// pluginExtensions extracts the `extensions.<name>` sub-map from a
+// canonical primitive's Extensions field and returns it as a map suitable
+// for verbatim emission into a target's frontmatter. Returns nil if the
+// namespace is absent or not a map. Per SPEC §4.x, plugins are expected
+// to surface their own namespace's payload unchanged (no key remapping).
+func pluginExtensions(ext map[string]any, name string) map[string]any {
+	if ext == nil {
+		return nil
+	}
+	sub, ok := ext[name]
+	if !ok {
+		return nil
+	}
+	m, ok := sub.(map[string]any)
+	if !ok || len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // windsurfHookEntry mirrors Windsurf's Cascade Hooks JSON schema for a
@@ -550,14 +805,26 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 	}
 
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" || h.ScriptPath == "" {
+		if h == nil || h.ScriptPath == "" {
 			continue
 		}
-		wsEvent, ok := mapWindsurfEvent(h.Event, h.Matcher)
+		// v2 read (additive, SPEC §4.4.2): fall back to EventCanonical
+		// when the v0.8 Hook.Event string is empty. The parser populates
+		// both shapes; reading both makes the plugin robust to direct-API
+		// callers that only set the typed enum. We strip the optional
+		// "native:" prefix that v2 uses to mark target-specific names.
+		eventName := h.Event
+		if eventName == "" && h.EventCanonical != "" {
+			eventName = strings.TrimPrefix(string(h.EventCanonical), "native:")
+		}
+		if eventName == "" {
+			continue
+		}
+		wsEvent, ok := mapWindsurfEvent(eventName, h.Matcher)
 		if !ok {
-			msg := fmt.Sprintf("Windsurf Cascade Hooks has no event matching %q (matcher=%q); hook not projected.", h.Event, h.Matcher)
+			msg := fmt.Sprintf("Windsurf Cascade Hooks has no event matching %q (matcher=%q); hook not projected.", eventName, h.Matcher)
 			if h.ScopePath != "" {
-				msg = fmt.Sprintf("Windsurf Cascade Hooks has no event matching %q (matcher=%q, scope: %s); hook not projected.", h.Event, h.Matcher, h.ScopePath)
+				msg = fmt.Sprintf("Windsurf Cascade Hooks has no event matching %q (matcher=%q, scope: %s); hook not projected.", eventName, h.Matcher, h.ScopePath)
 			}
 			warnings = append(warnings, plugin.Warning{
 				Source:   h.ScriptPath,
@@ -764,6 +1031,10 @@ func buildWindsurfMCPOp(proj *model.Project) (plugin.Operation, error) {
 		Merger:   merger,
 	}, nil
 }
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *WindsurfPlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that WindsurfPlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*WindsurfPlugin)(nil)

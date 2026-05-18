@@ -50,6 +50,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // CursorPlugin projects Project state into Cursor's `.cursor/` layout.
@@ -88,6 +89,13 @@ func (p *CursorPlugin) Detect(root string) bool {
 // subagents, and hooks (in addition to the long-standing context rules
 // and MCP). Permissions remain without a native primitive; deferring
 // the sandbox-profile generator to v0.8.1.
+//
+// v0.9.0 (Phase 2a): per-field cells are populated under
+// {Agent,Skill,Command,Hook,MCPServer,Permissions,Scope}Fields per
+// SPEC §12 (Cursor column, "cur"). Coarse v0.8 cells preserved for
+// backward compatibility — only NON-native fields are listed (absent =
+// native). Extensions namespaces the plugin reads under
+// `extensions.cursor:` are declared per-primitive.
 func (p *CursorPlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
@@ -99,6 +107,127 @@ func (p *CursorPlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportNative,
 		Permissions:   plugin.SupportUnsupported,
 		MCP:           plugin.SupportNative,
+
+		// SPEC §12 Agent (cur column).
+		AgentFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"ModelFallbacks":   plugin.FieldSilent,
+				"Tools":            plugin.FieldSilent,
+				"DisallowedTools":  plugin.FieldDegraded,
+				"MaxTurns":         plugin.FieldSilent,
+				"Temperature":      plugin.FieldSilent,
+				"MCPServers":       plugin.FieldUnsupported,
+				"AllowedSubagents": plugin.FieldUnsupported,
+				"UserInvocable":    plugin.FieldSilent,
+				"ModelInvocable":   plugin.FieldSilent,
+				"InitialPrompt":    plugin.FieldUnsupported,
+				"ScopePath":        plugin.FieldDegraded,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 Skill (cur column).
+		SkillFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"WhenToUse":                 plugin.FieldDegraded,
+				"Activation.ContentRegex":   plugin.FieldUnsupported,
+				"Activation.UserInvocable":  plugin.FieldSilent,
+				"Activation.ModelInvocable": plugin.FieldSilent,
+				"AllowedTools":              plugin.FieldDegraded,
+				"Arguments":                 plugin.FieldDegraded,
+				"Model":                     plugin.FieldUnsupported,
+				"Subagent":                  plugin.FieldDegraded,
+				"ScopePath":                 plugin.FieldDegraded,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 Command (cur column).
+		CommandFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Description":  plugin.FieldUnsupported,
+				"ArgumentHint": plugin.FieldSilent,
+				"Arguments":    plugin.FieldDegraded,
+				"Model":        plugin.FieldUnsupported,
+				"Tools":        plugin.FieldUnsupported,
+				"Agent":        plugin.FieldDegraded,
+				"AutoInvoke":   plugin.FieldSilent,
+				"ScopePath":    plugin.FieldDegraded,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 Hook (cur column).
+		HookFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":                plugin.FieldSilent,
+				"Description":         plugin.FieldSilent,
+				"Event (Claude-only)": plugin.FieldUnsupported,
+				"Handlers (http)":     plugin.FieldUnsupported,
+				"Handlers (mcp_tool)": plugin.FieldUnsupported,
+				"Handlers (agent)":    plugin.FieldUnsupported,
+				"Sequential":          plugin.FieldSilent,
+				"StatusMessage":       plugin.FieldSilent,
+				"Async":               plugin.FieldUnsupported,
+				"Once":                plugin.FieldUnsupported,
+				"If":                  plugin.FieldUnsupported,
+				"Cwd":                 plugin.FieldSilent,
+				"Env":                 plugin.FieldUnsupported,
+				"Bash + Powershell":   plugin.FieldUnsupported,
+				"ScopePath":           plugin.FieldDegraded,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 MCPServer (cur column).
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Auth.Scheme=oauth": plugin.FieldDegraded,
+				"Cwd":               plugin.FieldSilent,
+				"TimeoutMs":         plugin.FieldUnsupported,
+				"AutoApprove":       plugin.FieldUnsupported,
+				"Trust":             plugin.FieldUnsupported,
+				"IncludeTools":      plugin.FieldUnsupported,
+				"ExcludeTools":      plugin.FieldUnsupported,
+				"ScopePath":         plugin.FieldDegraded,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 Permissions (cur column).
+		// Cursor sandbox has no `ask` bucket; allow/deny degrade.
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Allow (global)":   plugin.FieldDegraded,
+				"Ask (global)":     plugin.FieldUnsupported,
+				"Deny (global)":    plugin.FieldDegraded,
+				"Allow (scoped)":   plugin.FieldUnsupported,
+				"Ask (scoped)":     plugin.FieldUnsupported,
+				"Deny (scoped)":    plugin.FieldUnsupported,
+				"Edit/Read/Write:": plugin.FieldDegraded,
+				"mcp: target":      plugin.FieldUnsupported,
+			},
+			Extensions: []string{"cursor"},
+		},
+
+		// SPEC §12 Scope (cur column).
+		ScopeFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Path (cascade)":     plugin.FieldDegraded,
+				"Activation=Cascade": plugin.FieldDegraded,
+				"Priority":           plugin.FieldDegraded,
+				"Tags":               plugin.FieldSilent,
+				"IsOverride":         plugin.FieldUnsupported,
+			},
+			Extensions: []string{"cursor"},
+		},
 	}
 }
 
@@ -122,8 +251,15 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	var ops []plugin.Operation
 	var warnings []plugin.Warning
 
+	// Phase 2.5 TODO (SPEC §4.1.4 / IMPLEMENTATION_PLAN §7.4): when both
+	// `claude` and `cursor` targets are enabled, Cursor agents should
+	// emit to `.cursor/agents/` only (Cursor reads `.claude/agents/`
+	// directly) and emit a single info warning per project. De-dup logic
+	// + the per-project warning shim live in Phase 2.5 — this plugin
+	// continues to emit unconditionally here.
+
 	if proj.Context != nil {
-		content := renderMDC("Project-wide context", nil, true, proj.Context.Body)
+		content := renderMDC("Project-wide context", nil, true, proj.Context.Body, nil)
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    ".cursor/rules/_root.mdc",
@@ -148,7 +284,7 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			body = sc.Document.Body
 			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
-		content := renderMDC(desc, sc.Globs, false, body)
+		content := renderMDC(desc, sc.Globs, false, body, cursorExtensionKVs(sc.Extensions))
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", slugify(sc.Path)+".mdc")),
@@ -256,7 +392,7 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if h == nil || h.ScopePath == "" || p.DisableHookWrappers {
 			continue
 		}
-		evt := cursorEventName(h.Event)
+		evt := cursorEventName(resolveHookEvent(h))
 		if evt == "" {
 			continue
 		}
@@ -337,6 +473,12 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 // cursorEventName maps a prism Hook.Event to its Cursor 2.4+ event name,
 // or returns "" if the event has no Cursor analog (caller should warn +
 // drop). Cursor-native camelCase names pass through verbatim.
+//
+// v0.9.0 (Phase 2a): when the canonical (string) Event is empty, this
+// also consults the typed EventCanonical enum, since the v2 parser may
+// populate only the canonical form for hooks declared via the v2 shape.
+// String() on HookEvent produces the same casing used by the v0.8
+// switch above.
 func cursorEventName(event string) string {
 	switch event {
 	case "PreToolUse":
@@ -361,6 +503,44 @@ func cursorEventName(event string) string {
 	return ""
 }
 
+// resolveHookEvent picks the effective event string for a hook, preferring
+// the v0.8 Event field but falling back to EventCanonical (v2). Used at
+// every call site that previously read h.Event directly.
+//
+// EventCanonical is snake_case (`pre_tool_use`); the v0.8 Event field is
+// PascalCase (`PreToolUse`). When falling back we map the canonical enum
+// to the equivalent PascalCase string so the cursor event switch above
+// continues to match.
+func resolveHookEvent(h *model.Hook) string {
+	if h == nil {
+		return ""
+	}
+	if h.Event != "" {
+		return h.Event
+	}
+	switch h.EventCanonical {
+	case model.EventPreToolUse:
+		return "PreToolUse"
+	case model.EventPostToolUse:
+		return "PostToolUse"
+	case model.EventSessionStart:
+		return "SessionStart"
+	case model.EventSessionEnd:
+		return "SessionEnd"
+	case model.EventUserPromptSubmit:
+		return "UserPromptSubmit"
+	case model.EventStop:
+		return "Stop"
+	case model.EventSubagentStop:
+		return "SubagentStop"
+	case model.EventPreCompact:
+		return "PreCompact"
+	}
+	// Any other canonical event (or empty) — pass the raw string through;
+	// cursorEventName will drop it if there's no analog.
+	return string(h.EventCanonical)
+}
+
 // hasUsableHooks reports whether any hook in hs will translate to a
 // usable Cursor event (i.e., cursorEventName returns non-empty).
 func hasUsableHooks(hs []*model.Hook) bool {
@@ -368,7 +548,7 @@ func hasUsableHooks(hs []*model.Hook) bool {
 		if h == nil {
 			continue
 		}
-		if cursorEventName(h.Event) != "" {
+		if cursorEventName(resolveHookEvent(h)) != "" {
 			return true
 		}
 	}
@@ -409,14 +589,18 @@ func (p *CursorPlugin) buildHooksOp(proj *model.Project, wrapperPaths map[*model
 	seenSource := map[string]bool{}
 
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		if h == nil {
 			continue
 		}
-		evt := cursorEventName(h.Event)
+		eventStr := resolveHookEvent(h)
+		if eventStr == "" {
+			continue
+		}
+		evt := cursorEventName(eventStr)
 		if evt == "" {
 			warnings = append(warnings, plugin.Warning{
 				Source:   proj.SourceTag(h.ScriptPath),
-				Message:  fmt.Sprintf("Cursor has no analog for hook event %q; dropped.", h.Event),
+				Message:  fmt.Sprintf("Cursor has no analog for hook event %q; dropped.", eventStr),
 				Severity: "info",
 			})
 			continue
@@ -575,7 +759,10 @@ func marshalJSONStable(v any) (string, error) {
 // We use encoding/json to emit the globs array because a JSON array of
 // strings (e.g. `["src/**","docs/**"]`) is also valid YAML flow-style array
 // syntax, and json.Marshal handles escaping for us.
-func renderMDC(description string, globs []string, alwaysApply bool, body string) string {
+//
+// extraKVs are extension keys (e.g. from `extensions.cursor:` on a scope
+// or context primitive) spliced in verbatim after the built-in keys.
+func renderMDC(description string, globs []string, alwaysApply bool, body string, extraKVs [][2]string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if description != "" {
@@ -590,6 +777,12 @@ func renderMDC(description string, globs []string, alwaysApply bool, body string
 	}
 	if alwaysApply {
 		b.WriteString("alwaysApply: true\n")
+	}
+	for _, kv := range extraKVs {
+		b.WriteString(kv[0])
+		b.WriteString(": ")
+		b.WriteString(kv[1])
+		b.WriteString("\n")
 	}
 	b.WriteString("---\n")
 	if body != "" {
@@ -643,9 +836,19 @@ func scopedSkillSlug(scopePath, name string) string {
 // fields, so we re-emit them as YAML frontmatter for Cursor's discovery.
 // Mirrors internal/engine/serialize.go:renderSkillBody (kept inline to
 // avoid a plugins → engine import).
+//
+// v0.9.0 (Phase 2a): additive v2 read — when sk.Globs is empty, fall
+// back to sk.Activation.Globs. Emission shape is unchanged.
+// extensions.cursor entries (if any) are merged into the frontmatter
+// verbatim under their own key/value pairs.
 func renderCursorSkillBody(sk *model.Skill) string {
 	var b strings.Builder
-	hasFM := sk.Description != "" || sk.Trigger != "" || len(sk.Globs) > 0
+	globs := sk.Globs
+	if len(globs) == 0 {
+		globs = sk.Activation.Globs
+	}
+	extKVs := cursorExtensionKVs(sk.Extensions)
+	hasFM := sk.Description != "" || sk.Trigger != "" || len(globs) > 0 || len(extKVs) > 0
 	if hasFM {
 		b.WriteString("---\n")
 		if sk.Description != "" {
@@ -658,9 +861,15 @@ func renderCursorSkillBody(sk *model.Skill) string {
 			b.WriteString(renderYAMLScalar(sk.Trigger))
 			b.WriteString("\n")
 		}
-		if len(sk.Globs) > 0 {
+		if len(globs) > 0 {
 			b.WriteString("globs: ")
-			b.WriteString(renderGlobs(sk.Globs))
+			b.WriteString(renderGlobs(globs))
+			b.WriteString("\n")
+		}
+		for _, kv := range extKVs {
+			b.WriteString(kv[0])
+			b.WriteString(": ")
+			b.WriteString(kv[1])
 			b.WriteString("\n")
 		}
 		b.WriteString("---\n")
@@ -668,3 +877,45 @@ func renderCursorSkillBody(sk *model.Skill) string {
 	b.WriteString(ensureTrailingNewline(sk.Document.Body))
 	return b.String()
 }
+
+// cursorExtensionKVs extracts the `cursor:` extension namespace from a
+// canonical Extensions map (SPEC §4.x.2) and returns sorted (key, YAML
+// scalar) pairs ready to splice into frontmatter. Returns nil when the
+// `cursor` key is absent or not a map.
+//
+// Pass-through is verbatim per Phase 2a: scalars/maps/slices each render
+// via JSON-as-YAML (json.Marshal). Sorting keeps output deterministic.
+func cursorExtensionKVs(ext map[string]any) [][2]string {
+	if len(ext) == 0 {
+		return nil
+	}
+	raw, ok := ext["cursor"]
+	if !ok {
+		return nil
+	}
+	asMap, ok := raw.(map[string]any)
+	if !ok || len(asMap) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(asMap))
+	for k := range asMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][2]string, 0, len(keys))
+	for _, k := range keys {
+		val, err := json.Marshal(asMap[k])
+		if err != nil {
+			continue
+		}
+		out = append(out, [2]string{k, string(val)})
+	}
+	return out
+}
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *CursorPlugin) SchemaVersion() int { return version.SchemaVersion }
+
+// Compile-time check that CursorPlugin satisfies plugin.Plugin.
+var _ plugin.Plugin = (*CursorPlugin)(nil)

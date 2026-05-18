@@ -35,6 +35,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // ContinuePlugin projects Project state into `.continue/rules/*.md`,
@@ -67,9 +68,18 @@ func (p *ContinuePlugin) Detect(root string) bool {
 // description-triggered attachment (ScopeSemantic), invokable prompt files
 // (Commands), permissions.yaml (Permissions), and per-file MCP server
 // configuration. Skills degrade to scoped rule files (no dedicated skill
-// primitive). Agents and Hooks are unsupported.
+// primitive). Agents and Hooks are unsupported in v0.8; the Phase 2.5
+// hooks-native flip is tracked via SPEC §4.4 and
+// `plugins/hooks_claude_shape.go` (Continue's hooks schema is verbatim
+// Claude's).
+//
+// v0.8 coarse cells (Context, ScopePaths, …, MCP) are preserved unchanged
+// so existing engine paths keep working. v2 per-field FieldCapabilities
+// follow SPEC §12 — Continue column (`con`); fields not listed default to
+// FieldNative per the engine fallback.
 func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
+		// v0.8 coarse fields — unchanged.
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
 		ScopeSemantic: plugin.SupportNative,
@@ -79,6 +89,150 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportUnsupported,
 		Permissions:   plugin.SupportNative, // .continue/permissions.yaml (project-local override)
 		MCP:           plugin.SupportNative,
+
+		// v2 per-field cells (SPEC §12, Continue column). Each block's
+		// Extensions list names the plugin's `extensions.<name>:` keyspace.
+		AgentFields: plugin.FieldCapabilities{
+			Supported: false, // Continue has no subagent primitive.
+			Fields: map[string]plugin.FieldSupport{
+				"Name":             plugin.FieldDegraded,
+				"Description":      plugin.FieldUnsupported,
+				"SystemPrompt":     plugin.FieldDegraded,
+				"Model":            plugin.FieldDegraded,
+				"ModelFallbacks":   plugin.FieldSilent,
+				"Tools":            plugin.FieldUnsupported,
+				"DisallowedTools":  plugin.FieldUnsupported,
+				"ReadOnly":         plugin.FieldUnsupported,
+				"Background":       plugin.FieldUnsupported,
+				"MaxTurns":         plugin.FieldUnsupported,
+				"Temperature":      plugin.FieldDegraded,
+				"MCPServers":       plugin.FieldDegraded,
+				"AllowedSubagents": plugin.FieldUnsupported,
+				"UserInvocable":    plugin.FieldUnsupported,
+				"ModelInvocable":   plugin.FieldUnsupported,
+				"InitialPrompt":    plugin.FieldUnsupported,
+				"ScopePath":        plugin.FieldUnsupported,
+			},
+			Extensions: []string{p.Name()},
+		},
+		SkillFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":                      plugin.FieldNative,
+				"Description":               plugin.FieldNative,
+				"WhenToUse":                 plugin.FieldDegraded,
+				"Activation.Modes.Always":   plugin.FieldNative,
+				"Activation.Modes.ModelDec": plugin.FieldNative,
+				"Activation.Modes.Glob":     plugin.FieldNative,
+				"Activation.Modes.Manual":   plugin.FieldNative,
+				"Activation.Globs":          plugin.FieldNative,
+				"Activation.ContentRegex":   plugin.FieldNative,
+				"Activation.UserInvocable":  plugin.FieldSilent,
+				"Activation.ModelInvocable": plugin.FieldSilent,
+				"AllowedTools":              plugin.FieldUnsupported,
+				"Arguments":                 plugin.FieldDegraded,
+				"Scripts":                   plugin.FieldUnsupported,
+				"References":                plugin.FieldUnsupported,
+				"Model":                     plugin.FieldUnsupported,
+				"Subagent":                  plugin.FieldUnsupported,
+				"ScopePath":                 plugin.FieldUnsupported,
+			},
+			Extensions: []string{p.Name()},
+		},
+		CommandFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":         plugin.FieldNative,
+				"Description":  plugin.FieldNative,
+				"ArgumentHint": plugin.FieldSilent,
+				"Arguments":    plugin.FieldDegraded,
+				"Model":        plugin.FieldNative,
+				"Tools":        plugin.FieldUnsupported,
+				"Agent":        plugin.FieldUnsupported,
+				"AutoInvoke":   plugin.FieldSilent,
+				"ScopePath":    plugin.FieldDegraded,
+			},
+			Extensions: []string{p.Name()},
+		},
+		// HookFields: Continue's hooks schema is verbatim Claude's
+		// (SPEC §4.4); per IMPLEMENTATION_PLAN.md Phase 2.5 the flip to
+		// native uses plugins/hooks_claude_shape.go.
+		// TODO(Phase 2.5): once hooks_claude_shape.go is wired in,
+		// populate the per-field cells per SPEC §12 (Continue Hook column —
+		// most fields N) and flip Supported true. For now Continue
+		// declares hooks unsupported across the board so callers see
+		// honest degradation warnings.
+		HookFields: plugin.FieldCapabilities{
+			Supported: false,
+			Fields: map[string]plugin.FieldSupport{
+				"*": plugin.FieldUnsupported,
+			},
+			Extensions: []string{p.Name()},
+		},
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldNative,
+				"Transport.stdio":    plugin.FieldNative,
+				"Transport.http":    plugin.FieldNative,
+				"Transport.sse":     plugin.FieldDegraded,
+				"Command":            plugin.FieldNative,
+				"Args":               plugin.FieldNative,
+				"Env":                plugin.FieldNative,
+				"Cwd":                plugin.FieldNative,
+				"URL":                plugin.FieldNative,
+				"Headers":            plugin.FieldNative,
+				"Auth.Scheme.bearer": plugin.FieldNative,
+				"Auth.Scheme.header": plugin.FieldNative,
+				"Auth.Scheme.oauth":  plugin.FieldDegraded,
+				"TimeoutMs":          plugin.FieldUnsupported,
+				"Disabled":           plugin.FieldNative,
+				"AutoApprove":        plugin.FieldUnsupported,
+				"Trust":              plugin.FieldUnsupported,
+				"IncludeTools":       plugin.FieldUnsupported,
+				"ExcludeTools":       plugin.FieldUnsupported,
+				"ScopePath":          plugin.FieldDegraded,
+			},
+			Extensions: []string{p.Name()},
+		},
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Allow.global":         plugin.FieldNative,
+				"Ask.global":           plugin.FieldNative,
+				"Deny.global":          plugin.FieldNative, // spelled `exclude` in Continue
+				"Allow.scoped":         plugin.FieldDegraded,
+				"Ask.scoped":           plugin.FieldDegraded,
+				"Deny.scoped":          plugin.FieldDegraded,
+				"target.bash":          plugin.FieldNative,
+				"target.editReadWrite": plugin.FieldNative,
+				"target.fs":            plugin.FieldDegraded,
+				"target.network":      plugin.FieldDegraded,
+				"target.mcp":           plugin.FieldDegraded,
+				"glob.recursive":       plugin.FieldDegraded,
+				"glob.negation":        plugin.FieldDegraded,
+			},
+			Extensions: []string{p.Name()},
+		},
+		ScopeFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Path.cascade":        plugin.FieldDegraded,
+				"Path.empty":          plugin.FieldNative,
+				"Name":                plugin.FieldNative,
+				"Description":         plugin.FieldNative,
+				"Globs":               plugin.FieldNative,
+				"Activation.Always":   plugin.FieldNative,
+				"Activation.Cascade":  plugin.FieldDegraded,
+				"Activation.Glob":     plugin.FieldNative,
+				"Activation.Manual":   plugin.FieldUnsupported,
+				"Activation.ModelDec": plugin.FieldNative,
+				"Priority":            plugin.FieldNative, // lexicographic filename order
+				"Tags":                plugin.FieldSilent,
+				"IsOverride":          plugin.FieldUnsupported,
+			},
+			Extensions: []string{p.Name()},
+		},
 	}
 }
 
@@ -103,7 +257,8 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 
 	// Root context → .continue/rules/_root.md with alwaysApply: true.
 	if proj.Context != nil {
-		content := renderContinueRule("Project-wide context", nil, true, proj.Context.Body)
+		// Root context has no Extensions slot on Document; pass nil.
+		content := renderContinueRule("Project-wide context", nil, true, proj.Context.Body, nil)
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    ".continue/rules/_root.md",
@@ -129,7 +284,9 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = sc.Document.Body
 			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
-		content := renderContinueRule(desc, sc.Globs, false, body)
+		// extensions.continue.* passthrough (SPEC §5.1, §12 Extensions=N).
+		extra := continueExtensions(sc.Extensions)
+		content := renderContinueRule(desc, sc.Globs, false, body, extra)
 		ops = append(ops, plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", slugify(sc.Path)+".md")),
@@ -159,7 +316,17 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			body = skill.Document.Body
 			sources = []string{proj.SourceTag(skill.Document.SourcePath)}
 		}
-		content := renderContinueRule(desc, skill.Globs, false, body)
+		// v2 additive read: fall back to Activation.Globs when the v0.8
+		// flat Globs is empty (SPEC §4.2.2). The parser populates both,
+		// but downstream test fixtures may only set one form; reading
+		// either preserves backwards compatibility.
+		globs := skill.Globs
+		if len(globs) == 0 {
+			globs = skill.Activation.Globs
+		}
+		// extensions.continue.* passthrough.
+		extra := continueExtensions(skill.Extensions)
+		content := renderContinueRule(desc, globs, false, body, extra)
 		fname := "skill-" + scopedSkillSlug(skill.ScopePath, skill.Name) + ".md"
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
@@ -214,10 +381,12 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		} else {
 			fname = skillSlug(cmd.Name) + ".md"
 		}
+		// extensions.continue.* passthrough.
+		extra := continueExtensions(cmd.Extensions)
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".continue", "prompts", fname)),
-			Content: renderContinuePrompt(cmd.Name, desc, body),
+			Content: renderContinuePrompt(cmd.Name, desc, body, extra),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
@@ -261,9 +430,17 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if h == nil {
 			continue
 		}
-		msg := fmt.Sprintf("Continue has no hook primitive; %s:%s not projected", h.Event, h.Matcher)
+		// v2 additive read: prefer the v0.8 Event string but fall back
+		// to EventCanonical (typed enum, SPEC §4.4.2) when Event is
+		// empty. The parser populates both in v2 emissions; older
+		// fixtures may only set one.
+		eventName := h.Event
+		if eventName == "" {
+			eventName = string(h.EventCanonical)
+		}
+		msg := fmt.Sprintf("Continue has no hook primitive; %s:%s not projected", eventName, h.Matcher)
 		if h.ScopePath != "" {
-			msg = fmt.Sprintf("Continue has no hook primitive; scoped hook %s:%s (scope: %s) not projected", h.Event, h.Matcher, h.ScopePath)
+			msg = fmt.Sprintf("Continue has no hook primitive; scoped hook %s:%s (scope: %s) not projected", eventName, h.Matcher, h.ScopePath)
 		}
 		warnings = append(warnings, plugin.Warning{
 			Source:   h.ScriptPath,
@@ -531,7 +708,11 @@ func hasUntranslatableGlob(pattern string) bool {
 // the prompt body. The encoding/json shim is used to escape the
 // description and name strings safely (JSON strings are valid YAML
 // scalars, including the colon-in-description case).
-func renderContinuePrompt(name, description, body string) string {
+//
+// extra is the verbatim `extensions.continue.*` map (typically nil); when
+// non-empty its keys are appended to the frontmatter after the canonical
+// keys. Plugin-namespaced pass-through per SPEC §5.1.
+func renderContinuePrompt(name, description, body string, extra map[string]any) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if name != "" {
@@ -545,6 +726,7 @@ func renderContinuePrompt(name, description, body string) string {
 		b.WriteString("\n")
 	}
 	b.WriteString("invokable: true\n")
+	writeExtensionsYAML(&b, extra)
 	b.WriteString("---\n")
 	if body != "" {
 		b.WriteString(body)
@@ -626,7 +808,11 @@ func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operati
 //
 // The globs field is rendered via encoding/json — a JSON array of strings is
 // also valid YAML flow-array syntax, and json.Marshal handles escaping.
-func renderContinueRule(description string, globs []string, alwaysApply bool, body string) string {
+//
+// extra is the verbatim `extensions.continue.*` map (typically nil); when
+// non-empty its keys are appended to the frontmatter after the canonical
+// keys. Plugin-namespaced pass-through per SPEC §5.1.
+func renderContinueRule(description string, globs []string, alwaysApply bool, body string, extra map[string]any) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if description != "" {
@@ -642,6 +828,7 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 	if alwaysApply {
 		b.WriteString("alwaysApply: true\n")
 	}
+	writeExtensionsYAML(&b, extra)
 	b.WriteString("---\n")
 	if body != "" {
 		b.WriteString(body)
@@ -651,6 +838,69 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 	}
 	return b.String()
 }
+
+// continueExtensions extracts the `extensions.continue` block from a
+// primitive's Extensions map (SPEC §5.1). Returns nil when absent or
+// when the value isn't a map. Other extension namespaces are dropped
+// silently — they belong to other plugins.
+func continueExtensions(ext map[string]any) map[string]any {
+	if ext == nil {
+		return nil
+	}
+	raw, ok := ext["continue"]
+	if !ok {
+		return nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		// `extensions.continue:` was provided but isn't a map; treat as
+		// nothing-to-passthrough rather than crashing the emit.
+		return nil
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// writeExtensionsYAML appends extension pass-through keys to a YAML
+// frontmatter builder. Keys are emitted in sorted order for deterministic
+// output. Values are marshaled via yaml.v3 so nested maps, lists, and
+// scalars all round-trip without manual escaping.
+//
+// TODO(Phase 2.5, SPEC §4.5.3): Continue's `${env:VAR}` rewrite is
+// `${{ secrets.VAR }}` plus a one-per-server info warning ("value must
+// live in Continue secrets store, not just shell env"). The rewrite is
+// applied to MCP fields (command/args/env/url/headers) at emit; this
+// rule-frontmatter passthrough currently emits values verbatim. Wire
+// up the rewrite + warning in the MCP emit path during the Phase 2.5
+// sweep; for now extension blobs round-trip unchanged.
+func writeExtensionsYAML(b *strings.Builder, extra map[string]any) {
+	if len(extra) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		// Marshal the single key→value pair so yaml.v3 handles quoting,
+		// indentation, and nested types. Trim the trailing newline so
+		// our own "\n" terminator is uniform.
+		out, err := yaml.Marshal(map[string]any{k: extra[k]})
+		if err != nil {
+			// Defensive: skip malformed values rather than failing the
+			// whole emit. Should never trigger for parser-produced maps.
+			continue
+		}
+		b.Write(out)
+	}
+}
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *ContinuePlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that ContinuePlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*ContinuePlugin)(nil)

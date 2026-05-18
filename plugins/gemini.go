@@ -12,6 +12,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // GeminiPlugin projects a model.Project into Gemini CLI's on-disk layout:
@@ -58,6 +59,11 @@ func (p *GeminiPlugin) Detect(root string) bool {
 }
 
 // Capabilities returns the capability matrix entry for Gemini CLI.
+//
+// Per-field declarations match SPEC §12 (Gemini column, "gem"). v0.8 coarse
+// cells are preserved for back-compat; v2 FieldCapabilities maps reflect
+// the per-field tier for every non-native cell in the spec. Fields not
+// listed in a map default to FieldNative.
 func (p *GeminiPlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
@@ -71,6 +77,126 @@ func (p *GeminiPlugin) Capabilities() plugin.Capabilities {
 		Hooks:       plugin.SupportNative, // settings.json hooks block
 		Permissions: plugin.SupportNative, // via prism perms-guard wrapper + sidecar policy
 		MCP:         plugin.SupportNative,
+
+		// SPEC §12 Agent / gem column.
+		AgentFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"DisallowedTools":  plugin.FieldDegraded,
+				"ReadOnly":         plugin.FieldDegraded,
+				"Background":       plugin.FieldSilent,
+				"ModelFallbacks":   plugin.FieldSilent,
+				"AllowedSubagents": plugin.FieldUnsupported,
+				"UserInvocable":    plugin.FieldSilent,
+				"ModelInvocable":   plugin.FieldSilent,
+				"InitialPrompt":    plugin.FieldUnsupported,
+				"ScopePath":        plugin.FieldDegraded,
+			},
+		},
+
+		// SPEC §12 Skill / gem column. Globs / ContentRegex and the
+		// "Always" / "Glob" activation modes are unsupported on Gemini
+		// (skills project as agents without auto-trigger).
+		SkillFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"WhenToUse":                 plugin.FieldDegraded,
+				"Activation.Modes.Always":   plugin.FieldUnsupported,
+				"Activation.Modes.Glob":     plugin.FieldUnsupported,
+				"Activation.Globs":          plugin.FieldUnsupported,
+				"Activation.ContentRegex":   plugin.FieldUnsupported,
+				"Activation.UserInvocable":  plugin.FieldSilent,
+				"Activation.ModelInvocable": plugin.FieldSilent,
+				"AllowedTools":              plugin.FieldUnsupported,
+				"Arguments":                 plugin.FieldDegraded,
+				"Model":                     plugin.FieldUnsupported,
+				"Subagent":                  plugin.FieldUnsupported,
+				"ScopePath":                 plugin.FieldDegraded,
+			},
+		},
+
+		// SPEC §12 Command / gem column.
+		CommandFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"ArgumentHint": plugin.FieldSilent,
+				"Arguments":    plugin.FieldDegraded,
+				"Model":        plugin.FieldUnsupported,
+				"Tools":        plugin.FieldUnsupported,
+				"Agent":        plugin.FieldUnsupported,
+				"AutoInvoke":   plugin.FieldSilent,
+				"ScopePath":    plugin.FieldDegraded,
+			},
+		},
+
+		// SPEC §12 Hook / gem column. Claude-only events (PreCompact,
+		// SessionResume, …) are unsupported; the per-action canonical
+		// events (PreShell, PostFileEdit, …) translate to BeforeTool +
+		// matcher via hook_envelope.MapHookEventFor — see Plan() TODO.
+		HookFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"Event.ClaudeOnly":  plugin.FieldUnsupported,
+				"Handlers.http":     plugin.FieldUnsupported,
+				"Handlers.mcp_tool": plugin.FieldUnsupported,
+				"Handlers.prompt":   plugin.FieldUnsupported,
+				"Handlers.agent":    plugin.FieldUnsupported,
+				"StatusMessage":     plugin.FieldSilent,
+				"Async":             plugin.FieldUnsupported,
+				"FailClosed":        plugin.FieldUnsupported,
+				"Once":              plugin.FieldUnsupported,
+				"If":                plugin.FieldUnsupported,
+				"Cwd":               plugin.FieldSilent,
+				"Env":               plugin.FieldUnsupported,
+				"Bash+Powershell":   plugin.FieldUnsupported,
+				// ScopePath is native via the scope-guard wrapper family
+				// (SPEC §12 footnote ¹).
+			},
+		},
+
+		// SPEC §12 MCPServer / gem column. Most fields are native;
+		// AutoApprove and oauth auth degrade; ScopePath degrades.
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"Auth.Scheme.oauth": plugin.FieldDegraded,
+				"AutoApprove":       plugin.FieldDegraded,
+				"ScopePath":         plugin.FieldDegraded,
+			},
+		},
+
+		// SPEC §12 Permissions / gem column — all native via the
+		// perms-guard sidecar (footnote ¹).
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields:     map[string]plugin.FieldSupport{},
+		},
+
+		// SPEC §12 Scope / gem column. Globs / glob-based activation
+		// have no Gemini analog; Name degrades, Description / Tags
+		// drop silently, Priority synthesizes as cascade depth.
+		ScopeFields: plugin.FieldCapabilities{
+			Supported:  true,
+			Extensions: []string{"gemini"},
+			Fields: map[string]plugin.FieldSupport{
+				"Name":                     plugin.FieldDegraded,
+				"Description":              plugin.FieldSilent,
+				"Globs":                    plugin.FieldUnsupported,
+				"Activation.Always":        plugin.FieldDegraded,
+				"Activation.Glob":          plugin.FieldUnsupported,
+				"Activation.Manual":        plugin.FieldUnsupported,
+				"Activation.ModelDecision": plugin.FieldUnsupported,
+				"Priority":                 plugin.FieldDegraded,
+				"Tags":                     plugin.FieldSilent,
+				"IsOverride":               plugin.FieldUnsupported,
+			},
+		},
 	}
 }
 
@@ -166,7 +292,7 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			body = ag.Document.Body
 			srcTag = proj.SourceTag(ag.Document.SourcePath)
 		}
-		content := renderGeminiAgent(ag.Name, ag.Description, body)
+		content := renderGeminiAgent(ag.Name, ag.Description, body, geminiExtensions(ag.Extensions))
 		sources := []string{}
 		if srcTag != "" {
 			sources = append(sources, srcTag)
@@ -213,14 +339,21 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 				desc = "trigger: " + sk.Trigger
 			}
 		}
-		if len(sk.Globs) > 0 {
+		// v2 additive read: prefer the v0.8 slice if populated, fall back
+		// to Activation.Globs (SPEC §4.2.2). Either source projects into
+		// the description string — the emission shape is unchanged.
+		globs := sk.Globs
+		if len(globs) == 0 && len(sk.Activation.Globs) > 0 {
+			globs = sk.Activation.Globs
+		}
+		if len(globs) > 0 {
 			if desc != "" {
-				desc = desc + " (globs: " + strings.Join(sk.Globs, ", ") + ")"
+				desc = desc + " (globs: " + strings.Join(globs, ", ") + ")"
 			} else {
-				desc = "globs: " + strings.Join(sk.Globs, ", ")
+				desc = "globs: " + strings.Join(globs, ", ")
 			}
 		}
-		content := renderGeminiAgent(sk.Name, desc, body)
+		content := renderGeminiAgent(sk.Name, desc, body, geminiExtensions(sk.Extensions))
 		sources := []string{}
 		if srcTag != "" {
 			sources = append(sources, srcTag)
@@ -266,7 +399,7 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			body = cmd.Document.Body
 			srcTag = proj.SourceTag(cmd.Document.SourcePath)
 		}
-		content := renderGeminiCommand(cmd.Description, body)
+		content := renderGeminiCommand(cmd.Description, body, geminiExtensions(cmd.Extensions))
 		sources := []string{}
 		if srcTag != "" {
 			sources = append(sources, srcTag)
@@ -300,7 +433,19 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			continue
 		}
 		hookBase := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
-		mappedEvent := mapGeminiHookEvent(h.Event)
+		// v2 additive read: prefer canonical event when v0.8 is empty
+		// (SPEC §4.4.2). Emission shape unchanged — both feed the same
+		// mapGeminiHookEvent lookup.
+		// TODO(prism v0.9): replace mapGeminiHookEvent with
+		// MapHookEventFor("gemini", h.EventCanonical) so per-action
+		// canonical events (PreShell, PostFileEdit, …) translate to
+		// BeforeTool + matcher form. Translation table lives in
+		// plugins/hook_envelope.go. See SPEC §4.4.4.
+		rawEvent := h.Event
+		if rawEvent == "" && h.EventCanonical != "" {
+			rawEvent = string(h.EventCanonical)
+		}
+		mappedEvent := mapGeminiHookEvent(rawEvent)
 		wrapperFile := scopeSlug(h.ScopePath) + "-" + mappedEvent + "-" + hookBase + ".sh"
 		wrapperRel := filepath.Join(".gemini", "hooks", "__scope-guard__", wrapperFile)
 
@@ -409,7 +554,15 @@ func buildGeminiContextOp(proj *model.Project, doc *model.Document, targetPath s
 // fields (tools, model, temperature, max_turns, max_timeout) are omitted
 // when the canonical model doesn't carry them so the projected file
 // inherits Gemini's defaults.
-func renderGeminiAgent(name, description, body string) string {
+//
+// extensions is the verbatim `extensions.gemini.*` map from the canonical
+// primitive (Agent.Extensions["gemini"] or Skill.Extensions["gemini"]).
+// When non-nil and non-empty, each top-level key is emitted as a YAML
+// frontmatter entry below name/description. Reserved keys (name,
+// description) are dropped to prevent the passthrough from clobbering
+// canonical fields. Values are serialized via json.Marshal which is also
+// a valid YAML flow form.
+func renderGeminiAgent(name, description, body string, extensions map[string]any) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if name != "" {
@@ -422,6 +575,26 @@ func renderGeminiAgent(name, description, body string) string {
 		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
 	}
+	if len(extensions) > 0 {
+		keys := make([]string, 0, len(extensions))
+		for k := range extensions {
+			if k == "name" || k == "description" {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			raw, err := json.Marshal(extensions[k])
+			if err != nil {
+				continue
+			}
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
 	b.WriteString("---\n")
 	if body != "" {
 		b.WriteString(body)
@@ -432,15 +605,58 @@ func renderGeminiAgent(name, description, body string) string {
 	return b.String()
 }
 
+// geminiExtensions returns the `gemini` extension sub-map from a
+// canonical Extensions map, or nil. Supports both `map[string]any` (the
+// typical YAML parse shape) and the rare interface{} variant.
+func geminiExtensions(ext map[string]any) map[string]any {
+	if ext == nil {
+		return nil
+	}
+	raw, ok := ext["gemini"]
+	if !ok || raw == nil {
+		return nil
+	}
+	if m, ok := raw.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
 // renderGeminiCommand renders a slash-command TOML file. Minimal schema:
 // description + prompt as triple-quoted multi-line string. Triple-quote
 // sequences inside the body are escaped to prevent premature termination.
-func renderGeminiCommand(description, body string) string {
+//
+// extensions is the verbatim `extensions.gemini.*` map from the canonical
+// Command primitive. When non-nil and non-empty, each top-level key is
+// emitted as a TOML key/value below description (and above prompt) using
+// JSON encoding for the value — JSON scalars/arrays/objects are valid
+// TOML inline syntax. Reserved keys (description, prompt) are dropped.
+func renderGeminiCommand(description, body string, extensions map[string]any) string {
 	var b strings.Builder
 	if description != "" {
 		b.WriteString("description = ")
 		b.WriteString(renderYAMLScalar(description))
 		b.WriteString("\n")
+	}
+	if len(extensions) > 0 {
+		keys := make([]string, 0, len(extensions))
+		for k := range extensions {
+			if k == "description" || k == "prompt" {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			raw, err := json.Marshal(extensions[k])
+			if err != nil {
+				continue
+			}
+			b.WriteString(k)
+			b.WriteString(" = ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
 	}
 	b.WriteString("prompt = \"\"\"\n")
 	b.WriteString(sanitizeTOMLTripleQuoted(body))
@@ -534,10 +750,19 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 	buckets := map[string][]pendingHook{}
 	eventOrder := []string{}
 	for _, h := range proj.Hooks {
-		if h == nil || h.Event == "" {
+		if h == nil {
 			continue
 		}
-		mappedEvent := mapGeminiHookEvent(h.Event)
+		// v2 additive read: fall back to EventCanonical when the v0.8
+		// Event slot is empty. Emission shape unchanged.
+		rawEvent := h.Event
+		if rawEvent == "" && h.EventCanonical != "" {
+			rawEvent = string(h.EventCanonical)
+		}
+		if rawEvent == "" {
+			continue
+		}
+		mappedEvent := mapGeminiHookEvent(rawEvent)
 		if _, ok := buckets[mappedEvent]; !ok {
 			eventOrder = append(eventOrder, mappedEvent)
 		}
@@ -649,6 +874,10 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 		Merger:  merger,
 	}, nil
 }
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *GeminiPlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that GeminiPlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*GeminiPlugin)(nil)

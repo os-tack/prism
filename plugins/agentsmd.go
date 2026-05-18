@@ -7,6 +7,7 @@ import (
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/plugin"
+	"agents.dev/agents/internal/version"
 )
 
 // AgentsMDPlugin projects a model.Project into a single AGENTS.md file at the
@@ -44,13 +45,50 @@ func (p *AgentsMDPlugin) Detect(root string) bool {
 
 // Capabilities returns the capability matrix entry for AGENTS.md.
 //
-// Everything beyond Context is degraded: scopes lose enforcement (loaded
-// always), and skills/commands/agents/hooks/permissions/MCP are all rendered
-// as informational text. The text is preserved faithfully, but the runtime
-// semantics — script execution, command invocation, hook firing, permission
-// enforcement, MCP wiring — cannot be reproduced by AGENTS.md alone.
+// Coarse v0.8 cells (kept for backward compatibility): everything beyond
+// Context is degraded — scopes lose enforcement (loaded always), and
+// skills/commands/agents/hooks/permissions/MCP are all rendered as
+// informational text where they have any presence at all.
+//
+// v2 per-field cells (SPEC §12 AGENTS.md column, `agm`): refined to match
+// what AGENTS.md actually projects.
+//
+//   - Skills:      ALL silent — AGENTS.md describes skill prose but the
+//     individual fields (Name/Description/Activation/...)
+//     have no AGENTS.md-side semantic to map onto. The
+//     whole primitive is dropped at the semantic layer
+//     (text body survives, but is unparseable as a skill).
+//     Supported=false; "*"=FieldSilent.
+//   - MCPServer:   ALL unsupported — AGENTS.md cannot wire MCP at all.
+//     Supported=false; "*"=FieldUnsupported.
+//   - Hooks:       ALL unsupported — AGENTS.md cannot execute hooks.
+//     Supported=false; "*"=FieldUnsupported.
+//   - Agent:       mostly unsupported, except SystemPrompt (degraded —
+//     body prose) and Extensions[plugin] (native pass-through).
+//   - Command:     Name/Description/ScopePath degraded (rendered as text);
+//     all other invocation-shape fields silent;
+//     Extensions[plugin] native.
+//   - Permissions: all buckets and targets degraded (informational text
+//     only); Extensions[plugin] native.
+//   - Scope:       Path cascade native (the only plugin that nests
+//     AGENTS.md per directory); Name/Description/Priority/
+//     Tags degraded; Globs and non-cascade activation modes
+//     unsupported; IsOverride native (the only plugin that
+//     round-trips AGENTS.override.md). Tags is degraded —
+//     surfaced as a sub-heading per SPEC §12 footnote 8.
+//
+// Extensions: lists "agentsmd" as the namespace this plugin owns under
+// `extensions.<name>:`. AGENTS.md v0.9 has no frontmatter, so the
+// passthrough is currently a no-op — v1.1 (SPEC §4.7.4 last row) will
+// add frontmatter for Tags and Description, at which point this
+// namespace will start emitting data.
 func (p *AgentsMDPlugin) Capabilities() plugin.Capabilities {
+	const ext = "agentsmd"
+
 	return plugin.Capabilities{
+		// v0.8 coarse cells — unchanged from prior shape so existing
+		// callers and the existing test continue to observe the same
+		// values.
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportDegraded, // becomes documented sections; loaded always
 		ScopeSemantic: plugin.SupportDegraded,
@@ -60,6 +98,108 @@ func (p *AgentsMDPlugin) Capabilities() plugin.Capabilities {
 		Hooks:         plugin.SupportDegraded,
 		Permissions:   plugin.SupportDegraded,
 		MCP:           plugin.SupportDegraded,
+
+		// v2 per-field cells (SPEC §12 AGENTS.md column).
+
+		// Skill: whole primitive silent.
+		SkillFields: plugin.FieldCapabilities{
+			Supported:  false,
+			Fields:     map[string]plugin.FieldSupport{"*": plugin.FieldSilent},
+			Extensions: []string{ext},
+		},
+
+		// MCPServer: whole primitive unsupported.
+		MCPServerFields: plugin.FieldCapabilities{
+			Supported:  false,
+			Fields:     map[string]plugin.FieldSupport{"*": plugin.FieldUnsupported},
+			Extensions: []string{ext},
+		},
+
+		// Hook: whole primitive unsupported.
+		HookFields: plugin.FieldCapabilities{
+			Supported:  false,
+			Fields:     map[string]plugin.FieldSupport{"*": plugin.FieldUnsupported},
+			Extensions: []string{ext},
+		},
+
+		// Agent: mostly unsupported; SystemPrompt degrades to prose;
+		// Extensions native (round-trips opaque blob).
+		AgentFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"*":                  plugin.FieldUnsupported,
+				"SystemPrompt":       plugin.FieldDegraded,
+				"ScopePath":          plugin.FieldUnsupported,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{ext},
+		},
+
+		// Command: Name/Description/ScopePath rendered as text;
+		// invocation-shape fields silent; Extensions native.
+		CommandFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Name":               plugin.FieldDegraded,
+				"Description":        plugin.FieldDegraded,
+				"ArgumentHint":       plugin.FieldSilent,
+				"Arguments":          plugin.FieldSilent,
+				"Model":              plugin.FieldSilent,
+				"Tools":              plugin.FieldSilent,
+				"Agent":              plugin.FieldSilent,
+				"AutoInvoke":         plugin.FieldSilent,
+				"ScopePath":          plugin.FieldDegraded,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{ext},
+		},
+
+		// Permissions: every bucket and target is degraded (text only);
+		// Extensions native.
+		PermissionsFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Allow":              plugin.FieldDegraded,
+				"Deny":               plugin.FieldDegraded,
+				"Ask":                plugin.FieldDegraded,
+				"AllowScoped":        plugin.FieldDegraded,
+				"DenyScoped":         plugin.FieldDegraded,
+				"AskScoped":          plugin.FieldDegraded,
+				"bash":               plugin.FieldDegraded,
+				"Edit/Read/Write":    plugin.FieldDegraded,
+				"fs":                 plugin.FieldDegraded,
+				"network":            plugin.FieldDegraded,
+				"mcp":                plugin.FieldDegraded,
+				"**":                 plugin.FieldDegraded,
+				"!":                  plugin.FieldDegraded,
+				"Extensions[plugin]": plugin.FieldNative,
+			},
+			Extensions: []string{ext},
+		},
+
+		// Scope: cascade native; IsOverride native (round-trips to
+		// AGENTS.override.md); descriptive metadata degraded; globs and
+		// non-cascade activation modes unsupported.
+		ScopeFields: plugin.FieldCapabilities{
+			Supported: true,
+			Fields: map[string]plugin.FieldSupport{
+				"Path":                 plugin.FieldNative,
+				"Path==\"\"":           plugin.FieldNative,
+				"Name":                 plugin.FieldDegraded,
+				"Description":          plugin.FieldDegraded,
+				"Globs":                plugin.FieldUnsupported,
+				"Activation=Always":    plugin.FieldDegraded,
+				"Activation=Cascade":   plugin.FieldNative,
+				"Activation=Glob":      plugin.FieldUnsupported,
+				"Activation=Manual":    plugin.FieldUnsupported,
+				"Activation=ModelDec.": plugin.FieldUnsupported,
+				"Priority":             plugin.FieldDegraded,
+				"Tags":                 plugin.FieldDegraded,
+				"IsOverride":           plugin.FieldNative,
+				"Extensions[plugin]":   plugin.FieldNative,
+			},
+			Extensions: []string{ext},
+		},
 	}
 }
 
@@ -132,10 +272,19 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		// Trigger + description blockquote. Always include the triggers line
 		// (even with empty globs list) so the section shape is predictable;
 		// description is optional on its own line.
+		//
+		// v2 additive read: when the v0.8 Description is empty but the v2
+		// Scope.Name is set (SPEC §4.7.2), use Name as the description
+		// fallback. Strictly additive — existing v0.8 sources with non-empty
+		// Description observe identical output.
 		b.WriteString("> Triggers: ")
 		b.WriteString(strings.Join(sc.Globs, ", "))
 		b.WriteString("\n")
-		if desc := strings.TrimSpace(sc.Description); desc != "" {
+		desc := strings.TrimSpace(sc.Description)
+		if desc == "" {
+			desc = strings.TrimSpace(sc.Name)
+		}
+		if desc != "" {
 			b.WriteString("> ")
 			b.WriteString(desc)
 			b.WriteString("\n")
@@ -159,6 +308,19 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Message:  "loaded always — AGENTS.md has no scope enforcement",
 			Severity: "info",
 		})
+
+		// v2 additive read: surface IsOverride (SPEC §4.7.2 / §12 — agm is
+		// the only plugin that round-trips this natively via
+		// AGENTS.override.md). Emission as a separate file is deferred;
+		// for Phase 2a we surface a warning so downstream tooling can
+		// detect the canonical intent without an emission-shape change.
+		if sc.IsOverride {
+			warnings = append(warnings, plugin.Warning{
+				Source:   src,
+				Message:  "v2 IsOverride detected — canonical AGENTS.override.md round-trip not yet emitted (Phase 2a additive read only).",
+				Severity: "info",
+			})
+		}
 	}
 
 	// 3. Skills (global only — scoped skills go under their per-scope
@@ -302,14 +464,27 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			}
 			b.WriteString("\n")
 
+			// v2 additive read: when the v0.8 Document body is empty (or
+			// the Document is nil) but the canonical v2 Agent.SystemPrompt
+			// is set, render SystemPrompt as the body. Strictly additive —
+			// SPEC §12 marks SystemPrompt as D for agm and existing v0.8
+			// sources with non-empty Document.Body see identical output.
+			rendered := false
 			if a.Document != nil {
 				body := strings.TrimSpace(a.Document.Body)
 				if body != "" {
 					b.WriteString(body)
 					b.WriteString("\n\n")
+					rendered = true
 				}
 				if src := relAgentsMDSource(proj, a.Document.SourcePath); src != "" {
 					sources = append(sources, src)
+				}
+			}
+			if !rendered {
+				if sp := strings.TrimSpace(a.SystemPrompt); sp != "" {
+					b.WriteString(sp)
+					b.WriteString("\n\n")
 				}
 			}
 
@@ -765,6 +940,10 @@ func renderAgentsMDScopedCapabilities(b *strings.Builder, proj *model.Project) (
 func relAgentsMDSource(proj *model.Project, abs string) string {
 	return proj.SourceTag(abs)
 }
+
+// SchemaVersion returns the canonical schema version this plugin
+// understands (SPEC §6.4).
+func (p *AgentsMDPlugin) SchemaVersion() int { return version.SchemaVersion }
 
 // Compile-time check that AgentsMDPlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*AgentsMDPlugin)(nil)
