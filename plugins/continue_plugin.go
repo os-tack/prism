@@ -231,7 +231,7 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 				"target.bash":          plugin.FieldNative,
 				"target.editReadWrite": plugin.FieldNative,
 				"target.fs":            plugin.FieldDegraded,
-				"target.network":      plugin.FieldDegraded,
+				"target.network":       plugin.FieldDegraded,
 				"target.mcp":           plugin.FieldDegraded,
 				"glob.recursive":       plugin.FieldDegraded,
 				"glob.negation":        plugin.FieldDegraded,

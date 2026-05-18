@@ -144,7 +144,7 @@ func (p *WindsurfPlugin) Capabilities() plugin.Capabilities {
 				"AllowedTools":                     plugin.FieldUnsupported,
 				"Arguments":                        plugin.FieldUnsupported,
 				"Scripts":                          plugin.FieldUnsupported,
-				"References":                      plugin.FieldUnsupported,
+				"References":                       plugin.FieldUnsupported,
 				"Model":                            plugin.FieldUnsupported,
 				"Subagent":                         plugin.FieldUnsupported,
 				"ScopePath":                        plugin.FieldUnsupported,

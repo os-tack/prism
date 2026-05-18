@@ -28,7 +28,7 @@ const (
 	PermTargetNetwork   PermTarget = "network" // WebFetch / Fetch domain
 	PermTargetMCP       PermTarget = "mcp"     // mcp:<server>[:<tool>]
 	PermTargetWebFetch  PermTarget = "WebFetch"
-	PermTargetToolOnly  PermTarget = ""        // bare tool name with no pattern ("Bash" alone)
+	PermTargetToolOnly  PermTarget = "" // bare tool name with no pattern ("Bash" alone)
 	PermTargetUnknown   PermTarget = "unknown"
 )
 
