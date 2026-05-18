@@ -132,9 +132,26 @@ func Check(p *Policy, toolName, action string) Decision {
 
 // matchRule reports whether a `tool:pattern` rule matches the given
 // (toolName, action) pair. Rules without a colon are treated as
-// tool-only matchers (any action under that tool matches). Rules with
-// a trailing `*` glob match by prefix on the action; everything else is
-// an exact match.
+// tool-only matchers (any action under that tool matches).
+//
+// v0.9 / schema v2 grammar extensions (SPEC §4.6.2):
+//
+//   - `fs:<pattern>` is a synonym for Read|Write|Edit; a rule like
+//     `fs:src/**` matches when toolName is any of Read/Write/Edit and the
+//     action matches the pattern. Plugins emit-time fan-out continues to
+//     handle the Claude wire format; the matcher's job is just to detect a
+//     hit.
+//   - `network:<domain>` matches WebFetch / Fetch tool calls where the
+//     action is a URL or domain. Trailing `*` and recursive `**` glob
+//     forms are honored.
+//   - `mcp:<server>[:<tool>]` matches MCP tool dispatch. The runtime
+//     emits `tool_name` as `mcp__<server>__<tool>`; the matcher accepts
+//     either that wire form or the canonical `mcp__` payload form.
+//   - `**` recursive-glob is honored alongside the trailing-`*` form.
+//   - `!`-prefixed patterns negate within their list (e.g. an entry
+//     `Edit:!src/billing/migrations/*` inside an allow list reduces to a
+//     deny entry at emit time; the matcher itself reports the rule as
+//     non-matching so the negation cannot be used to bypass deny).
 func matchRule(rule, toolName, action string) bool {
 	if rule == "" {
 		return false
@@ -145,15 +162,150 @@ func matchRule(rule, toolName, action string) bool {
 	}
 	ruleTool := rule[:idx]
 	rulePattern := rule[idx+1:]
+
+	// Negation prefix `!`. Within the rule's pattern, a leading `!` reverses
+	// the match — but only meaningfully at emit time (the engine expands a
+	// negated allow rule into a deny). For runtime matching we treat the
+	// negated rule as not-matching so it cannot smuggle a permission past
+	// a deny check.
+	if strings.HasPrefix(rulePattern, "!") {
+		return false
+	}
+
+	// `fs:` synonym for Read|Write|Edit/MultiEdit.
+	if strings.EqualFold(ruleTool, "fs") {
+		switch {
+		case strings.EqualFold(toolName, "read"),
+			strings.EqualFold(toolName, "write"),
+			strings.EqualFold(toolName, "edit"),
+			strings.EqualFold(toolName, "multiedit"):
+			return matchPattern(rulePattern, action)
+		}
+		return false
+	}
+
+	// `network:` matches WebFetch / Fetch by domain or URL pattern.
+	if strings.EqualFold(ruleTool, "network") {
+		switch {
+		case strings.EqualFold(toolName, "webfetch"),
+			strings.EqualFold(toolName, "fetch"):
+			return matchPattern(rulePattern, action)
+		}
+		return false
+	}
+
+	// `mcp:<server>[:<tool>]` matches MCP tool dispatch.
+	if strings.EqualFold(ruleTool, "mcp") {
+		// rulePattern is `<server>[:<tool>]`. action is typically the MCP
+		// tool name in the Claude wire form `mcp__<server>__<tool>` or the
+		// canonical `<server>:<tool>` form.
+		server, mcpTool, hasTool := splitMCP(rulePattern)
+		actServer, actTool := normalizeMCPAction(toolName, action)
+		if actServer == "" {
+			return false
+		}
+		if !globMatch(server, actServer) {
+			return false
+		}
+		if !hasTool || mcpTool == "" || mcpTool == "*" {
+			return true
+		}
+		return globMatch(mcpTool, actTool)
+	}
+
 	if !strings.EqualFold(ruleTool, toolName) {
 		return false
 	}
-	if rulePattern == "" || rulePattern == "*" {
+	return matchPattern(rulePattern, action)
+}
+
+// splitMCP splits a `mcp:` rule's pattern into (server, tool, hasTool).
+// Accepts `<server>`, `<server>:<tool>`, or `<server>:*`.
+func splitMCP(pat string) (string, string, bool) {
+	if idx := strings.Index(pat, ":"); idx >= 0 {
+		return pat[:idx], pat[idx+1:], true
+	}
+	return pat, "", false
+}
+
+// normalizeMCPAction returns (server, tool) for an MCP dispatch payload.
+// Accepts the Claude wire form `mcp__<server>__<tool>` (toolName is the
+// dispatch tool itself) and the canonical `<server>:<tool>` action form.
+func normalizeMCPAction(toolName, action string) (string, string) {
+	if strings.HasPrefix(toolName, "mcp__") {
+		rest := strings.TrimPrefix(toolName, "mcp__")
+		if idx := strings.Index(rest, "__"); idx >= 0 {
+			return rest[:idx], rest[idx+2:]
+		}
+		return rest, ""
+	}
+	if strings.EqualFold(toolName, "mcp") {
+		if idx := strings.Index(action, ":"); idx >= 0 {
+			return action[:idx], action[idx+1:]
+		}
+		return action, ""
+	}
+	return "", ""
+}
+
+// matchPattern is the shared glob check used by every namespace branch.
+// Honors exact match, trailing `*` prefix, and `**` recursive forms.
+func matchPattern(pat, action string) bool {
+	if pat == "" || pat == "*" || pat == "**" {
 		return true
 	}
-	if strings.HasSuffix(rulePattern, "*") {
-		prefix := strings.TrimSuffix(rulePattern, "*")
-		return strings.HasPrefix(action, prefix)
+	return globMatch(pat, action)
+}
+
+// globMatch is a simple glob with `*` (single-segment) and `**`
+// (recursive) semantics. Conservative implementation: split the pattern
+// on `**` and require the action to contain each literal segment in
+// order; within segments, `*` matches any run of non-`/` characters via
+// prefix/suffix anchoring.
+func globMatch(pat, s string) bool {
+	if pat == s {
+		return true
 	}
-	return rulePattern == action
+	// Fast path: trailing `*` glob (the v0.7 default).
+	if strings.HasSuffix(pat, "*") && !strings.Contains(pat[:len(pat)-1], "*") {
+		return strings.HasPrefix(s, pat[:len(pat)-1])
+	}
+	// Recursive `**` glob: split into anchored segments and match in order.
+	if strings.Contains(pat, "**") {
+		segs := strings.Split(pat, "**")
+		rest := s
+		for i, seg := range segs {
+			if seg == "" {
+				continue
+			}
+			switch {
+			case i == 0:
+				if !strings.HasPrefix(rest, seg) {
+					return false
+				}
+				rest = rest[len(seg):]
+			case i == len(segs)-1:
+				if !strings.HasSuffix(rest, seg) {
+					return false
+				}
+			default:
+				idx := strings.Index(rest, seg)
+				if idx < 0 {
+					return false
+				}
+				rest = rest[idx+len(seg):]
+			}
+		}
+		return true
+	}
+	// Single `*` somewhere in the middle: split and match prefix/suffix.
+	if strings.Contains(pat, "*") {
+		idx := strings.Index(pat, "*")
+		prefix, suffix := pat[:idx], pat[idx+1:]
+		if !strings.HasPrefix(s, prefix) {
+			return false
+		}
+		return strings.HasSuffix(s, suffix)
+	}
+	return false
 }

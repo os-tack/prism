@@ -75,6 +75,10 @@ type Warning struct {
 }
 
 // Support describes how a plugin handles a particular canonical capability.
+//
+// v0.8 carries the coarse Support enum on Capabilities; v2 (SPEC §6.2)
+// replaces it with per-field FieldCapabilities. For Phase 0 both shapes
+// coexist on Capabilities — see FieldSupport / FieldCapabilities below.
 type Support string
 
 const (
@@ -83,8 +87,74 @@ const (
 	SupportUnsupported Support = "unsupported" // not emitted at all
 )
 
+// FieldSupport describes how a plugin handles a single canonical field
+// (SPEC §6.2). Distinct from Support because v2 adds the "silent" tier
+// (drop without warning).
+type FieldSupport string
+
+const (
+	// FieldNative — 1:1 mapping. No warning emitted.
+	FieldNative FieldSupport = "native"
+	// FieldDegraded — lossy mapping; one info warning per touched source.
+	FieldDegraded FieldSupport = "degraded"
+	// FieldUnsupported — the field is dropped; one warn-level warning per
+	// touched source.
+	FieldUnsupported FieldSupport = "unsupported"
+	// FieldSilent — the field is dropped because it has no semantic meaning
+	// on this target; no warning emitted.
+	FieldSilent FieldSupport = "silent"
+)
+
+// FieldCapabilities describes the support for one primitive's fields.
+//
+// Supported is false when the WHOLE primitive is dropped (e.g. Windsurf
+// has no Agent primitive). Fields maps canonical field paths
+// (dot-notation, e.g. "Activation.Globs") to FieldSupport. Absent fields
+// are assumed FieldNative. Extensions lists the extension namespaces this
+// plugin reads under `extensions.<name>:` — typically just `[Name()]`.
+type FieldCapabilities struct {
+	Supported  bool
+	Fields     map[string]FieldSupport
+	Extensions []string
+}
+
+// FlatFromSupport lifts a v0.8 coarse Support value into a v2
+// FieldCapabilities entry. The Supported flag is true unless the source
+// Support is Unsupported; the Fields map carries a single wildcard key
+// ("*") mapped to the equivalent FieldSupport tier. Plugins that have not
+// yet been refined to per-field declarations can populate their v2
+// FieldCapabilities cells via this helper without changing behavior; the
+// engine (when it later consults per-field cells) can fall back to "*"
+// for any field path it doesn't find an explicit entry for.
+//
+// Phase 0 callers may use this freely; subsequent phases will replace
+// the wildcard entries with explicit per-field maps.
+func FlatFromSupport(s Support) FieldCapabilities {
+	var fs FieldSupport
+	switch s {
+	case SupportNative:
+		fs = FieldNative
+	case SupportDegraded:
+		fs = FieldDegraded
+	case SupportUnsupported:
+		fs = FieldUnsupported
+	default:
+		fs = FieldNative
+	}
+	return FieldCapabilities{
+		Supported: s != SupportUnsupported,
+		Fields:    map[string]FieldSupport{"*": fs},
+	}
+}
+
 // Capabilities describes what a plugin can express in its target tool.
 // Used to surface degradation warnings and power `agents capabilities`.
+//
+// v0.8 fields (Context, ScopePaths, ..., MCP) carry coarse per-primitive
+// Support values. v2 (SPEC §6.2) adds per-primitive FieldCapabilities
+// under new field names so callers reading either shape compile against
+// the same struct. Plugins populate both for Phase 0; later phases will
+// retire the coarse v0.8 cells.
 type Capabilities struct {
 	Context       Support
 	ScopePaths    Support
@@ -95,6 +165,16 @@ type Capabilities struct {
 	Hooks         Support
 	Permissions   Support
 	MCP           Support
+
+	// v2 per-primitive FieldCapabilities (SPEC §6.2). Named distinctly
+	// from the v0.8 fields above so no collision occurs.
+	AgentFields       FieldCapabilities
+	SkillFields       FieldCapabilities
+	CommandFields     FieldCapabilities
+	HookFields        FieldCapabilities
+	MCPServerFields   FieldCapabilities
+	PermissionsFields FieldCapabilities
+	ScopeFields       FieldCapabilities
 }
 
 // Plugin is the interface every projection plugin implements.
@@ -117,6 +197,12 @@ type Plugin interface {
 	// Plan produces the Operations needed to project Project into this plugin's
 	// target tool. It must be pure with respect to the filesystem.
 	Plan(proj *model.Project, opts model.TargetOption) ([]Operation, error)
+
+	// SchemaVersion returns the canonical schema major version this plugin
+	// understands. In-tree plugins always return version.SchemaVersion; the
+	// engine refuses to load any plugin whose declared version predates the
+	// project's `schema_version:` (SPEC §6.4).
+	SchemaVersion() int
 }
 
 // Registry holds the set of plugins available to the engine.

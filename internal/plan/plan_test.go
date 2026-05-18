@@ -25,6 +25,7 @@ type mockPlugin struct {
 func (m *mockPlugin) Name() string                      { return m.name }
 func (m *mockPlugin) Detect(root string) bool           { return m.detect }
 func (m *mockPlugin) Capabilities() plugin.Capabilities { return m.caps }
+func (m *mockPlugin) SchemaVersion() int                { return 2 }
 func (m *mockPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plugin.Operation, error) {
 	m.mu.Lock()
 	m.called++

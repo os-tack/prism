@@ -22,6 +22,7 @@ type mergeCounterPlugin struct {
 
 func (mergeCounterPlugin) Name() string       { return "merge-counter" }
 func (mergeCounterPlugin) Detect(string) bool { return true }
+func (mergeCounterPlugin) SchemaVersion() int { return 2 }
 func (mergeCounterPlugin) Capabilities() plugin.Capabilities {
 	return plugin.Capabilities{}
 }

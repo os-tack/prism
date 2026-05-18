@@ -112,6 +112,16 @@ func parseSkills(skillsDir string) ([]*model.Skill, error) {
 				s.Trigger = v
 			}
 			s.Globs = stringSliceFromFrontmatter(doc.Frontmatter, "globs")
+			// v2 additive populations (SPEC §4.2.2). Trigger and Globs above
+			// are the v0.8 top-level fields; Activation mirrors the same data
+			// so v2 readers see it under sk.Activation.{Modes,Globs}.
+			if v, ok := doc.Frontmatter["extensions"].(map[string]any); ok {
+				s.Extensions = v
+			}
+			s.Activation.Globs = s.Globs
+			if s.Trigger == "glob" || len(s.Globs) > 0 {
+				s.Activation.Modes = []model.SkillActivationMode{model.SkillActivationGlob}
+			}
 		}
 
 		scripts, err := collectScripts(filepath.Join(skillDir, "scripts"))
@@ -194,6 +204,10 @@ func parseCommands(commandsDir string) ([]*model.Command, error) {
 			if v, ok := doc.Frontmatter["description"].(string); ok {
 				c.Description = v
 			}
+			// v2 additive populations (SPEC §4.3.2).
+			if v, ok := doc.Frontmatter["extensions"].(map[string]any); ok {
+				c.Extensions = v
+			}
 		}
 		commands = append(commands, c)
 	}
@@ -229,6 +243,15 @@ func parseAgents(agentsSubdir string) ([]*model.Agent, error) {
 			if v, ok := doc.Frontmatter["description"].(string); ok {
 				a.Description = v
 			}
+			// v2 additive populations (SPEC §4.1.2). SystemPrompt mirrors
+			// the document body so v2 readers don't have to dig through
+			// Document.Body.
+			if v, ok := doc.Frontmatter["extensions"].(map[string]any); ok {
+				a.Extensions = v
+			}
+		}
+		if doc != nil {
+			a.SystemPrompt = doc.Body
 		}
 		agents = append(agents, a)
 	}
@@ -282,13 +305,25 @@ func parseHooks(hooksDir string) ([]*model.Hook, error) {
 			scriptPath = abs
 		}
 		baseName := strings.TrimSuffix(strings.TrimSuffix(n, ".yaml"), ".yml")
+		h := &model.Hook{
+			Event:      raw.Event,
+			Matcher:    raw.Matcher,
+			ScriptPath: scriptPath,
+		}
+		// v2 additive populations (SPEC §4.4.2). EventCanonical mirrors
+		// Event as a typed enum; MatcherV2 mirrors Matcher as the
+		// {Kind, Patterns} struct so v2 readers and v0.8 readers see the
+		// same hook data through different access paths.
+		h.EventCanonical = model.HookEvent(raw.Event)
+		if raw.Matcher != "" {
+			h.MatcherV2 = model.HookMatcher{
+				Kind:     "exact",
+				Patterns: []string{raw.Matcher},
+			}
+		}
 		named_hooks = append(named_hooks, named{
 			name: baseName,
-			hook: &model.Hook{
-				Event:      raw.Event,
-				Matcher:    raw.Matcher,
-				ScriptPath: scriptPath,
-			},
+			hook: h,
 		})
 	}
 	sort.Slice(named_hooks, func(i, j int) bool { return named_hooks[i].name < named_hooks[j].name })
@@ -309,17 +344,19 @@ func parsePermissions(path string) (*model.Permissions, error) {
 		return nil, fmt.Errorf("parser: read %s: %w", path, err)
 	}
 	var raw struct {
-		Allow []string `yaml:"allow"`
-		Deny  []string `yaml:"deny"`
-		Ask   []string `yaml:"ask"`
+		Allow      []string       `yaml:"allow"`
+		Deny       []string       `yaml:"deny"`
+		Ask        []string       `yaml:"ask"`
+		Extensions map[string]any `yaml:"extensions"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parser: parse %s: %w", path, err)
 	}
 	return &model.Permissions{
-		Allow: raw.Allow,
-		Deny:  raw.Deny,
-		Ask:   raw.Ask,
+		Allow:      raw.Allow,
+		Deny:       raw.Deny,
+		Ask:        raw.Ask,
+		Extensions: raw.Extensions,
 	}, nil
 }
 

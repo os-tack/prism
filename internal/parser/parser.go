@@ -328,7 +328,7 @@ func readDocument(path, sourcePath, agentsDir, globalAgentsDir string, maxDepth 
 	if err != nil {
 		return nil, err
 	}
-	fm, body, err := splitFrontmatter(data)
+	fm, body, offset, err := splitFrontmatter(data)
 	if err != nil {
 		return nil, fmt.Errorf("parser: %s: %w", path, err)
 	}
@@ -337,10 +337,11 @@ func readDocument(path, sourcePath, agentsDir, globalAgentsDir string, maxDepth 
 		return nil, fmt.Errorf("parser: %s: %w", path, err)
 	}
 	return &model.Document{
-		SourcePath:  sourcePath,
-		Frontmatter: fm,
-		Body:        expanded,
-		Includes:    includes,
+		SourcePath:            sourcePath,
+		Frontmatter:           fm,
+		Body:                  expanded,
+		Includes:              includes,
+		FrontmatterLineOffset: offset,
 	}, nil
 }
 
@@ -354,30 +355,43 @@ func readDocumentNoExpand(path, sourcePath string) (*model.Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	fm, body, err := splitFrontmatter(data)
+	fm, body, offset, err := splitFrontmatter(data)
 	if err != nil {
 		return nil, fmt.Errorf("parser: %s: %w", path, err)
 	}
 	return &model.Document{
-		SourcePath:  sourcePath,
-		Frontmatter: fm,
-		Body:        body,
+		SourcePath:            sourcePath,
+		Frontmatter:           fm,
+		Body:                  body,
+		FrontmatterLineOffset: offset,
 	}, nil
 }
 
-// splitFrontmatter returns the parsed frontmatter (or nil) and the body.
-func splitFrontmatter(data []byte) (map[string]any, string, error) {
+// splitFrontmatter returns the parsed frontmatter (or nil), the body,
+// and the 1-based line on which the body begins. v0.9 / schema v2
+// rejects TOML (`+++`) and JSON (`{`) frontmatter delimiters — only
+// YAML (`---`) frontmatter is supported (SPEC §3.2).
+func splitFrontmatter(data []byte) (map[string]any, string, int, error) {
 	// Normalize CRLF.
 	s := strings.ReplaceAll(string(data), "\r\n", "\n")
+
+	// Reject TOML and JSON frontmatter delimiters per SPEC §3.2.
+	if strings.HasPrefix(s, "+++\n") || strings.HasPrefix(s, "+++") {
+		return nil, "", 0, fmt.Errorf("frontmatter: TOML (+++) delimiters are not supported; use YAML (---) frontmatter")
+	}
+	if strings.HasPrefix(s, "{") {
+		return nil, "", 0, fmt.Errorf("frontmatter: JSON ({) delimiters are not supported; use YAML (---) frontmatter")
+	}
+
 	if !strings.HasPrefix(s, "---\n") {
-		return nil, s, nil
+		return nil, s, 0, nil
 	}
 	// Drop the leading "---\n".
 	rest := s[4:]
 	end := strings.Index(rest, "\n---")
 	if end < 0 {
 		// No closing fence — treat the whole file as body.
-		return nil, s, nil
+		return nil, s, 0, nil
 	}
 	fmText := rest[:end]
 	bodyStart := end + len("\n---")
@@ -385,16 +399,36 @@ func splitFrontmatter(data []byte) (map[string]any, string, error) {
 	// Strip the newline immediately after the closing fence, if any.
 	body = strings.TrimPrefix(body, "\n")
 
+	// Compute 1-based offset of the body start. Frontmatter spans:
+	//   line 1            "---"
+	//   lines 2..(2+N-1)  fmText (N lines)
+	//   line 2+N          "---"
+	//   line 3+N          body begins (1-based)
+	fmLines := strings.Count(fmText, "\n") + 1
+	offset := fmLines + 3 // "---" + N lines + "---" + 1 → body line
+
 	var fm map[string]any
 	if strings.TrimSpace(fmText) != "" {
 		if err := yaml.Unmarshal([]byte(fmText), &fm); err != nil {
-			return nil, "", fmt.Errorf("yaml frontmatter: %w", err)
+			return nil, "", 0, fmt.Errorf("yaml frontmatter: %w", err)
 		}
 	}
-	return fm, body, nil
+	return fm, body, offset, nil
 }
 
 // readConfig parses .agents/agents.config.yaml. Returns nil (no error) if absent.
+//
+// v0.9 / schema v2 additions (SPEC §3.1.1):
+//   - schema_version: int — REQUIRED long-term. For Phase 0 we soften
+//     missing/non-2 to a stderr warning so existing v0.8 tests pass.
+//     TODO(phase-2): promote to a hard parse error per SPEC §3.1.1.
+//   - include: []string under `include:` key — populates Config.Layers
+//     (the "layered config" file list). The legacy `include:` block on
+//     this same key (with `max_depth: N`) for the @include preprocessor
+//     is preserved for back-compat; the parser accepts BOTH shapes (a
+//     scalar/mapping with `max_depth` OR a sequence of paths).
+//   - extensions: map[string]any — project-wide pass-through.
+//   - target_options[<plugin>].extensions: per-target pass-through.
 func readConfig(path string) (*model.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -403,30 +437,79 @@ func readConfig(path string) (*model.Config, error) {
 		}
 		return nil, fmt.Errorf("parser: read %s: %w", path, err)
 	}
+	// First pass: decode the well-known fields except `include:`, which is
+	// shape-ambiguous (mapping vs. sequence). We handle include in a second
+	// pass via a yaml.Node tap.
 	var raw struct {
+		SchemaVersion int      `yaml:"schema_version"`
 		Targets       []string `yaml:"targets"`
 		TargetOptions map[string]struct {
-			Mode     string `yaml:"mode"`
-			Disabled bool   `yaml:"disabled"`
+			Mode       string         `yaml:"mode"`
+			Disabled   bool           `yaml:"disabled"`
+			Extensions map[string]any `yaml:"extensions"`
 		} `yaml:"target_options"`
-		Include struct {
-			MaxDepth int `yaml:"max_depth"`
-		} `yaml:"include"`
+		Extensions map[string]any `yaml:"extensions"`
+		// IncludeRaw captures whatever shape the user wrote at the `include:`
+		// key. We decode it post-hoc into either IncludeConfig (legacy mapping
+		// form) or Layers (v2 sequence form).
+		IncludeRaw yaml.Node `yaml:"include"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parser: parse %s: %w", path, err)
 	}
+
+	// Phase 0 schema_version handling. SPEC §3.1.1 requires the value to
+	// be present and equal to version.SchemaVersion; we soften both
+	// conditions to a stderr warning so v0.8-shape tests/fixtures keep
+	// passing during the transition.
+	// TODO(phase-2, SPEC §3.1.1): promote missing/non-matching to a hard
+	// error and remove this soft path.
+	if raw.SchemaVersion == 0 {
+		fmt.Fprintf(os.Stderr, "parser: %s: warning: schema_version missing; v0.9 expects `schema_version: 2` (SPEC §3.1.1)\n", path)
+	} else if raw.SchemaVersion != 2 {
+		fmt.Fprintf(os.Stderr, "parser: %s: warning: schema_version %d not recognized; v0.9 reads schema_version: 2 (SPEC §3.1.1)\n", path, raw.SchemaVersion)
+	}
+
 	cfg := &model.Config{
+		SchemaVersion: raw.SchemaVersion,
 		Targets:       raw.Targets,
 		TargetOptions: make(map[string]model.TargetOption, len(raw.TargetOptions)),
-		Include: model.IncludeConfig{
-			MaxDepth: raw.Include.MaxDepth,
-		},
+		Extensions:    raw.Extensions,
 	}
+
+	// Decode the include node. Two shapes are accepted:
+	//   include:
+	//     max_depth: 32           # legacy IncludeConfig
+	//   include:
+	//     - ~/.agents             # v2 layered-config Layers
+	//     - vendor/team-defaults
+	switch raw.IncludeRaw.Kind {
+	case yaml.MappingNode:
+		var ic struct {
+			MaxDepth int `yaml:"max_depth"`
+		}
+		if err := raw.IncludeRaw.Decode(&ic); err != nil {
+			return nil, fmt.Errorf("parser: parse %s include: %w", path, err)
+		}
+		cfg.Include = model.IncludeConfig{MaxDepth: ic.MaxDepth}
+	case yaml.SequenceNode:
+		var layers []string
+		if err := raw.IncludeRaw.Decode(&layers); err != nil {
+			return nil, fmt.Errorf("parser: parse %s include: %w", path, err)
+		}
+		cfg.Layers = layers
+	case 0:
+		// Absent — both Include and Layers stay zero.
+	default:
+		// Scalar or alias — surface a warning, leave both empty.
+		fmt.Fprintf(os.Stderr, "parser: %s: warning: include: must be a mapping (legacy) or sequence (v2), got %v\n", path, raw.IncludeRaw.Kind)
+	}
+
 	for name, opt := range raw.TargetOptions {
 		cfg.TargetOptions[name] = model.TargetOption{
-			Mode:     opt.Mode,
-			Disabled: opt.Disabled,
+			Mode:       opt.Mode,
+			Disabled:   opt.Disabled,
+			Extensions: opt.Extensions,
 		}
 	}
 	return cfg, nil

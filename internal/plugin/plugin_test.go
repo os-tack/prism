@@ -13,6 +13,7 @@ type stubPlugin struct{ name string }
 func (p *stubPlugin) Name() string               { return p.name }
 func (p *stubPlugin) Detect(root string) bool    { return false }
 func (p *stubPlugin) Capabilities() Capabilities { return Capabilities{} }
+func (p *stubPlugin) SchemaVersion() int          { return 2 }
 func (p *stubPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]Operation, error) {
 	return nil, nil
 }

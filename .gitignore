@@ -26,3 +26,5 @@ registers-dump.md
 # Generated dev artifacts
 /dist/
 /coverage.out
+/prism
+/prism-schema

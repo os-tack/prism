@@ -13,6 +13,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// MaxSupportedVersion is the highest lockfile format version this binary
+// can read. v0.9 ships lockfile version 2 (SPEC §7). Reads of a higher
+// version are a hard error (no dual-write — see SPEC §7.4).
+const MaxSupportedVersion = 2
+
+// DefaultVersion is the format version new lockfiles are stamped with.
+// Bumped to 2 in v0.9.
+const DefaultVersion = 2
+
+// DefaultSchemaVersion is the canonical schema version stamped into new
+// lockfiles. Mirrors version.SchemaVersion; kept as a local constant so
+// the lockfile package does not depend on internal/version (which would
+// produce an import cycle for the version package's lockfile-aware
+// helpers in some build configurations).
+const DefaultSchemaVersion = 2
+
 // Entry is the bookkeeping for one projected file.
 type Entry struct {
 	Sources []string `yaml:"sources"`
@@ -22,11 +38,16 @@ type Entry struct {
 }
 
 // Lockfile is the persisted .agents/.lock structure.
+//
+// v0.9 / schema v2 (SPEC §7.1) adds SchemaVersion alongside the existing
+// Version field. Version is the lockfile format version; SchemaVersion
+// is the canonical model schema version.
 type Lockfile struct {
-	Version     int              `yaml:"version"`
-	GeneratedBy string           `yaml:"generated_by"`
-	At          time.Time        `yaml:"at"`
-	Files       map[string]Entry `yaml:"files"`
+	Version       int              `yaml:"version"`
+	SchemaVersion int              `yaml:"schema_version,omitempty"`
+	GeneratedBy   string           `yaml:"generated_by"`
+	At            time.Time        `yaml:"at"`
+	Files         map[string]Entry `yaml:"files"`
 }
 
 // Path returns the absolute path to the lockfile under root.
@@ -35,12 +56,18 @@ func Path(root string) string {
 }
 
 // Load reads root/.agents/.lock. If the file is missing, an empty Lockfile
-// (Version: 1) is returned, no error.
+// (Version: DefaultVersion) is returned, no error.
+//
+// Forward-incompat policy (SPEC §7.4): if the lockfile's `version:`
+// exceeds MaxSupportedVersion, Load returns a hard error with an upgrade
+// message. No dual-write — a newer lockfile MAY contain fields the older
+// binary doesn't know, and silently truncating would let stale tooling
+// overwrite a team's pinned set.
 func Load(root string) (*Lockfile, error) {
 	data, err := os.ReadFile(Path(root))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &Lockfile{Version: 1, Files: map[string]Entry{}}, nil
+			return &Lockfile{Version: DefaultVersion, Files: map[string]Entry{}}, nil
 		}
 		return nil, fmt.Errorf("lockfile: read: %w", err)
 	}
@@ -48,11 +75,14 @@ func Load(root string) (*Lockfile, error) {
 	if err := yaml.Unmarshal(data, &lf); err != nil {
 		return nil, fmt.Errorf("lockfile: parse: %w", err)
 	}
+	if lf.Version > MaxSupportedVersion {
+		return nil, fmt.Errorf("lockfile is version %d but this binary supports up to version %d. Update prism: https://github.com/agents-dev/agents/releases", lf.Version, MaxSupportedVersion)
+	}
 	if lf.Files == nil {
 		lf.Files = map[string]Entry{}
 	}
 	if lf.Version == 0 {
-		lf.Version = 1
+		lf.Version = DefaultVersion
 	}
 	return &lf, nil
 }
@@ -62,7 +92,10 @@ func Load(root string) (*Lockfile, error) {
 // diffs.
 func (l *Lockfile) Save(root string) error {
 	if l.Version == 0 {
-		l.Version = 1
+		l.Version = DefaultVersion
+	}
+	if l.SchemaVersion == 0 {
+		l.SchemaVersion = DefaultSchemaVersion
 	}
 	if l.At.IsZero() {
 		l.At = time.Now().UTC()
@@ -89,6 +122,9 @@ func (l *Lockfile) Save(root string) error {
 	}
 
 	addScalar("version", fmt.Sprintf("%d", l.Version))
+	if l.SchemaVersion != 0 {
+		addScalar("schema_version", fmt.Sprintf("%d", l.SchemaVersion))
+	}
 	addScalar("generated_by", l.GeneratedBy)
 	addScalar("at", l.At.UTC().Format(time.RFC3339))
 

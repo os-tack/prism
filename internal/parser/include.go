@@ -130,7 +130,7 @@ func (s *includeState) expand(body, sourcePath string, stack []string, depth int
 		}
 
 		// Strip frontmatter; only the body is substituted.
-		_, includedBody, err := splitFrontmatter(data)
+		_, includedBody, _, err := splitFrontmatter(data)
 		if err != nil {
 			return "", fmt.Errorf("include: %s: %w", resolved, err)
 		}
