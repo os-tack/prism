@@ -57,6 +57,7 @@ func (c *CopilotImporter) Detect(root string) bool {
 		filepath.Join(root, ".github", "prompts"),
 		filepath.Join(root, ".github", "agents"),
 		filepath.Join(root, ".github", "mcp.json"),
+		filepath.Join(root, ".github", "hooks"),
 	}
 	for _, p := range markers {
 		if _, err := os.Stat(p); err == nil {
@@ -302,7 +303,102 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 	}
 	proj.MCP = mergeCopilotMCP(rootMCP, dotMCP)
 
+	// .github/hooks/hooks.json — v0.8.2 preview hooks (gated behind
+	// --enable-preview-hooks on emit; importer accepts unconditionally).
+	hooks, herr := readCopilotPreviewHooks(root)
+	if herr != nil {
+		return nil, nil, herr
+	}
+	proj.Hooks = append(proj.Hooks, hooks...)
+
+	// .github/hooks/__perms-guard__/{policy.json,*.policy.json} — v0.8.2
+	// perms-via-hook sidecars. Same shape as cline; companion to
+	// emitPermsGuardWrappers in plugins/copilot.go.
+	global, scoped, perr := readPermsGuardSidecars(filepath.Join(root, ".github", "hooks", "__perms-guard__"))
+	if perr != nil {
+		return nil, nil, perr
+	}
+	if global != nil {
+		proj.Permissions = global
+	}
+	proj.ScopedPermissions = append(proj.ScopedPermissions, scoped...)
+
 	return proj, warnings, nil
+}
+
+// readCopilotPreviewHooks parses .github/hooks/hooks.json (Copilot preview
+// schema, v0.8.2 emission) back into []*model.Hook. The schema:
+//
+//	{"version": 1, "hooks": {"<event>": [{"matcher": "...", "hooks":
+//	  [{"type": "command", "command": "..."}]}]}}
+//
+// Commands pointing at __scope-guard__ or __perms-guard__ wrappers are
+// projection artifacts — they're skipped (the scoped/perms sources live
+// in the canonical .agents/ tree, not this projection).
+func readCopilotPreviewHooks(root string) ([]*model.Hook, error) {
+	hooksPath := filepath.Join(root, ".github", "hooks", "hooks.json")
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("copilot: read %s: %w", hooksPath, err)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var doc struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if jerr := json.Unmarshal(data, &doc); jerr != nil {
+		return nil, fmt.Errorf("copilot: parse %s: %w", hooksPath, jerr)
+	}
+	// Reverse the canonical→Copilot event-name mapping. Anything we don't
+	// recognize keeps its name verbatim; users targeting other tools can
+	// still re-emit (mapClineEvent / mapGeminiHookEvent already accept
+	// pass-through events).
+	reverse := map[string]string{
+		"preToolUse":          "PreToolUse",
+		"postToolUse":         "PostToolUse",
+		"sessionStart":        "SessionStart",
+		"sessionEnd":          "SessionEnd",
+		"userPromptSubmitted": "UserPromptSubmit",
+		"agentStop":           "Stop",
+		"subagentStop":        "SubagentStop",
+		"errorOccurred":       "Notification",
+	}
+	events := make([]string, 0, len(doc.Hooks))
+	for k := range doc.Hooks {
+		events = append(events, k)
+	}
+	sort.Strings(events)
+	var out []*model.Hook
+	for _, event := range events {
+		canonical, ok := reverse[event]
+		if !ok {
+			canonical = event
+		}
+		for _, grp := range doc.Hooks[event] {
+			for _, entry := range grp.Hooks {
+				cmd := entry.Command
+				if strings.Contains(cmd, "__scope-guard__") || strings.Contains(cmd, "__perms-guard__") {
+					continue
+				}
+				out = append(out, &model.Hook{
+					Event:      canonical,
+					Matcher:    grp.Matcher,
+					ScriptPath: cmd,
+				})
+			}
+		}
+	}
+	return out, nil
 }
 
 // readCopilotAgents reads .github/agents/<slug>.agent.md into []*model.Agent.

@@ -283,3 +283,84 @@ func TestRoundTrip_Continue_V08(t *testing.T) {
 		}
 	}
 }
+
+// TestRoundTrip_Cline_V082_Perms seeds a global permissions sidecar at
+// .cline/hooks/__perms-guard__/policy.json (the v0.8.2 emission shape)
+// and verifies the importer reads it back + the plugin re-emits the
+// wrapper artifacts on the next compile. Locks the perms-via-hook
+// round-trip closed.
+func TestRoundTrip_Cline_V082_Perms(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		".clinerules/00-overview.md": "Project-wide Go conventions: gofmt.\n",
+		".cline/hooks/__perms-guard__/policy.json": `{
+  "allow": ["bash:ls *"],
+  "deny": ["bash:rm -rf *"]
+}`,
+	})
+
+	opts := rtOptions(t, root, plugins.NewCline())
+	runRoundTrip(t, opts, "cline")
+
+	// Policy survives the round-trip.
+	policyData, err := os.ReadFile(filepath.Join(root, ".cline", "hooks", "__perms-guard__", "policy.json"))
+	if err != nil {
+		t.Fatalf("read policy.json: %v", err)
+	}
+	if !strings.Contains(string(policyData), `"bash:ls *"`) {
+		t.Errorf("policy.json missing allow rule:\n%s", policyData)
+	}
+	if !strings.Contains(string(policyData), `"bash:rm -rf *"`) {
+		t.Errorf("policy.json missing deny rule:\n%s", policyData)
+	}
+
+	// PreToolUse.json wires the gate wrapper.
+	preData, err := os.ReadFile(filepath.Join(root, ".clinerules", "hooks", "PreToolUse.json"))
+	if err != nil {
+		t.Fatalf("read PreToolUse.json: %v", err)
+	}
+	if !strings.Contains(string(preData), "__perms-guard__") {
+		t.Errorf("PreToolUse.json missing perms-guard reference:\n%s", preData)
+	}
+}
+
+// TestRoundTrip_Copilot_V082_PreviewHooks seeds a .github/hooks/hooks.json
+// and a perms-guard policy sidecar, runs init + compile via the copilot
+// plugin (with EnablePreviewHooks on), and verifies both surfaces survive.
+func TestRoundTrip_Copilot_V082_PreviewHooks(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		".github/copilot-instructions.md": "# Conventions\n\nUse Go 1.25.\n",
+		".github/hooks/hooks.json": `{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/preflight.sh"}]}
+    ]
+  }
+}`,
+		".github/hooks/__perms-guard__/policy.json": `{"allow": ["bash:ls *"], "deny": ["bash:rm -rf *"]}`,
+	})
+
+	opts := rtOptions(t, root, &plugins.CopilotPlugin{EnablePreviewHooks: true})
+	runRoundTrip(t, opts, "copilot")
+
+	hooksData, err := os.ReadFile(filepath.Join(root, ".github", "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read hooks.json: %v", err)
+	}
+	if !strings.Contains(string(hooksData), "preflight.sh") {
+		t.Errorf("hooks.json missing user hook:\n%s", hooksData)
+	}
+	if !strings.Contains(string(hooksData), "__perms-guard__") {
+		t.Errorf("hooks.json missing perms-guard wiring:\n%s", hooksData)
+	}
+
+	policyData, err := os.ReadFile(filepath.Join(root, ".github", "hooks", "__perms-guard__", "policy.json"))
+	if err != nil {
+		t.Fatalf("read policy.json: %v", err)
+	}
+	if !strings.Contains(string(policyData), `"bash:rm -rf *"`) {
+		t.Errorf("policy.json missing deny rule:\n%s", policyData)
+	}
+}

@@ -41,7 +41,7 @@ SHA-256 sidecars next to each binary.
 
 ```
 # darwin/arm64 example
-curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.8.1-darwin-arm64
+curl -L -o prism https://github.com/os-tack/prism/releases/latest/download/prism-v0.8.2-darwin-arm64
 chmod +x prism
 ./prism --help
 ```
@@ -112,19 +112,20 @@ read path.
 PLUGIN     CONTEXT  PATHS   SEMANTIC  SKILLS  CMDS    AGENTS  HOOKS   PERMS   MCP
 agents-md  native   degr.   degr.     degr.   degr.   degr.   degr.   degr.   degr.
 claude     native   native  degr.     native  native  native  native  native  native
-cline      native   native  native    degr.   native  ----    native  ----    native
+cline      native   native  native    degr.   native  ----    native  native  native
 continue   native   native  native    degr.   native  ----    ----    native  native
-copilot    native   native  degr.     degr.   native  native  ----    ----    native
+copilot    native   native  degr.     degr.   native  native  native* native* native
 cursor     native   native  native    native  native  native  native  ----    native
 gemini     native   native  degr.     degr.   native  native  native  native  native
 windsurf   native   native  native    degr.   degr.   ----    native  ----    native
 ```
 
 - **native**: 1:1 mapping; full fidelity.
-- **degr.** (degraded): approximated in the target's nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
+- **native\*** (copilot Hooks + Perms): native projection, opt-in via `--enable-preview-hooks` because the underlying Copilot hook API is in public preview at the GitHub side. Default OFF; flip on per-run or in CI.
+- **degr.** (degraded): approximated in the target.s nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
 - **----** (unsupported): not projected. Plugin emits a warning naming the dropped item.
 
-As of v0.8.0, **17 cells flipped from `----` or `degr.` to `native`** when six of eight plugins were rewritten to match each tool's May 2026 feature surface. Cursor, Gemini, Cline, Continue, Copilot, and Windsurf all gained meaningful new emissions (hooks, agents, slash commands, MCP, dedicated skill formats, native permissions). See [CHANGELOG.md](CHANGELOG.md) for the per-plugin breakdown.
+As of v0.8.2, **20 cells have flipped from `----` or `degr.` to `native`** across the v0.8 series. v0.8.0 rewrote six of eight plugins for May 2026 feature parity (17 cells). v0.8.2 added cline PERMS plus copilot HOOKS + PERMS (3 cells; copilot is preview-gated). See [CHANGELOG.md](CHANGELOG.md) for the per-plugin breakdown.
 
 Show the matrix with `prism capabilities`.
 
@@ -313,6 +314,7 @@ Global flags:
 - `--global <dir>` — global layer parent (default: `~/` if `~/.agents/` exists)
 - `--no-global` — skip the global layer
 - `--no-hook-wrappers` — disable scope-guard / perms-guard wrapper generation
+- `--enable-preview-hooks` — opt into Copilot preview hooks (.github/hooks/hooks.json + perms-guard wiring); off by default until GA
 
 ## How it works
 
@@ -346,6 +348,9 @@ engine-side so they're portable across macOS/Linux/Windows.
 
 [See CHANGELOG.md](CHANGELOG.md) for full release notes. Highlights:
 
+- **v0.8.2** — copilot HOOKS (preview, opt-in), copilot PERMS, cline PERMS;
+  three more cells flipped to native (issues #2/#3/#4)
+- **v0.8.1** — importer parity for the v0.8.0 emissions; round-trip lock-in
 - **v0.8.0** — major plugin parity release: 17 capability cells flipped
   to native across cursor / gemini / cline / continue / copilot / windsurf
 - **v0.7.x** — central registry, `--interactive` importers, perms-guard

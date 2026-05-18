@@ -283,6 +283,18 @@ func (c *ClineImporter) Import(root string) (*model.Project, []Warning, error) {
 	}
 	proj.MCP = append(proj.MCP, mcps...)
 
+	// .cline/hooks/__perms-guard__/{policy.json,*.policy.json} —
+	// v0.8.2 perms-via-hook sidecars (round-trip companion to the
+	// emitPermsGuardWrappers emission in plugins/cline.go).
+	global, scoped, perr := readPermsGuardSidecars(filepath.Join(root, ".cline", "hooks", "__perms-guard__"))
+	if perr != nil {
+		return nil, nil, perr
+	}
+	if global != nil {
+		proj.Permissions = global
+	}
+	proj.ScopedPermissions = append(proj.ScopedPermissions, scoped...)
+
 	return proj, warnings, nil
 }
 

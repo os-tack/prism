@@ -103,7 +103,7 @@ func (p *ClinePlugin) Capabilities() plugin.Capabilities {
 		Commands:      plugin.SupportNative,
 		Agents:        plugin.SupportUnsupported,
 		Hooks:         plugin.SupportNative,
-		Permissions:   plugin.SupportUnsupported,
+		Permissions:   plugin.SupportNative, // wrapper-implemented via prism perms-guard (v0.8.2)
 		MCP:           plugin.SupportNative,
 	}
 }
@@ -299,10 +299,62 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 		wrapperPaths[h] = wrapperAbs
 	}
 
+	// Perms-guard wrappers + sidecar policy. v0.8.2 flipped Cline's
+	// Permissions cell to native by re-using the gemini wrapper pattern:
+	// .cline/hooks/__perms-guard__/{policy.json, *-gate.sh,
+	// <event>-<basename>.sh}. The wrappers are wired into PreToolUse.json
+	// below — per-hook wrappers replace the raw script command; bare
+	// gate wrappers append as their own PreToolUse entries.
+	permsOps, permsWarnings, perr := emitPermsGuardWrappers(p.Name(), proj, p.DisableHookWrappers)
+	if perr != nil {
+		return nil, perr
+	}
+	ops = append(ops, permsOps...)
+
+	// Build (hook → perms-guard wrapper path) so the hook JSON command
+	// points at the wrapper that enforces the policy, then executes the
+	// user script on allow.
+	permsHookWrappers := map[*model.Hook]string{}
+	for _, h := range proj.Hooks {
+		if h == nil || h.Event == "" {
+			continue
+		}
+		base := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
+		var wrapperName string
+		if h.ScopePath == "" {
+			wrapperName = h.Event + "-" + base + ".sh"
+		} else {
+			wrapperName = permsScopeSlug(h.ScopePath) + "-" + h.Event + "-" + base + ".sh"
+		}
+		wrapperRel := filepath.Join("."+p.Name(), "hooks", "__perms-guard__", wrapperName)
+		for _, op := range permsOps {
+			if op.Path == wrapperRel {
+				permsHookWrappers[h] = filepath.Join(proj.Root, wrapperRel)
+				break
+			}
+		}
+	}
+
+	var permsGateRefs []string
+	for _, op := range permsOps {
+		if !strings.Contains(op.Path, "__perms-guard__") {
+			continue
+		}
+		if strings.HasSuffix(op.Path, "global-gate.sh") || strings.HasSuffix(op.Path, "-gate.sh") {
+			permsGateRefs = append(permsGateRefs, op.Path)
+		}
+	}
+	sort.Strings(permsGateRefs)
+
 	// Hooks → .clinerules/hooks/<event>.json. One JSON file per event,
 	// each carrying the standard {matcher, hooks: [{type, command}]}
-	// shape. Scoped hooks point at their scope-guard wrapper.
-	if hookOps := buildClineHookOps(proj, wrapperPaths); len(hookOps) > 0 {
+	// shape. Scoped hooks point at their scope-guard wrapper. The
+	// perms-guard gate wrappers (when permissions exist but no user
+	// hooks) are appended to PreToolUse so every tool call flows
+	// through the policy. When user hooks DO exist, each hook's
+	// command is rewritten to its per-hook perms-guard wrapper
+	// (which wraps the user script).
+	if hookOps := buildClineHookOps(proj, wrapperPaths, permsHookWrappers, proj.Root, permsGateRefs); len(hookOps) > 0 {
 		ops = append(ops, hookOps...)
 	}
 
@@ -347,28 +399,7 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			Severity: "info",
 		})
 	}
-	if proj.Permissions != nil {
-		if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
-			orphanWarnings = append(orphanWarnings, plugin.Warning{
-				Source:   "permissions.yaml",
-				Message:  "Cline has no permissions primitive in v0.8.0; permissions not projected.",
-				Severity: "info",
-			})
-		}
-	}
-	for _, sp := range proj.ScopedPermissions {
-		if sp == nil {
-			continue
-		}
-		if len(sp.Allow)+len(sp.Deny)+len(sp.Ask) == 0 {
-			continue
-		}
-		orphanWarnings = append(orphanWarnings, plugin.Warning{
-			Source:   sp.ScopePath + "/permissions.yaml",
-			Message:  fmt.Sprintf("Cline has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
-			Severity: "info",
-		})
-	}
+	orphanWarnings = append(orphanWarnings, permsWarnings...)
 
 	if len(orphanWarnings) > 0 && len(ops) > 0 {
 		ops[0].Warnings = append(ops[0].Warnings, orphanWarnings...)
@@ -404,35 +435,54 @@ type clineHookFile struct {
 // TaskComplete, TaskCancel. We do not validate the event name here —
 // any non-empty event becomes a JSON filename, so callers can stage
 // future events without code changes.
-func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string) []plugin.Operation {
-	if len(proj.Hooks) == 0 {
+//
+// permsHookWrappers maps user hooks to their perms-guard wrapper path
+// (absolute); when present, the wrapper replaces the raw script command.
+// permsGateRefs are project-relative paths to bare perms-guard gates
+// (from emitPermsGuardWrappers, when permissions exist but no user
+// hooks did); each gate is appended as a PreToolUse entry with empty
+// matcher so the policy fires on every tool call.
+//
+// Precedence: scope-guard wrappers > perms-guard wrappers > raw script.
+// (Scope-guard already wraps the perms-guard at the wrapper-script
+// level when both apply — the perms-guard wrapper invokes the user
+// script which can in turn be scope-gated by the scope-guard wrapper
+// the projection emitted alongside.)
+func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string, permsHookWrappers map[*model.Hook]string, projRoot string, permsGateRefs []string) []plugin.Operation {
+	if len(proj.Hooks) == 0 && len(permsGateRefs) == 0 {
 		return nil
 	}
 
-	// event → matcher → []entry, preserving Hooks slice order within each
-	// matcher bucket for stable output.
 	buckets := map[string]map[string][]clineHookEntry{}
 	matcherOrder := map[string][]string{}
 	eventOrder := []string{}
+	addEntry := func(ev, matcher string, entry clineHookEntry) {
+		if _, ok := buckets[ev]; !ok {
+			buckets[ev] = map[string][]clineHookEntry{}
+			eventOrder = append(eventOrder, ev)
+		}
+		if _, ok := buckets[ev][matcher]; !ok {
+			matcherOrder[ev] = append(matcherOrder[ev], matcher)
+		}
+		buckets[ev][matcher] = append(buckets[ev][matcher], entry)
+	}
 	for _, h := range proj.Hooks {
 		if h == nil || h.Event == "" {
 			continue
 		}
 		ev := mapClineEvent(h.Event)
-		if _, ok := buckets[ev]; !ok {
-			buckets[ev] = map[string][]clineHookEntry{}
-			eventOrder = append(eventOrder, ev)
-		}
-		if _, ok := buckets[ev][h.Matcher]; !ok {
-			matcherOrder[ev] = append(matcherOrder[ev], h.Matcher)
-		}
 		cmdPath := h.ScriptPath
 		if w, ok := wrapperPaths[h]; ok {
 			cmdPath = w
+		} else if w, ok := permsHookWrappers[h]; ok {
+			cmdPath = w
 		}
-		buckets[ev][h.Matcher] = append(buckets[ev][h.Matcher], clineHookEntry{
+		addEntry(ev, h.Matcher, clineHookEntry{Type: "command", Command: cmdPath})
+	}
+	for _, gate := range permsGateRefs {
+		addEntry("PreToolUse", "", clineHookEntry{
 			Type:    "command",
-			Command: cmdPath,
+			Command: filepath.Join(projRoot, gate),
 		})
 	}
 

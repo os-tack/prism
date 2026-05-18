@@ -339,8 +339,8 @@ func TestCline_Capabilities(t *testing.T) {
 	if caps.Hooks != plugin.SupportNative {
 		t.Errorf("Hooks = %q, want native", caps.Hooks)
 	}
-	if caps.Permissions != plugin.SupportUnsupported {
-		t.Errorf("Permissions = %q, want unsupported", caps.Permissions)
+	if caps.Permissions != plugin.SupportNative {
+		t.Errorf("Permissions = %q, want native", caps.Permissions)
 	}
 	if caps.MCP != plugin.SupportNative {
 		t.Errorf("MCP = %q, want native", caps.MCP)
@@ -908,4 +908,102 @@ func extractFrontmatter(t *testing.T, content string) string {
 		t.Fatalf("frontmatter end delimiter missing:\n%s", content)
 	}
 	return rest[:end+1] // include trailing newline of last key
+}
+
+// TestCline_PermsGuard_GlobalEmits verifies that a global Permissions
+// block (no hooks) projects a policy sidecar + global gate wrapper under
+// .cline/hooks/__perms-guard__/, and wires the gate into PreToolUse.json.
+func TestCline_PermsGuard_GlobalEmits(t *testing.T) {
+	projRoot := "/tmp/p"
+	proj := &model.Project{
+		Root:      projRoot,
+		AgentsDir: filepath.Join(projRoot, ".agents"),
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	wantPolicy := filepath.Join(".cline", "hooks", "__perms-guard__", "policy.json")
+	wantGate := filepath.Join(".cline", "hooks", "__perms-guard__", "global-gate.sh")
+	if findOpByPath(ops, wantPolicy) == nil {
+		t.Fatalf("missing policy at %s; got %v", wantPolicy, opPathSet(ops))
+	}
+	if findOpByPath(ops, wantGate) == nil {
+		t.Fatalf("missing gate at %s; got %v", wantGate, opPathSet(ops))
+	}
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	if preOp == nil {
+		t.Fatalf("missing PreToolUse.json op; got %v", opPathSet(ops))
+	}
+	wantCmd := filepath.Join(projRoot, wantGate)
+	if !strings.Contains(preOp.Content, wantCmd) {
+		t.Errorf("PreToolUse.json missing perms-guard gate %s; got %s", wantCmd, preOp.Content)
+	}
+}
+
+// TestCline_PermsGuard_DisableHookWrappers verifies that setting
+// DisableHookWrappers suppresses perms-guard emission AND the PreToolUse
+// wiring (no hooks, no wrappers).
+func TestCline_PermsGuard_DisableHookWrappers(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/p",
+		AgentsDir: "/tmp/p/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+		},
+	}
+	p := &ClinePlugin{DisableHookWrappers: true}
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("unexpected perms-guard artifact with DisableHookWrappers=true: %s", op.Path)
+		}
+	}
+}
+
+// TestCline_PermsGuard_CoexistsWithUserHook verifies that an existing
+// user-authored PreToolUse hook and the perms-guard gate both land in
+// the PreToolUse.json hook list.
+func TestCline_PermsGuard_CoexistsWithUserHook(t *testing.T) {
+	projRoot := "/tmp/p"
+	proj := &model.Project{
+		Root:      projRoot,
+		AgentsDir: filepath.Join(projRoot, ".agents"),
+		Hooks: []*model.Hook{
+			{Event: "PreToolUse", Matcher: "Bash", ScriptPath: "/tmp/p/.agents/hooks/lint.sh"},
+		},
+		Permissions: &model.Permissions{
+			Deny: []string{"bash:rm -rf *"},
+		},
+	}
+	p := NewCline()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	if preOp == nil {
+		t.Fatalf("missing PreToolUse.json op")
+	}
+	// When user hooks + perms both exist, the hook command is rewritten
+	// to its per-hook perms-guard wrapper (which wraps the user script).
+	if !strings.Contains(preOp.Content, "__perms-guard__/PreToolUse-lint.sh") {
+		t.Errorf("PreToolUse.json missing per-hook perms-guard wrapper:\n%s", preOp.Content)
+	}
+	// The wrapper itself was emitted as an op AND references the user script.
+	wrapperOp := findOpByPath(ops, ".cline/hooks/__perms-guard__/PreToolUse-lint.sh")
+	if wrapperOp == nil {
+		t.Fatalf("missing per-hook perms-guard wrapper op; got %v", opPathSet(ops))
+	}
+	if !strings.Contains(wrapperOp.Content, "lint.sh") {
+		t.Errorf("wrapper missing user script reference:\n%s", wrapperOp.Content)
+	}
 }

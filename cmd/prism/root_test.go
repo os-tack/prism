@@ -22,7 +22,7 @@ func TestNoHookWrappersFlag_Plumbing(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			reg := plugin.NewRegistry()
-			if err := registerPlugins(reg, c.noHook); err != nil {
+			if err := registerPlugins(reg, c.noHook, false); err != nil {
 				t.Fatalf("registerPlugins: %v", err)
 			}
 

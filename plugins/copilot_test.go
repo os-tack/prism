@@ -906,3 +906,197 @@ func TestCopilot_AgentScoped_Warns(t *testing.T) {
 		t.Errorf("expected scoped-agent degradation warning, got %#v", op.Warnings)
 	}
 }
+
+// TestCopilot_Preview_HookFlagOff verifies the v0.8.1 default behaviour:
+// without --enable-preview-hooks, a hook produces a warning and NO
+// .github/hooks/hooks.json file.
+func TestCopilot_Preview_HookFlagOff(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{Event: "PreToolUse", Matcher: "Bash", ScriptPath: "/tmp/proj/.agents/hooks/lint.sh"},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "hooks.json") || strings.Contains(op.Path, "__scope-guard__") || strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("unexpected hook artifact with flag off: %s", op.Path)
+		}
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "preview") && strings.Contains(w.Message, "--enable-preview-hooks") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected preview-hint warning when flag is off")
+	}
+}
+
+// TestCopilot_Preview_HookFlagOn verifies that --enable-preview-hooks
+// emits .github/hooks/hooks.json with the user's hook routed through
+// the preview event-name mapping (PreToolUse → preToolUse).
+func TestCopilot_Preview_HookFlagOn(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{Event: "PreToolUse", Matcher: "Bash", ScriptPath: "/tmp/proj/.agents/hooks/lint.sh"},
+		},
+	}
+	p := &CopilotPlugin{EnablePreviewHooks: true}
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	hooksPath := filepath.Join(".github", "hooks", "hooks.json")
+	hooksOp := findCopilotOp(ops, hooksPath)
+	if hooksOp == nil {
+		t.Fatalf("missing hooks.json op; got %v", copilotOpPaths(ops))
+	}
+	if !strings.Contains(hooksOp.Content, `"preToolUse"`) {
+		t.Errorf("hooks.json missing preToolUse event:\n%s", hooksOp.Content)
+	}
+	if !strings.Contains(hooksOp.Content, "lint.sh") {
+		t.Errorf("hooks.json missing user script:\n%s", hooksOp.Content)
+	}
+	if !strings.Contains(hooksOp.Content, "${PROJECT_DIR}") {
+		t.Errorf("hooks.json missing ${PROJECT_DIR} for portability:\n%s", hooksOp.Content)
+	}
+}
+
+// TestCopilot_Preview_PermsFlagOn verifies that --enable-preview-hooks
+// projects Permissions through .github/hooks/__perms-guard__/policy.json
+// + a gate wrapper, and wires the gate into hooks.json under preToolUse.
+func TestCopilot_Preview_PermsFlagOn(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/proj/.agents/context.md",
+			Body:       "ctx",
+		},
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+	}
+	p := &CopilotPlugin{EnablePreviewHooks: true}
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	wantPolicy := filepath.Join(".github", "hooks", "__perms-guard__", "policy.json")
+	wantGate := filepath.Join(".github", "hooks", "__perms-guard__", "global-gate.sh")
+	if findCopilotOp(ops, wantPolicy) == nil {
+		t.Fatalf("missing perms policy at %s; got %v", wantPolicy, copilotOpPaths(ops))
+	}
+	if findCopilotOp(ops, wantGate) == nil {
+		t.Fatalf("missing perms gate at %s; got %v", wantGate, copilotOpPaths(ops))
+	}
+	hooksOp := findCopilotOp(ops, filepath.Join(".github", "hooks", "hooks.json"))
+	if hooksOp == nil {
+		t.Fatalf("missing hooks.json op")
+	}
+	if !strings.Contains(hooksOp.Content, "global-gate.sh") {
+		t.Errorf("hooks.json missing perms-guard gate wiring:\n%s", hooksOp.Content)
+	}
+	if !strings.Contains(hooksOp.Content, `"preToolUse"`) {
+		t.Errorf("hooks.json missing preToolUse event for gate:\n%s", hooksOp.Content)
+	}
+}
+
+// TestCopilot_Preview_ScopedHook_WrapperEmitted verifies that with the
+// flag on, scoped hooks materialize a __scope-guard__ wrapper just like
+// the other plugins, and hooks.json points at the wrapper via PROJECT_DIR.
+func TestCopilot_Preview_ScopedHook_WrapperEmitted(t *testing.T) {
+	projRoot := "/tmp/proj"
+	proj := &model.Project{
+		Root:      projRoot,
+		AgentsDir: filepath.Join(projRoot, ".agents"),
+		Context: &model.Document{
+			SourcePath: filepath.Join(projRoot, ".agents", "context.md"),
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{
+				Event:      "PreToolUse",
+				Matcher:    "Edit",
+				ScriptPath: filepath.Join(projRoot, ".agents", "src", "billing", "hooks", "verify.sh"),
+				ScopePath:  "src/billing",
+			},
+		},
+	}
+	p := &CopilotPlugin{EnablePreviewHooks: true}
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	wrapperRel := filepath.Join(".github", "hooks", "__scope-guard__", "src-billing-preToolUse-verify.sh")
+	if findCopilotOp(ops, wrapperRel) == nil {
+		t.Fatalf("missing scope-guard wrapper at %s; got %v", wrapperRel, copilotOpPaths(ops))
+	}
+	hooksOp := findCopilotOp(ops, filepath.Join(".github", "hooks", "hooks.json"))
+	if hooksOp == nil {
+		t.Fatalf("missing hooks.json op")
+	}
+	if !strings.Contains(hooksOp.Content, filepath.ToSlash(wrapperRel)) {
+		t.Errorf("hooks.json doesn't reference wrapper %s:\n%s", wrapperRel, hooksOp.Content)
+	}
+}
+
+// TestCopilot_Preview_CapabilityMatrixFlips verifies the Capabilities()
+// matrix reflects the flag: Hooks + Permissions native when on, both
+// unsupported when off.
+func TestCopilot_Preview_CapabilityMatrixFlips(t *testing.T) {
+	on := &CopilotPlugin{EnablePreviewHooks: true}
+	off := &CopilotPlugin{}
+	if on.Capabilities().Hooks != plugin.SupportNative {
+		t.Errorf("flag on Hooks = %v, want native", on.Capabilities().Hooks)
+	}
+	if on.Capabilities().Permissions != plugin.SupportNative {
+		t.Errorf("flag on Permissions = %v, want native", on.Capabilities().Permissions)
+	}
+	if off.Capabilities().Hooks != plugin.SupportUnsupported {
+		t.Errorf("flag off Hooks = %v, want unsupported", off.Capabilities().Hooks)
+	}
+	if off.Capabilities().Permissions != plugin.SupportUnsupported {
+		t.Errorf("flag off Permissions = %v, want unsupported", off.Capabilities().Permissions)
+	}
+}
+
+// findCopilotOp returns the operation matching path, or nil. Mirrors
+// the findOpByPath helper in cline_test.go.
+func findCopilotOp(ops []plugin.Operation, path string) *plugin.Operation {
+	for i := range ops {
+		if ops[i].Path == path {
+			return &ops[i]
+		}
+	}
+	return nil
+}
+
+// copilotOpPaths returns just the path slice for error messages.
+func copilotOpPaths(ops []plugin.Operation) []string {
+	out := make([]string, 0, len(ops))
+	for _, op := range ops {
+		out = append(out, op.Path)
+	}
+	return out
+}

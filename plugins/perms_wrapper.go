@@ -12,7 +12,7 @@ import (
 
 // emitPermsGuardWrappers builds the OpWrite operations that materialize the
 // prism perms-guard wrapper script + sidecar policy JSON for a plugin that
-// lacks a native permissions primitive (currently gemini, continue).
+// lacks a native permissions primitive (currently gemini, cline, copilot).
 //
 // One sidecar policy file is emitted per scope (global or scoped). Each
 // proj.Hook (if any) is wrapped with its own perms-guard script pointed
@@ -25,16 +25,28 @@ import (
 // function returns nil ops + nil warnings, leaving the projection
 // untouched (callers can still emit their own warnings if they want).
 //
-// The on-disk layout (under <pluginName>):
+// The on-disk layout (under <hooksRoot>/__perms-guard__/, where hooksRoot
+// defaults to .<pluginName>/hooks but can be overridden — copilot uses
+// .github/hooks, for example):
 //
-//	.<pluginName>/hooks/__perms-guard__/policy.json                — global policy
-//	.<pluginName>/hooks/__perms-guard__/<scope-slug>.policy.json   — scoped policy
-//	.<pluginName>/hooks/__perms-guard__/<event>-<basename>.sh      — wrapper per hook
-//	.<pluginName>/hooks/__perms-guard__/<scope-slug>-<event>-<basename>.sh
-//	.<pluginName>/hooks/__perms-guard__/global-gate.sh             — bare gate when no hooks
+//	<hooksRoot>/__perms-guard__/policy.json                — global policy
+//	<hooksRoot>/__perms-guard__/<scope-slug>.policy.json   — scoped policy
+//	<hooksRoot>/__perms-guard__/<event>-<basename>.sh      — wrapper per hook
+//	<hooksRoot>/__perms-guard__/<scope-slug>-<event>-<basename>.sh
+//	<hooksRoot>/__perms-guard__/global-gate.sh             — bare gate when no hooks
 //
 // All paths are project-relative; the engine resolves absolute paths.
 func emitPermsGuardWrappers(pluginName string, proj *model.Project, disabled bool) ([]plugin.Operation, []plugin.Warning, error) {
+	return emitPermsGuardWrappersAt(pluginName, filepath.Join("."+pluginName, "hooks"), proj, disabled)
+}
+
+// emitPermsGuardWrappersAt is the same as emitPermsGuardWrappers but lets
+// the caller specify an explicit hooksRoot (project-relative). Plugins
+// whose hook config lives outside their plugin-named dotdir (copilot
+// emits to .github/) use this entry point. hooksRoot is the parent of
+// the __perms-guard__ directory — e.g. ".github/hooks" yields
+// ".github/hooks/__perms-guard__/...".
+func emitPermsGuardWrappersAt(pluginName, hooksRoot string, proj *model.Project, disabled bool) ([]plugin.Operation, []plugin.Warning, error) {
 	if disabled || proj == nil {
 		return nil, nil, nil
 	}
@@ -54,7 +66,7 @@ func emitPermsGuardWrappers(pluginName string, proj *model.Project, disabled boo
 		return nil, nil, nil
 	}
 
-	hooksDir := filepath.Join("."+pluginName, "hooks", "__perms-guard__")
+	hooksDir := filepath.Join(hooksRoot, "__perms-guard__")
 
 	var ops []plugin.Operation
 	policyPaths := map[string]string{} // scope-path (or "") → project-relative policy path

@@ -11,13 +11,15 @@ import (
 
 // cliState carries shared state between subcommands.
 type cliState struct {
-	root           string
-	globalRoot     string
-	noGlobal       bool
-	noHookWrappers bool
+	root               string
+	globalRoot         string
+	noGlobal           bool
+	noHookWrappers     bool
+	enablePreviewHooks bool
 	// registry is rebuilt by ensureRegistry on first options() call so it
-	// reflects post-parse flag values (notably noHookWrappers). Subcommands
-	// should never read this directly — go through options().
+	// reflects post-parse flag values (notably noHookWrappers,
+	// enablePreviewHooks). Subcommands should never read this directly —
+	// go through options().
 	registry *plugin.Registry
 }
 
@@ -39,7 +41,7 @@ func (s *cliState) ensureRegistry() error {
 		return nil
 	}
 	reg := plugin.NewRegistry()
-	if err := registerPlugins(reg, s.noHookWrappers); err != nil {
+	if err := registerPlugins(reg, s.noHookWrappers, s.enablePreviewHooks); err != nil {
 		return err
 	}
 	s.registry = reg
@@ -89,6 +91,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&state.globalRoot, "global", defaultGlobal, "global layer root (parent of ~/.agents/); empty disables")
 	root.PersistentFlags().BoolVar(&state.noGlobal, "no-global", false, "skip the global layer even if --global is set")
 	root.PersistentFlags().BoolVar(&state.noHookWrappers, "no-hook-wrappers", false, "disable __scope-guard__ wrapper scripts for scoped Claude hooks (projects them as global hooks instead)")
+	root.PersistentFlags().BoolVar(&state.enablePreviewHooks, "enable-preview-hooks", false, "emit Copilot preview-stage hook projections (.github/hooks/hooks.json + perms-guard wiring); off by default until GA")
 
 	// `capabilities` is the only subcommand that reads from state.registry
 	// without going through cliState.options() — give it the same lazy

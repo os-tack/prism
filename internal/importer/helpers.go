@@ -10,6 +10,7 @@ package importer
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -248,4 +249,91 @@ func uniqueName(caller, base string, exists func(string) bool) string {
 	}
 	fmt.Fprintf(os.Stderr, "importer/%s: uniqueName cap (1000) hit for %q; collisions may occur\n", caller, base)
 	return base
+}
+
+// readPermsGuardSidecars reads the perms-guard policy sidecars that the
+// projection plugins emit under .<tool>/hooks/__perms-guard__/ and returns
+// them as model.Permissions / model.ScopedPermissions. Used by the cline
+// and copilot importers (which inherited gemini's wrapper pattern in v0.8.2).
+//
+// Convention: policy.json holds the global policy; <scope>.policy.json
+// holds the per-scope policy where <scope> is the slug emitted by
+// permsScopeSlug (e.g. "src-billing.policy.json"). The slug-to-path
+// inversion uses scopeFromSlug, which mirrors plugins/perms_wrapper.go's
+// permsScopeSlug (slash↔dash).
+//
+// Returns (nil, nil, nil) when the directory doesn't exist or contains
+// no readable policies.
+func readPermsGuardSidecars(dir string) (*model.Permissions, []*model.Permissions, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("importer: read %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	var global *model.Permissions
+	var scoped []*model.Permissions
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return nil, nil, fmt.Errorf("importer: read %s: %w", full, rerr)
+		}
+		var raw struct {
+			Allow []string `json:"allow"`
+			Deny  []string `json:"deny"`
+			Ask   []string `json:"ask"`
+		}
+		if len(data) > 0 {
+			if jerr := yamlOrJSONUnmarshalPerms(data, &raw); jerr != nil {
+				return nil, nil, fmt.Errorf("importer: parse %s: %w", full, jerr)
+			}
+		}
+		switch {
+		case name == "policy.json":
+			global = &model.Permissions{Allow: raw.Allow, Deny: raw.Deny, Ask: raw.Ask}
+		case strings.HasSuffix(name, ".policy.json"):
+			slug := strings.TrimSuffix(name, ".policy.json")
+			scoped = append(scoped, &model.Permissions{
+				ScopePath: scopeFromSlug(slug),
+				Allow:     raw.Allow,
+				Deny:      raw.Deny,
+				Ask:       raw.Ask,
+			})
+		}
+	}
+	return global, scoped, nil
+}
+
+// yamlOrJSONUnmarshalPerms decodes the perms-guard policy sidecar. The
+// projection writes JSON via perms.Marshal, but we accept either shape
+// defensively (users may hand-edit). Keeps the importer permissive in
+// the face of the standard "users will paste YAML somewhere" hazard.
+func yamlOrJSONUnmarshalPerms(data []byte, out any) error {
+	if err := json.Unmarshal(data, out); err == nil {
+		return nil
+	}
+	return yaml.Unmarshal(data, out)
+}
+
+// scopeFromSlug inverts permsScopeSlug in plugins/perms_wrapper.go. The
+// slug "global" is reserved for the un-scoped policy.json (we never call
+// scopeFromSlug for that filename); every other slug uses dash-to-slash
+// conversion. Best-effort: not always perfectly invertible (e.g. a scope
+// path that legitimately contained a dash will round-trip to a slash).
+func scopeFromSlug(slug string) string {
+	if slug == "" || slug == "global" {
+		return ""
+	}
+	return strings.ReplaceAll(slug, "-", "/")
 }

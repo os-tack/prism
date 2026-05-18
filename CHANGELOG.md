@@ -4,6 +4,94 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.8.2
+
+Three cells flipped: **copilot HOOKS** (preview, opt-in), **copilot PERMS**
+(wrapper, preview-gated), and **cline PERMS** (wrapper, always-on). Closes
+the three deferrals tracked in v0.8.1's "Sequenced for v0.8.2+" list. Issues
+#2 (cline perms-via-hook), #3 (copilot perms-via-hook), and #4 (copilot
+preview hooks).
+
+### Added
+- **`--enable-preview-hooks` persistent flag** (`cmd/prism/root.go`). Opts
+  into Copilot's preview-stage hook surface — `.github/hooks/hooks.json`
+  + the perms-guard wiring layered on top of it. Off by default since the
+  preview JSON schema can still drift before GA. Flag is persistent so
+  subcommands (`compile`, `check`, `diff`, `watch`) all honour it without
+  per-subcommand wiring.
+- **Copilot preview hooks** (`plugins/copilot.go`,
+  `internal/importer/copilot.go`). When the flag is on, `proj.Hooks` projects
+  to `.github/hooks/hooks.json` using the preview event-name mapping
+  (`PreToolUse` → `preToolUse`, `SessionStart` → `sessionStart`,
+  `UserPromptSubmit` → `userPromptSubmitted`, etc.). Scoped hooks reuse the
+  existing `prism scope-guard` wrapper at
+  `.github/hooks/__scope-guard__/<scope>-<event>-<hook>.sh` — Copilot's
+  preview hook contract is JSON-on-stdin with exit-2-blocks, matching the
+  Claude/Cline/Gemini shape the wrapper already handles. Hook commands in
+  `hooks.json` use `${PROJECT_DIR}/<rel>` so the projection survives `mv`
+  of the project tree (Copilot honours the same env var Claude does).
+  Importer round-trips the file back into `model.Hook`, filtering wrapper
+  paths as projection artifacts.
+- **Copilot perms-via-hook** (`plugins/copilot.go`,
+  `internal/importer/copilot.go`). Re-uses `emitPermsGuardWrappers` (now via
+  the new `emitPermsGuardWrappersAt` entry point that takes an explicit
+  hooks root, since copilot writes under `.github/hooks` rather than
+  `.copilot/hooks`). Wraps every user hook with a per-hook perms-guard
+  script + sidecar `policy.json`; when no user hooks exist, emits a bare
+  `global-gate.sh` and appends it as a `preToolUse` entry in `hooks.json`.
+  Importer reads `.github/hooks/__perms-guard__/policy.json` (and any
+  `<scope>.policy.json` siblings) back into `model.Permissions` /
+  `model.ScopedPermissions`.
+- **Cline perms-via-hook** (`plugins/cline.go`,
+  `internal/importer/cline.go`). Same wrapper pattern as gemini/copilot,
+  but always-on (Cline's hooks are GA, no preview flag needed). Hook
+  commands in `.clinerules/hooks/PreToolUse.json` are rewritten to point
+  at per-hook perms-guard wrappers when permissions exist; bare gates fall
+  back to standalone entries. Coexists cleanly with user-authored hooks
+  (the wrapper invokes the user script on allow).
+- **`emitPermsGuardWrappersAt` helper** (`plugins/perms_wrapper.go`). New
+  entry point that takes an explicit `hooksRoot` so plugins whose hook
+  config lives outside their plugin-named dotdir (copilot → `.github/hooks`)
+  can re-use the wrapper machinery. The existing `emitPermsGuardWrappers`
+  is now a thin shim over `emitPermsGuardWrappersAt` that defaults
+  `hooksRoot` to `.<pluginName>/hooks`. Gemini/cline callers are
+  source-compatible (they keep using the simpler name).
+- **`readPermsGuardSidecars` importer helper** (`internal/importer/helpers.go`).
+  Reads the perms-guard policy JSON sidecars (`policy.json` and
+  `<scope>.policy.json`) into `model.Permissions` / `model.ScopedPermissions`.
+  Shared by cline and copilot importers. Accepts either JSON or YAML
+  defensively in case users hand-edit.
+- **Round-trip coverage** (`internal/engine/roundtrip_v08_test.go`): two
+  new tests — `TestRoundTrip_Cline_V082_Perms` and
+  `TestRoundTrip_Copilot_V082_PreviewHooks` — lock the new emissions
+  closed. Existing v0.8.0/v0.8.1 round-trips remain to preserve the
+  legacy paths.
+
+### Changed
+- **`CopilotPlugin` struct** gains `DisableHookWrappers` and
+  `EnablePreviewHooks` bool fields, both wired through
+  `cmd/prism/plugins.go`. `ClinePlugin` was already structured this way
+  (only needed the registry switch from `NewCline()` to the explicit
+  struct literal so `DisableHookWrappers` propagates).
+- **Capability matrix** (`prism capabilities`):
+  - `cline    PERMS  ----  →  native`
+  - `copilot  HOOKS  ----  →  native` (when `--enable-preview-hooks`;
+    `----` otherwise)
+  - `copilot  PERMS  ----  →  native` (when `--enable-preview-hooks`;
+    `----` otherwise)
+- **`internal/version.Version` bumped to `0.8.2`**.
+
+### Notes
+- The `--enable-preview-hooks` flag is the ONLY thing keeping Copilot
+  hooks/perms off by default. The on-disk artifacts (hooks.json, policy
+  sidecar, wrappers) are believed-stable, but the Copilot JSON schema is
+  still in public preview at the GitHub side. When the schema GAs we'll
+  drop the flag and flip the default. The default-off behaviour preserves
+  the v0.8.1 contract for users who haven't opted in.
+- Cline's perms-via-hook flips on by default (no flag). Cline's hook
+  surface is GA, and the wrapper pattern was already validated through
+  gemini in v0.8.0 — no preview risk to gate on.
+
 ## v0.8.1
 
 Importer parity for the v0.8.0 emissions, helper consolidation, and a

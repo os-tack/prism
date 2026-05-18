@@ -90,3 +90,46 @@ func TestCline_V08_WorkflowsAndLegacyCommandsCoexist(t *testing.T) {
 		t.Errorf("expected a command named deploy, got %+v", names)
 	}
 }
+
+// TestCline_V08_PermsGuardSidecar verifies the v0.8.2 importer reads the
+// perms-guard policy sidecar back into model.Permissions, so a Cline
+// projection round-trips its allow/deny/ask lists. Wrapper scripts are
+// projection artifacts and not directly imported (the policy carries the
+// canonical content).
+func TestCline_V08_PermsGuardSidecar(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, ".clinerules"))
+
+	mustWrite(t, filepath.Join(root, ".cline", "hooks", "__perms-guard__", "policy.json"),
+		`{
+  "allow": ["bash:ls *"],
+  "deny": ["bash:rm -rf *"],
+  "ask": ["bash:git *"]
+}`)
+	mustWrite(t, filepath.Join(root, ".cline", "hooks", "__perms-guard__", "src-billing.policy.json"),
+		`{"deny": ["bash:psql *"]}`)
+
+	proj, _, err := NewCline().Import(root)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if proj.Permissions == nil {
+		t.Fatalf("Permissions = nil; want global allow/deny/ask round-tripped")
+	}
+	if len(proj.Permissions.Allow) != 1 || proj.Permissions.Allow[0] != "bash:ls *" {
+		t.Errorf("Permissions.Allow = %v", proj.Permissions.Allow)
+	}
+	if len(proj.Permissions.Deny) != 1 || proj.Permissions.Deny[0] != "bash:rm -rf *" {
+		t.Errorf("Permissions.Deny = %v", proj.Permissions.Deny)
+	}
+	if len(proj.Permissions.Ask) != 1 || proj.Permissions.Ask[0] != "bash:git *" {
+		t.Errorf("Permissions.Ask = %v", proj.Permissions.Ask)
+	}
+	if len(proj.ScopedPermissions) != 1 {
+		t.Fatalf("ScopedPermissions = %d, want 1", len(proj.ScopedPermissions))
+	}
+	sp := proj.ScopedPermissions[0]
+	if sp.ScopePath != "src/billing" || len(sp.Deny) != 1 || sp.Deny[0] != "bash:psql *" {
+		t.Errorf("scoped perms = %+v", sp)
+	}
+}

@@ -46,7 +46,25 @@ import (
 )
 
 // CopilotPlugin projects Project state into `.github/` files Copilot reads.
-type CopilotPlugin struct{}
+//
+// v0.8.2 additions (gated by EnablePreviewHooks):
+//   - .github/hooks/hooks.json — repo-local hook config (Copilot preview;
+//     spec: https://docs.github.com/en/copilot/reference/hooks-configuration)
+//   - .github/hooks/__scope-guard__/<wrapper>.sh — scoped-hook wrappers
+//   - .github/hooks/__perms-guard__/{policy.json,wrapper.sh} — perms-guard
+//     sidecar policy + PreToolUse wrapper that enforces it
+type CopilotPlugin struct {
+	// DisableHookWrappers, when true, suppresses both the perms-guard
+	// wrapper script + sidecar policy emission AND the scope-guard
+	// wrappers for scoped hooks. Mirrors ClaudePlugin/GeminiPlugin.
+	DisableHookWrappers bool
+
+	// EnablePreviewHooks, when true, opts into the Copilot preview hook
+	// surface: .github/hooks/hooks.json emission plus the perms-guard
+	// PreToolUse wiring that depends on it. Off by default since the
+	// preview JSON schema can still change before GA.
+	EnablePreviewHooks bool
+}
 
 // NewCopilot constructs a CopilotPlugin.
 //
@@ -73,7 +91,7 @@ func (p *CopilotPlugin) Detect(root string) bool {
 	return false
 }
 
-// Capabilities returns Copilot's capability matrix.
+// Capabilities returns Copilot.s capability matrix.
 //
 // Copilot natively supports a repo-wide instructions file (Context), per-glob
 // instruction attachment (ScopePaths), prompt files / slash commands
@@ -81,11 +99,20 @@ func (p *CopilotPlugin) Detect(root string) bool {
 // GA as of 2026), and project-local MCP via `.github/mcp.json` (MCP).
 //
 // ScopeSemantic stays degraded — `applyTo` is glob-only, with no
-// description-driven trigger. Skills degrade to scoped instructions. Hooks
-// are SupportUnsupported pending the public-preview hook surface; a future
-// `--enable-preview-hooks` flag can flip this. Permissions have no Copilot
-// analog.
+// description-driven trigger. Skills degrade to scoped instructions.
+//
+// Hooks and Permissions flip on the EnablePreviewHooks opt-in (v0.8.2).
+// Both surfaces ride the Copilot preview hooks API; Permissions enforcement
+// is wrapper-based (PreToolUse + perms-guard sidecar), Hooks projects the
+// canonical Hook slice into the preview .github/hooks/hooks.json schema.
+// When the flag is off, both stay `----` (the v0.8.1 default behaviour).
 func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
+	hooks := plugin.SupportUnsupported
+	perms := plugin.SupportUnsupported
+	if p.EnablePreviewHooks {
+		hooks = plugin.SupportNative
+		perms = plugin.SupportNative
+	}
 	return plugin.Capabilities{
 		Context:       plugin.SupportNative,
 		ScopePaths:    plugin.SupportNative,
@@ -93,8 +120,8 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 		Skills:        plugin.SupportDegraded,
 		Commands:      plugin.SupportNative,
 		Agents:        plugin.SupportNative,
-		Hooks:         plugin.SupportUnsupported, // preview; defer
-		Permissions:   plugin.SupportUnsupported,
+		Hooks:         hooks,
+		Permissions:   perms,
 		MCP:           plugin.SupportNative,
 	}
 }
@@ -378,43 +405,57 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		ops = append(ops, mcpOp)
 	}
 
-	// 7. Capability gaps that produce no files: collect warnings.
+	// 7. Hooks + Permissions.
+	//
+	// Both ride the Copilot preview hooks API (.github/hooks/hooks.json);
+	// they only emit when EnablePreviewHooks is set. When the flag is off
+	// we surface info warnings so the user knows what was dropped.
 	var warnings []plugin.Warning
-	for _, hook := range proj.Hooks {
-		if hook == nil {
-			continue
+
+	if p.EnablePreviewHooks {
+		hookOps, hookWarnings, err := p.planPreviewHooks(proj)
+		if err != nil {
+			return nil, err
 		}
-		msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected.", hook.Event, hook.Matcher)
-		if hook.ScopePath != "" {
-			msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected.", hook.Event, hook.Matcher, hook.ScopePath)
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   hook.ScriptPath,
-			Message:  msg,
-			Severity: "info",
-		})
-	}
-	if proj.Permissions != nil {
-		if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
+		ops = append(ops, hookOps...)
+		warnings = append(warnings, hookWarnings...)
+	} else {
+		for _, hook := range proj.Hooks {
+			if hook == nil {
+				continue
+			}
+			msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected (pass --enable-preview-hooks to opt in).", hook.Event, hook.Matcher)
+			if hook.ScopePath != "" {
+				msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected (pass --enable-preview-hooks to opt in).", hook.Event, hook.Matcher, hook.ScopePath)
+			}
 			warnings = append(warnings, plugin.Warning{
-				Source:   "permissions.yaml",
-				Message:  "Copilot has no permissions primitive; permissions not projected.",
+				Source:   hook.ScriptPath,
+				Message:  msg,
 				Severity: "info",
 			})
 		}
-	}
-	for _, sp := range proj.ScopedPermissions {
-		if sp == nil {
-			continue
+		if proj.Permissions != nil {
+			if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
+				warnings = append(warnings, plugin.Warning{
+					Source:   "permissions.yaml",
+					Message:  "Copilot has no permissions primitive without preview hooks; permissions not projected (pass --enable-preview-hooks to opt in).",
+					Severity: "info",
+				})
+			}
 		}
-		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
-			continue
+		for _, sp := range proj.ScopedPermissions {
+			if sp == nil {
+				continue
+			}
+			if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+				continue
+			}
+			warnings = append(warnings, plugin.Warning{
+				Source:   "permissions.yaml",
+				Message:  fmt.Sprintf("Copilot has no permissions primitive without preview hooks; scoped permissions (scope: %s) not projected (pass --enable-preview-hooks to opt in).", sp.ScopePath),
+				Severity: "info",
+			})
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "permissions.yaml",
-			Message:  fmt.Sprintf("Copilot has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
-			Severity: "info",
-		})
 	}
 
 	// Attach warnings without a host op to the first emitted op. If no op
@@ -739,3 +780,257 @@ func buildCopilotMCPOp(proj *model.Project) plugin.Operation {
 
 // Compile-time check that CopilotPlugin satisfies plugin.Plugin.
 var _ plugin.Plugin = (*CopilotPlugin)(nil)
+
+// copilotHookEventMap translates prism's canonical Hook.Event values into
+// Copilot's preview hook event names (camelCase per the GitHub docs).
+// Claude-style PreToolUse/PostToolUse names map cleanly; SessionStart,
+// SessionEnd, UserPromptSubmit, Stop, and SubagentStop have direct
+// preview-event counterparts (re-cased). Unknown events drop with an info
+// warning rather than emit an unrecognized event name.
+//
+// Reference: https://docs.github.com/en/copilot/reference/hooks-configuration
+var copilotHookEventMap = map[string]string{
+	"PreToolUse":       "preToolUse",
+	"PostToolUse":      "postToolUse",
+	"SessionStart":     "sessionStart",
+	"SessionEnd":       "sessionEnd",
+	"UserPromptSubmit": "userPromptSubmitted",
+	"UserPrompt":       "userPromptSubmitted",
+	"Stop":             "agentStop",
+	"AgentStop":        "agentStop",
+	"SubagentStop":     "subagentStop",
+	"ErrorOccurred":    "errorOccurred",
+	"Notification":     "errorOccurred",
+}
+
+// mapCopilotHookEvent returns (event, ok). ok=false means the canonical
+// event has no Copilot preview counterpart and the caller should warn-and-drop.
+func mapCopilotHookEvent(event string) (string, bool) {
+	if mapped, ok := copilotHookEventMap[event]; ok {
+		return mapped, true
+	}
+	// Pass through anything that already looks camelCase Copilot-shaped.
+	if event != "" && event[0] >= 'a' && event[0] <= 'z' {
+		return event, true
+	}
+	return "", false
+}
+
+// copilotHookEntry mirrors a single hook command entry inside hooks.json.
+// Schema is {type: "command", command: "<path>"} matching Claude's contract
+// (Copilot picked the same shape for cross-tool compatibility).
+type copilotHookEntry struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+}
+
+// copilotHookGroup is one matcher group inside an event bucket.
+type copilotHookGroup struct {
+	Matcher string             `json:"matcher,omitempty"`
+	Hooks   []copilotHookEntry `json:"hooks"`
+}
+
+// planPreviewHooks emits the Copilot preview hook surface: scope-guard
+// wrapper scripts (one per scoped hook), perms-guard wrapper + sidecar
+// policies (when permissions exist), and the unified .github/hooks/hooks.json
+// that wires events to commands. Returns the ops, info warnings for any
+// unmappable canonical events, and the first error encountered.
+//
+// Called only when EnablePreviewHooks is true; callers gate.
+func (p *CopilotPlugin) planPreviewHooks(proj *model.Project) ([]plugin.Operation, []plugin.Warning, error) {
+	var ops []plugin.Operation
+	var warnings []plugin.Warning
+
+	// Scope-guard wrappers for scoped hooks, mirroring claude/cline/gemini.
+	wrapperPaths := map[*model.Hook]string{}
+	for _, h := range proj.Hooks {
+		if h == nil || h.ScopePath == "" || p.DisableHookWrappers {
+			continue
+		}
+		mappedEvent, ok := mapCopilotHookEvent(h.Event)
+		if !ok {
+			continue
+		}
+		hookBase := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
+		wrapperFile := scopeSlug(h.ScopePath) + "-" + mappedEvent + "-" + hookBase + ".sh"
+		wrapperRel := filepath.Join(".github", "hooks", "__scope-guard__", wrapperFile)
+		body := buildScopeGuardScript(wrapperRel, h.ScopePath, h.ScriptPath, formatScriptArg(h.ScriptPath, proj.Root))
+		ops = append(ops, plugin.Operation{
+			Kind:     plugin.OpWrite,
+			Path:     wrapperRel,
+			Content:  body,
+			Mode:     plugin.ModeWrite,
+			FileMode: 0o755,
+			Sources:  []string{proj.SourceTag(h.ScriptPath)},
+			Plugin:   p.Name(),
+		})
+		wrapperPaths[h] = wrapperRel
+	}
+
+	// Perms-guard wrappers + sidecar policies. The helper emits the
+	// policy.json sidecar plus either per-hook wrappers (when user
+	// hooks exist) or bare gate wrappers (when only permissions exist).
+	// Per-hook wrappers replace the raw command in hooks.json below;
+	// gate wrappers append as standalone preToolUse entries.
+	permsOps, permsWarnings, err := emitPermsGuardWrappersAt(p.Name(), filepath.Join(".github", "hooks"), proj, p.DisableHookWrappers)
+	if err != nil {
+		return nil, nil, err
+	}
+	ops = append(ops, permsOps...)
+	warnings = append(warnings, permsWarnings...)
+
+	permsHookWrappers := map[*model.Hook]string{}
+	for _, h := range proj.Hooks {
+		if h == nil || h.Event == "" {
+			continue
+		}
+		base := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
+		var wrapperName string
+		if h.ScopePath == "" {
+			wrapperName = h.Event + "-" + base + ".sh"
+		} else {
+			wrapperName = permsScopeSlug(h.ScopePath) + "-" + h.Event + "-" + base + ".sh"
+		}
+		wrapperRel := filepath.Join(".github", "hooks", "__perms-guard__", wrapperName)
+		for _, op := range permsOps {
+			if op.Path == wrapperRel {
+				permsHookWrappers[h] = wrapperRel
+				break
+			}
+		}
+	}
+
+	var permsGateRefs []string
+	for _, op := range permsOps {
+		if !strings.Contains(op.Path, "__perms-guard__") {
+			continue
+		}
+		if !strings.HasSuffix(op.Path, "-gate.sh") && !strings.HasSuffix(op.Path, "global-gate.sh") {
+			continue
+		}
+		permsGateRefs = append(permsGateRefs, op.Path)
+	}
+	sort.Strings(permsGateRefs)
+
+	// Build the hooks.json event buckets.
+	buckets := map[string][]copilotHookGroup{}
+	eventOrder := []string{}
+	matcherOrder := map[string][]string{}
+	addEntry := func(event, matcher string, entry copilotHookEntry) {
+		if _, ok := buckets[event]; !ok {
+			eventOrder = append(eventOrder, event)
+		}
+		matchers := matcherOrder[event]
+		found := false
+		for i, g := range buckets[event] {
+			if g.Matcher == matcher {
+				buckets[event][i].Hooks = append(buckets[event][i].Hooks, entry)
+				found = true
+				break
+			}
+		}
+		if !found {
+			buckets[event] = append(buckets[event], copilotHookGroup{
+				Matcher: matcher,
+				Hooks:   []copilotHookEntry{entry},
+			})
+			matcherOrder[event] = append(matchers, matcher)
+		}
+	}
+
+	for _, h := range proj.Hooks {
+		if h == nil || h.Event == "" {
+			continue
+		}
+		mappedEvent, ok := mapCopilotHookEvent(h.Event)
+		if !ok {
+			warnings = append(warnings, plugin.Warning{
+				Source:   proj.SourceTag(h.ScriptPath),
+				Message:  fmt.Sprintf("Copilot has no preview event for %q; hook not projected.", h.Event),
+				Severity: "info",
+			})
+			continue
+		}
+		var cmdPath string
+		switch {
+		case wrapperPaths[h] != "":
+			cmdPath = "${PROJECT_DIR}/" + filepath.ToSlash(wrapperPaths[h])
+		case permsHookWrappers[h] != "":
+			cmdPath = "${PROJECT_DIR}/" + filepath.ToSlash(permsHookWrappers[h])
+		case filepath.IsAbs(h.ScriptPath):
+			if rel, rerr := filepath.Rel(proj.Root, h.ScriptPath); rerr == nil && !strings.HasPrefix(rel, "..") {
+				cmdPath = "${PROJECT_DIR}/" + filepath.ToSlash(rel)
+			} else {
+				cmdPath = h.ScriptPath
+			}
+		default:
+			cmdPath = "${PROJECT_DIR}/" + filepath.ToSlash(h.ScriptPath)
+		}
+		addEntry(mappedEvent, h.Matcher, copilotHookEntry{Type: "command", Command: cmdPath})
+	}
+
+	// Wire perms-guard gate wrappers into preToolUse, so every tool call
+	// flows through the policy. Emitted regardless of whether user hooks
+	// already populate preToolUse — the entries run in document order.
+	for _, gate := range permsGateRefs {
+		addEntry("preToolUse", "", copilotHookEntry{
+			Type:    "command",
+			Command: "${PROJECT_DIR}/" + filepath.ToSlash(gate),
+		})
+	}
+
+	// No hooks to emit? Return any wrappers/policies + warnings; skip the
+	// hooks.json file. (perms-guard policies might still exist as standalone
+	// sidecars in this case — the gate wrappers were appended above so we
+	// will have entries to wire.)
+	if len(eventOrder) == 0 {
+		return ops, warnings, nil
+	}
+
+	sort.Strings(eventOrder)
+	for event, groups := range buckets {
+		matchers := append([]string(nil), matcherOrder[event]...)
+		sort.Strings(matchers)
+		sorted := make([]copilotHookGroup, 0, len(groups))
+		for _, m := range matchers {
+			for _, g := range groups {
+				if g.Matcher == m {
+					sorted = append(sorted, g)
+					break
+				}
+			}
+		}
+		buckets[event] = sorted
+	}
+
+	doc := map[string]any{
+		"version": 1,
+		"hooks":   buckets,
+	}
+	content, jerr := json.MarshalIndent(doc, "", "  ")
+	if jerr != nil {
+		return nil, nil, fmt.Errorf("copilot: marshal hooks.json: %w", jerr)
+	}
+
+	sources := []string{}
+	if len(proj.Hooks) > 0 {
+		sources = append(sources, "hooks.yaml")
+	}
+	if len(permsGateRefs) > 0 {
+		sources = append(sources, "permissions.yaml")
+	}
+	if len(sources) == 0 {
+		sources = []string{"hooks.yaml"}
+	}
+
+	ops = append(ops, plugin.Operation{
+		Kind:    plugin.OpWrite,
+		Path:    filepath.Join(".github", "hooks", "hooks.json"),
+		Content: string(content) + "\n",
+		Mode:    plugin.ModeWrite,
+		Plugin:  p.Name(),
+		Sources: sources,
+	})
+
+	return ops, warnings, nil
+}

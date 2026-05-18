@@ -21,16 +21,21 @@ import (
 // constructors so the field can be set at construction time.
 // ContinuePlugin migrated to native permissions in v0.8 and no longer
 // participates in the wrapper path.
-func registerPlugins(reg *plugin.Registry, noHookWrappers bool) error {
+//
+// enablePreviewHooks turns on Copilot's preview-stage hook + perms-via-hook
+// emissions (v0.8.2). Off by default since Copilot hooks were public-preview
+// at release; flipping the flag emits .github/hooks/hooks.json and the
+// __perms-guard__ wiring under that directory.
+func registerPlugins(reg *plugin.Registry, noHookWrappers, enablePreviewHooks bool) error {
 	toRegister := []plugin.Plugin{
 		&plugins.ClaudePlugin{DisableHookWrappers: noHookWrappers},
 		plugins.NewCursor(),
 		plugins.NewAgentsMD(),
 		&plugins.GeminiPlugin{DisableHookWrappers: noHookWrappers},
-		plugins.NewCline(),
+		&plugins.ClinePlugin{DisableHookWrappers: noHookWrappers},
 		plugins.NewContinue(),
 		plugins.NewWindsurf(),
-		plugins.NewCopilot(),
+		&plugins.CopilotPlugin{DisableHookWrappers: noHookWrappers, EnablePreviewHooks: enablePreviewHooks},
 	}
 	for _, p := range toRegister {
 		if err := reg.Register(p); err != nil {
