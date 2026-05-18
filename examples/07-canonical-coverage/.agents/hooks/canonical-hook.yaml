@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/hook.schema.json
+name: canonical-hook
+description: |
+  Exercises the canonical Hook shape: event, matcher kinds, three
+  handler kinds (command, http, mcp_tool), sequential / disabled
+  toggles, and the extensions block.
+event: pre_tool_use
+matcher:
+  kind: exact
+  patterns:
+    - Edit
+    - Write
+    - MultiEdit
+handlers:
+  - kind: command
+    command: ${project_dir}/.agents/hooks/scripts/block-secrets.sh
+    args:
+      - --strict
+    cwd: ${project_dir}
+    env:
+      LOG_LEVEL: debug
+    shell: bash
+    timeout_ms: 5000
+    status_message: "Scanning for secrets…"
+    async: false
+    fail_closed: true
+    once: false
+    if: "Edit(.env*) || Write(.env*)"
+  - kind: http
+    url: https://hooks.example.com/pre-tool
+    headers:
+      Authorization: Bearer ${env:HOOK_TOKEN}
+      Content-Type: application/json
+    allowed_env_vars:
+      - HOOK_TOKEN
+    timeout_ms: 3000
+  - kind: mcp_tool
+    mcp_server: github
+    mcp_name: check_pr_status
+    mcp_input:
+      include_drafts: false
+      since: "1h"
+    timeout_ms: 4000
+sequential: true
+disabled: false
+extensions:
+  claude:
+    permissionMode: plan
+  cursor:
+    failClosed: true

@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/agents.config.schema.json
+#
+# 07-canonical-coverage: the v0.9.0 round-trip / golden fixture.
+#
+# This project exercises every canonical field of every primitive at
+# least once. Phase 4's contract test runs:
+#
+#   parse → validate → plan → emit → re-parse
+#
+# against this tree and asserts byte-identical round-trip on the
+# canonical model. If you add a canonical field to internal/model/,
+# add an exerciser here in the same PR.
+schema_version: 2
+targets:
+  - claude
+  - cursor
+  - gemini
+  - copilot
+  - cline
+  - continue
+  - windsurf
+  - agents-md
+target_options:
+  cursor:
+    mode: write          # force write instead of symlink
+  agents-md:
+    disabled: false      # the default; spelled here to exercise the field
+    extensions:
+      myorg:
+        emit_section_marker: true
+include:
+  - ~/.agents            # personal layer (silently skipped if absent)
+extensions:
+  myorg:
+    org_id: acme-corp
+    contract_test_fixture: true

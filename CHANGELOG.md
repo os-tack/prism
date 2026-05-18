@@ -4,6 +4,203 @@ All notable changes to **prism** are documented here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## v0.9.0
+
+The canonical-schema release. v0.9 is the first cut of the **schema v2**
+contract: seven canonical primitives, per-field capability declarations,
+polymorphic activation, dimension-aware permissions, an explicit MCP
+transport enum + auth + policy surface, a canonical hook event taxonomy,
+and a project-wide `extensions:` pass-through. The v0.9 line is the
+v1.0 soak cycle per SPEC §11.2 — additive schema changes resume at v0.10
+once the contract test suite has run against the registry and any
+third-party plugins for a release.
+
+This is a greenfield release. There is no installed base of the implicit
+v1 form (schema_version-less) to migrate from; the parser warns on
+missing `schema_version:` for v0.9.x and will error in a follow-up
+hardening release.
+
+### Added — canonical model (`internal/model/`)
+
+- **Seven canonical primitives** per SPEC §2.1 + §4: Agent, Skill,
+  Command, Hook, MCPServer, Permissions, Scope. The Context and Rule
+  primitives were collapsed (a Scope with `Path: ""` and
+  `Activation: Always` IS the root context; Rules and Skills share the
+  polymorphic SkillActivation shape). Workflows are Skills with
+  `Activation.Modes = [Manual]`.
+- **Polymorphic `SkillActivation`** (SPEC §4.2.4): a `Modes` set
+  (`always`, `model_decision`, `glob`, `manual`) combined with `Globs`,
+  `ContentRegex`, `UserInvocable`, `ModelInvocable`. Empty Modes
+  defaults to `[ModelDecision]`. Plugins that can only express one
+  mode pick the most permissive available.
+- **Canonical hook event taxonomy** (SPEC §4.4): 25 canonical
+  `HookEvent` constants spanning generic (`pre_tool_use`,
+  `post_tool_use`) AND per-action (`pre_shell`, `pre_file_read`,
+  `post_file_edit`, `pre_mcp_call`, `post_mcp_call`) levels. Per-action
+  events translate to (generic + matcher) on plugins lacking the
+  specific event. Tool-specific events not in the canonical set are
+  carried verbatim via the `native:<verbatim>` escape — prism doesn't
+  translate; only the matching plugin emits.
+- **`MCPServer.Transport` required enum** (`"stdio" | "http" | "sse"`)
+  per SPEC §4.5. Plugins map to their native wire spelling (Cline
+  `streamableHttp`, Continue `streamable-http`, Gemini
+  `httpUrl`-vs-`url`). The canonical layer never infers transport.
+- **`MCPAuth` shape** with `Scheme` (`none | bearer | header | oauth`),
+  `Token`, `Headers`. OAuth is informational only (no projector
+  materializes it; prism warns and the user wires OAuth in the tool's
+  UI).
+- **Six MCP policy fields**: `TimeoutMs`, `Disabled`, `AutoApprove`,
+  `Trust`, `IncludeTools`, `ExcludeTools`. Plugins MAY honor; plugins
+  without support emit an info warning when set. `Disabled` is honored
+  universally by skipping emit (no warning).
+- **Dimension-aware permission grammar** (SPEC §4.6.2):
+  `<target>:<pattern>` and `<target>:<subaction>:<pattern>` with
+  recognized targets `bash`, `Read|Write|Edit|MultiEdit`, `fs`,
+  `network`, `mcp:<server>[:<tool>]`. Patterns support exact, trailing
+  `*` (prefix), recursive `**`, and negation prefix `!`. Resolution
+  order: **Deny > Allow > Ask > Default**. Regex patterns are rejected.
+- **`extensions:` block on every primitive** + on `agents.config.yaml`
+  itself (SPEC §5.1). Plugin-namespaced opaque pass-through; unknown
+  plugin keys produce a typo warning. Promoting an extension to a
+  canonical field is a minor bump with a one-cycle deprecation window.
+- **Canonical argument substitution** for Command and Skill bodies:
+  `{{arg:NAME}}`, `{{shell:CMD}}`, `{{file:PATH}}`. prism never
+  evaluates substitutions at compile time — plugins rewrite to the
+  target's native syntax at emit (Claude `$NAME` / `` !`...` ``;
+  Gemini `{{args}}` collapse; Copilot `${input:NAME}`; etc.). Variable
+  substitution `${env:VAR}` (env vars) and `${project_dir}` (project
+  root) are documented per SPEC §4.5.3.
+- **`Scope.IsOverride`** (SPEC §4.7) for the `AGENTS.override.md`
+  semantic. Round-trips only on AGENTS.md; other plugins emit as a
+  regular scope with a leading comment noting the intent so future
+  round-trips can detect.
+- **Virtual scopes** (SPEC §4.7.5): a Scope with `Path: ""` and
+  `Globs: [...]` has no cascade home; cascade plugins handle via
+  `extensions.<plugin>.virtual_hoist` (default true → hoist into
+  `_virtual_rules/<Name>.md`; false → skip with warning).
+
+### Added — schema, validation, lockfile
+
+- **`schema_version: 2` required in `agents.config.yaml`** (SPEC §3.1.1
+  + §8.1). v0.9 reads only `2`. Forward-incompat (e.g. `3` on a v0.9
+  binary) is a hard error with an upgrade message. Missing
+  `schema_version` is a parser warning in v0.9; phase-2 hardening
+  promotes to error.
+- **Lockfile `version: 2`** with Cargo-style forward-incompat error.
+  Lockfiles written by a newer prism are unreadable by an older one
+  ("lockfile version 3 is newer than this binary understands; upgrade
+  prism or delete .agents/.lock").
+- **Single pre-plugin `Validate()` pass** (SPEC §5.4) returning
+  `ValidationReport{Errors, Warnings}` with `File`, `Line`, `Column`,
+  `Field` (dot-path), `Severity`, `Message`. Errors block compile;
+  warnings are surfaced and compile proceeds.
+- **`--strict` flag on `prism check`** promotes warnings to errors for
+  CI. `compile`/`diff`/`watch` honor warnings as warnings.
+- **JSON Schema generation** at `schema/v2/*.schema.json` (one per
+  primitive + agents.config + extensions). Draft 2020-12. Generated
+  via `invopop/jsonschema` from struct tags. New `cmd/prism-schema`
+  regenerates from struct definitions. Editors discover via the
+  `# yaml-language-server: $schema=https://prism.dev/schema/v2/...`
+  hint at the top of each example.
+
+### Added — plugin interface (`internal/plugin/`)
+
+- **Per-field capability declarations** (SPEC §6.2). `Plugin.Capabilities()`
+  now returns a typed `Capabilities` struct that includes a
+  `FieldCapabilities` map keyed by primitive + field, with values from
+  the enum `{ SupportNative, SupportDegraded, SupportUnsupported,
+  SupportSilent, FieldSilent }`. The engine cross-references
+  per-project usage against per-plugin capabilities and surfaces a
+  single coherent warning report (no more per-plugin scattered
+  warnings).
+- **`SupportSilent` / `FieldSilent` level**: the field is dropped
+  without warning because the field is semantically meaningless on
+  that target (versus `SupportUnsupported`, which warns). Used heavily
+  on AGENTS.md (skill / hook fields silent, not unsupported) and on
+  fields like `ModelFallbacks` that only one plugin honors.
+- **`Plugin.SchemaVersion()` expectations**: plugins declare the
+  schema version they understand. The engine refuses to load any
+  plugin whose declared version predates the project's
+  `schema_version:`.
+- **`Plan()` purity invariant** preserved from v0.7: plugins never
+  touch the filesystem in `Plan()`; the engine handles all I/O and
+  passes existing bytes to `Merger` closures.
+
+### Added — plugin updates
+
+- **All 8 plugins declare per-field Capabilities** per the §12 matrix:
+  agents-md, claude, cline, continue, copilot, cursor, gemini,
+  windsurf. The §6.2 cross-reference replaces the v0.8 per-plugin
+  warning sites.
+
+### Added — documentation, examples
+
+- **SPEC.md** (2772 lines) covers the seven primitives, scoping rules,
+  cross-cutting concerns, plugin interface, lockfile, schema
+  versioning, JSON Schema pointers, open questions, and the full
+  per-field × per-plugin capability matrix (§12).
+- **IMPLEMENTATION_PLAN.md** sequences the v0.9.0 cut into phases (0
+  scaffolding, 1 model + parser, 2 validate, 3 plugin contract, 4
+  contract tests, 5 docs + examples, 6 lockfile + cmd surface).
+- **`examples/07-canonical-coverage/`**: a comprehensive fixture
+  exercising every canonical field of every primitive at least once
+  (the golden round-trip fixture per IMPLEMENTATION_PLAN §4.5). The
+  contract test (Phase 4) uses this fixture to assert
+  parse → validate → plan → emit → re-parse stability.
+- **YAML language-server hints** at the top of every example's
+  `agents.config.yaml` so editors auto-resolve the v2 schema.
+
+### Changed
+
+- **Plugin warning sites consolidated** behind the per-field
+  capability cross-reference. Plugins that previously emitted ad-hoc
+  warnings on each unsupported field now declare the field's level in
+  `Capabilities()` and let the engine collate.
+- **Cline `paths:` frontmatter on rule files** is the canonical scope
+  encoding (was filename-prefix in v0.7 and earlier). The filename
+  prefix is still readable by the importer for backward compat.
+
+### Deferred / Phase 2.5 (still pending in this release)
+
+Several Phase 2.5 plumbing items remain — the canonical schema lands
+in v0.9.0 but a handful of plugin-side emit paths still need the new
+shared serializer wiring:
+
+- **Continue HOOKS** (`plugins/continue_plugin.go`). Continue grew a
+  native hooks surface; the canonical model carries the events but the
+  Continue plugin still emits "unsupported (warn)" for every hook
+  pending the shared serializer flip. Planned for Phase 2.5.
+- **Claude permission rule fan-out**: the dimension-aware `fs:` /
+  `network:` / `mcp:` grammar parses canonically, but Claude's
+  `Edit/Read/Write/WebFetch/mcp__*` fan-out (SPEC §4.6.3) is still
+  driven by the v0.8 string-rewrite path. Migration to the shared
+  emitter is Phase 2.5.
+- **MCP wire shape from typed transport/auth**: plugins still hand-roll
+  the JSON for the most part. The shared `mcp.WireFormat(server,
+  plugin)` helper is wired in only on claude + gemini today; the
+  remaining six plugins continue to use their v0.8 path.
+- **Cline filename-dispatch hooks emission rewrite**: per SPEC §4.4.5,
+  Cline writes one executable script per `(event, matcher)` pair with
+  guard-clause inlining. The current Cline plugin still emits the v0.8
+  JSON-block shape; the filename-dispatch rewrite is Phase 2.5.
+- **Cursor cross-emit dedup + per-project warning**: Cursor reads
+  `.claude/agents/` directly when present. SPEC §4.1.4 says Cursor
+  should suppress `.cursor/agents/` emission when claude is also a
+  target, with **one info warning per project**. v0.9.0 still
+  double-emits.
+- **Gemini per-action event translation via shared map**: §4.4.4's
+  translation table is hand-maintained in the Gemini plugin today; the
+  shared `hookevents.TranslateForPlugin(event, plugin)` helper is
+  wired into the canonical model but the Gemini plugin still uses its
+  v0.8 inline switch.
+- **AGENTS.override.md filename split**: the AGENTS.md plugin
+  recognizes `IsOverride` but emits everything as `AGENTS.md` for now;
+  the filename split (`AGENTS.override.md` vs `AGENTS.md`) is Phase
+  2.5.
+
+These items are tracked as v0.9.x follow-ups; none of them block the
+canonical-schema contract.
+
 ## v0.8.2
 
 Three cells flipped: **copilot HOOKS** (preview, opt-in), **copilot PERMS**

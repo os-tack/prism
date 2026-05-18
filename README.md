@@ -106,6 +106,25 @@ to the source trace. Currently expanded only in `context.md` files (root and
 scoped); `SKILL.md`, `commands/*.md`, and `agents/*.md` use a no-expand
 read path.
 
+## Schema version
+
+prism's canonical model is versioned. v0.9.0 ships **schema v2** — the
+contract that the rest of the v0.9 → v1.0 line is committed to. Every
+`agents.config.yaml` MUST declare `schema_version: 2` at the top; v0.9
+reads only `2`, and a forward-incompat value (e.g. `3`) is a hard error
+with an upgrade message.
+
+The full spec — seven canonical primitives, polymorphic activation,
+dimension-aware permissions, the MCP transport/auth/policy surface, the
+hook event taxonomy, the `extensions:` block, JSON Schema pointers, and
+the per-field × per-plugin capability matrix — lives in
+[SPEC.md](SPEC.md). The v0.9 line is the **soak cycle** before v1.0
+declares stability per SPEC §11.2.
+
+JSON Schemas for editor integration live at `schema/v2/`. Each example
+under `examples/` ships a `# yaml-language-server: $schema=...` hint
+at the top so editors auto-resolve.
+
 ## Capability matrix
 
 ```
@@ -113,7 +132,7 @@ PLUGIN     CONTEXT  PATHS   SEMANTIC  SKILLS  CMDS    AGENTS  HOOKS   PERMS   MC
 agents-md  native   degr.   degr.     degr.   degr.   degr.   degr.   degr.   degr.
 claude     native   native  degr.     native  native  native  native  native  native
 cline      native   native  native    degr.   native  ----    native  native  native
-continue   native   native  native    degr.   native  ----    ----    native  native
+continue   native   native  native    degr.   native  ----    --†    native  native
 copilot    native   native  degr.     degr.   native  native  native* native* native
 cursor     native   native  native    native  native  native  native  ----    native
 gemini     native   native  degr.     degr.   native  native  native  native  native
@@ -122,8 +141,15 @@ windsurf   native   native  native    degr.   degr.   ----    native  ----    na
 
 - **native**: 1:1 mapping; full fidelity.
 - **native\*** (copilot Hooks + Perms): native projection, opt-in via `--enable-preview-hooks` because the underlying Copilot hook API is in public preview at the GitHub side. Default OFF; flip on per-run or in CI.
-- **degr.** (degraded): approximated in the target.s nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
+- **--†** (continue Hooks): Continue grew a native hooks surface; the canonical model carries the events but the plugin still emits "unsupported (warn)" pending Phase 2.5 shared-serializer wiring. See [CHANGELOG.md](CHANGELOG.md) v0.9.0 "Deferred / Phase 2.5" for the full list.
+- **degr.** (degraded): approximated in the target's nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
 - **----** (unsupported): not projected. Plugin emits a warning naming the dropped item.
+
+Schema v2 is in **soak cycle** for the v0.9 line — additive changes
+resume at v0.10 once the contract test suite has run against the
+registry and any third-party plugins. The fine-grained per-field
+capability matrix (which fields are silent vs unsupported on which
+plugins) lives in [SPEC.md §12](SPEC.md).
 
 As of v0.8.2, **20 cells have flipped from `----` or `degr.` to `native`** across the v0.8 series. v0.8.0 rewrote six of eight plugins for May 2026 feature parity (17 cells). v0.8.2 added cline PERMS plus copilot HOOKS + PERMS (3 cells; copilot is preview-gated). See [CHANGELOG.md](CHANGELOG.md) for the per-plugin breakdown.
 
@@ -348,6 +374,12 @@ engine-side so they're portable across macOS/Linux/Windows.
 
 [See CHANGELOG.md](CHANGELOG.md) for full release notes. Highlights:
 
+- **v0.9.0** — canonical schema v2: seven primitives, per-field
+  capability declarations, polymorphic skill activation,
+  dimension-aware permissions (`fs:`/`network:`/`mcp:`/`**`/`!`),
+  explicit MCP transport+auth+policy surface, 25 canonical hook events,
+  project-wide `extensions:` block, `Validate()` pass with `--strict`,
+  JSON Schema generation at `schema/v2/`, soak cycle for v1.0
 - **v0.8.2** — copilot HOOKS (preview, opt-in), copilot PERMS, cline PERMS;
   three more cells flipped to native (issues #2/#3/#4)
 - **v0.8.1** — importer parity for the v0.8.0 emissions; round-trip lock-in

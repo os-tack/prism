@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/permissions.schema.json
+#
+# Exercises the dimension-aware permission grammar (SPEC §4.6.2):
+# bash:, Edit/Read/Write/MultiEdit:, fs:, network:, mcp:<server>[:<tool>],
+# with exact / prefix / recursive / negated patterns.
+allow:
+  - bash:go test *
+  - bash:npm test *
+  - Read:**
+  - Edit:src/**
+  - Write:src/**
+  - MultiEdit:src/**
+  - fs:docs/**
+  - fs:!src/billing/migrations/*
+  - network:github.com
+  - network:*.npmjs.org
+  - mcp:github:*
+  - mcp:linear:list_teams
+
+ask:
+  - bash:npm install *
+  - Edit:.env*
+  - mcp:github:create_issue
+
+deny:
+  - bash:rm -rf *
+  - bash:git push *
+  - fs:.ssh/**
+  - fs:**/.git/**
+  - network:*
+  - mcp:github:delete_repository

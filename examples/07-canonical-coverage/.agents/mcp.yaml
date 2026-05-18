@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/mcpserver.schema.json
+#
+# Exercises all three MCP transports + Auth bearer + Auth header + the
+# six MCP policy fields (TimeoutMs, Disabled, AutoApprove, Trust,
+# IncludeTools, ExcludeTools).
+servers:
+  - name: github
+    transport: stdio
+    command: uvx
+    args:
+      - mcp-server-github
+    env:
+      GITHUB_TOKEN: ${env:GITHUB_TOKEN}
+    cwd: ${project_dir}
+    timeout_ms: 30000
+    disabled: false
+    auto_approve:
+      - list_issues
+      - get_pull_request
+    trust: false
+    include_tools:
+      - list_issues
+      - get_pull_request
+      - create_issue
+    exclude_tools:
+      - delete_repository
+    extensions:
+      gemini:
+        timeout_mins: 5
+
+  - name: linear
+    transport: http
+    url: https://mcp.linear.app/mcp
+    headers:
+      Authorization: Bearer ${env:LINEAR_API_KEY}
+      X-Linear-Workspace: acme-corp
+    auth:
+      scheme: bearer
+      token: ${env:LINEAR_API_KEY}
+    timeout_ms: 20000
+    auto_approve:
+      - list_teams
+    trust: false
+    extensions:
+      continue:
+        secrets_namespace: linear
+
+  - name: notion-sse
+    transport: sse
+    url: https://mcp.notion.com/sse
+    headers:
+      Authorization: Bearer ${env:NOTION_TOKEN}
+    auth:
+      scheme: header
+      headers:
+        X-Notion-Version: "2025-09-01"
+        Authorization: Bearer ${env:NOTION_TOKEN}
+    timeout_ms: 15000

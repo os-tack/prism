@@ -12,6 +12,7 @@ run `prism compile` — no extra setup required.
 | [04-mcp-servers](04-mcp-servers) | One MCP config, four per-plugin output shapes                 |
 | [05-hooks-with-scope-guard](05-hooks-with-scope-guard) | Scoped Claude hook + the generated scope-guard wrapper |
 | [06-permissions-wrappers](06-permissions-wrappers) | Native perms in Claude + Continue (since v0.8); perms-guard wrapper for Gemini |
+| [07-canonical-coverage](07-canonical-coverage) | Golden round-trip fixture for v0.9 schema v2: every canonical field of every primitive |
 
 ## Running
 

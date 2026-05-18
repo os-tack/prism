@@ -1,9 +1,13 @@
 ---
-description: Verify and dispatch a Stripe webhook payload.
-trigger: Use when implementing or reviewing a Stripe webhook handler.
-globs:
-  - src/billing/**
-allowed-tools:
+name: stripe-webhook
+description: |
+  Verify and dispatch a Stripe webhook payload.
+  Use when implementing or reviewing a Stripe webhook handler.
+activation:
+  modes: [glob, model_decision]
+  globs:
+    - src/billing/**
+allowed_tools:
   - Bash
   - Read
   - Edit

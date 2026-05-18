@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/permissions.schema.json
+#
+# Scoped permissions for src/billing/**. Native enforcement on the
+# perms-guard wrapper family (Gemini, Cline, Copilot); folded into
+# the global block with a warning on every other plugin.
+allow:
+  - bash:make migrate
+  - Read:src/billing/**
+  - Edit:src/billing/**
+  - Write:src/billing/**
+
+ask:
+  - Edit:src/billing/migrations/**
+
+deny:
+  - bash:make rollback *
+  - Edit:src/billing/migrations/2024-*
