@@ -541,8 +541,10 @@ func TestContinue_ScopedCommand_Warning(t *testing.T) {
 	}
 }
 
-// TestContinue_ScopedHook_Warning verifies that a scoped hook produces no
-// file but emits an info warning naming the scope.
+// TestContinue_ScopedHook_Warning verifies that a scoped hook is now
+// projected natively into .continue/hooks.yaml (Phase 2.5) with an info
+// warning naming the scope (Continue has no per-scope hooks; the entry
+// is merged into the flat file).
 func TestContinue_ScopedHook_Warning(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/proj/.agents",
@@ -564,21 +566,262 @@ func TestContinue_ScopedHook_Warning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
+	// The hook emits natively now: a .continue/hooks.yaml op MUST appear.
+	foundHookFile := false
 	for _, op := range ops {
-		if strings.Contains(op.Path, "hooks") {
-			t.Errorf("unexpected hook file: %s", op.Path)
+		if op.Path == ".continue/hooks.yaml" {
+			foundHookFile = true
 		}
 	}
+	if !foundHookFile {
+		t.Errorf("expected .continue/hooks.yaml op in v0.9 hooks-native path, got paths: %v", opsPaths(ops))
+	}
+	// And a per-scope merge warning should still surface somewhere.
 	found := false
 	for _, op := range ops {
 		for _, w := range op.Warnings {
-			if strings.Contains(w.Message, "no hook primitive") && strings.Contains(w.Message, "src/billing") && strings.Contains(w.Message, "PreToolUse:Bash") {
+			if strings.Contains(w.Message, "no per-scope hooks") && strings.Contains(w.Message, "src/billing") {
 				found = true
+				if w.Severity != "info" {
+					t.Errorf("scoped-hook warning severity = %q, want info", w.Severity)
+				}
 			}
 		}
 	}
 	if !found {
-		t.Errorf("expected scoped-hook warning, got ops=%#v", ops)
+		t.Errorf("expected scoped-hook merge warning, got ops=%#v", ops)
+	}
+}
+
+// TestContinue_Hooks_NativeEmit verifies that a global hook with a
+// canonical per-action event projects to .continue/hooks.yaml under the
+// translated event + matcher (Continue mirrors Claude's verbatim hook
+// schema per SPEC §4.4). The emitted YAML must parse cleanly and the
+// hooks Capability MUST be Native.
+func TestContinue_Hooks_NativeEmit(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		Hooks: []*model.Hook{
+			{
+				Name:           "block-bash",
+				EventCanonical: model.EventPreShell,
+				ScriptPath:     "/tmp/proj/.agents/hooks/scripts/block-secrets.sh",
+				Handlers: []model.HookHandler{
+					{
+						Kind:      model.HookHandlerCommand,
+						Command:   "/tmp/proj/.agents/hooks/scripts/block-secrets.sh",
+						TimeoutMs: 5000,
+					},
+				},
+			},
+		},
+	}
+	p := NewContinue()
+	if got := p.Capabilities().Hooks; got != plugin.SupportNative {
+		t.Errorf("Capabilities().Hooks = %v, want SupportNative", got)
+	}
+	if got := p.Capabilities().HookFields.Supported; !got {
+		t.Errorf("Capabilities().HookFields.Supported = false, want true")
+	}
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	var hookOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".continue/hooks.yaml" {
+			hookOp = &ops[i]
+			break
+		}
+	}
+	if hookOp == nil {
+		t.Fatalf("missing .continue/hooks.yaml op; have: %v", opsPaths(ops))
+	}
+	if hookOp.Plugin != "continue" {
+		t.Errorf("plugin = %q, want continue", hookOp.Plugin)
+	}
+	if hookOp.Kind != plugin.OpWrite {
+		t.Errorf("kind = %v, want OpWrite", hookOp.Kind)
+	}
+
+	// Parse YAML and verify shape: top-level keyed by event name (Claude
+	// wire form), values are a list of {matcher, hooks:[{type, command,
+	// timeout}]} groups.
+	type hookEntry struct {
+		Type    string `yaml:"type"`
+		Command string `yaml:"command"`
+		Timeout int    `yaml:"timeout"`
+	}
+	type hookGroup struct {
+		Matcher string      `yaml:"matcher"`
+		Hooks   []hookEntry `yaml:"hooks"`
+	}
+	parsed := map[string][]hookGroup{}
+	if err := yaml.Unmarshal([]byte(hookOp.Content), &parsed); err != nil {
+		t.Fatalf("parse hooks yaml: %v\n---\n%s", err, hookOp.Content)
+	}
+	preToolUse, ok := parsed["PreToolUse"]
+	if !ok {
+		t.Fatalf("expected PreToolUse key, got %v\n---\n%s", parsed, hookOp.Content)
+	}
+	if len(preToolUse) != 1 {
+		t.Fatalf("expected 1 group under PreToolUse, got %d", len(preToolUse))
+	}
+	if preToolUse[0].Matcher != "Bash" {
+		t.Errorf("matcher = %q, want Bash (pre_shell translates to PreToolUse + matcher Bash)", preToolUse[0].Matcher)
+	}
+	if len(preToolUse[0].Hooks) != 1 {
+		t.Fatalf("expected 1 handler, got %d", len(preToolUse[0].Hooks))
+	}
+	got := preToolUse[0].Hooks[0]
+	if got.Type != "command" {
+		t.Errorf("type = %q, want command", got.Type)
+	}
+	if got.Command != "/tmp/proj/.agents/hooks/scripts/block-secrets.sh" {
+		t.Errorf("command = %q", got.Command)
+	}
+	if got.Timeout != 5 {
+		t.Errorf("timeout = %d, want 5 (5000ms rounded to seconds)", got.Timeout)
+	}
+}
+
+// TestContinue_MCP_EnvVarRewrite verifies that ${env:VAR} references in
+// MCP fields rewrite to Continue's secrets-store form
+// ${{ secrets.VAR }} AND emit one info warning per affected server
+// (SPEC §4.5.3).
+func TestContinue_MCP_EnvVarRewrite(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		MCP: []*model.MCPServer{
+			{
+				Name:    "linear",
+				Command: "npx",
+				Args:    []string{"-y", "@linear/mcp"},
+				Env: map[string]string{
+					"LINEAR_TOKEN": "${env:LINEAR_API_KEY}",
+				},
+			},
+			{
+				Name:      "remote",
+				Transport: "http",
+				URL:       "https://mcp.example.com/v1",
+				Headers: map[string]string{
+					"Authorization": "Bearer ${env:REMOTE_TOKEN}",
+				},
+			},
+			{
+				Name:    "nothing-to-rewrite",
+				Command: "noop",
+			},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	byPath := map[string]plugin.Operation{}
+	for _, op := range ops {
+		byPath[op.Path] = op
+	}
+
+	// linear.yaml: env value must be rewritten; a warning must accompany.
+	linearOp, ok := byPath[".continue/mcpServers/linear.yaml"]
+	if !ok {
+		t.Fatalf("missing linear op; paths: %v", opsPaths(ops))
+	}
+	if !strings.Contains(linearOp.Content, "${{ secrets.LINEAR_API_KEY }}") {
+		t.Errorf("linear env value not rewritten:\n%s", linearOp.Content)
+	}
+	if strings.Contains(linearOp.Content, "${env:") {
+		t.Errorf("linear still contains ${env:} literal:\n%s", linearOp.Content)
+	}
+	foundLinearWarn := false
+	for _, w := range linearOp.Warnings {
+		if strings.Contains(w.Message, "rewritten to ${{ secrets") && strings.Contains(w.Message, "linear") && strings.Contains(w.Message, "secrets store") {
+			foundLinearWarn = true
+			if w.Severity != "info" {
+				t.Errorf("rewrite warning severity = %q, want info", w.Severity)
+			}
+		}
+	}
+	if !foundLinearWarn {
+		t.Errorf("expected linear secrets-store warning, got %#v", linearOp.Warnings)
+	}
+
+	// remote.yaml: headers value must rewrite.
+	remoteOp, ok := byPath[".continue/mcpServers/remote.yaml"]
+	if !ok {
+		t.Fatalf("missing remote op; paths: %v", opsPaths(ops))
+	}
+	if !strings.Contains(remoteOp.Content, "${{ secrets.REMOTE_TOKEN }}") {
+		t.Errorf("remote header value not rewritten:\n%s", remoteOp.Content)
+	}
+	if strings.Contains(remoteOp.Content, "${env:") {
+		t.Errorf("remote still contains ${env:} literal:\n%s", remoteOp.Content)
+	}
+	foundRemoteWarn := false
+	for _, w := range remoteOp.Warnings {
+		if strings.Contains(w.Message, "rewritten to ${{ secrets") && strings.Contains(w.Message, "remote") {
+			foundRemoteWarn = true
+		}
+	}
+	if !foundRemoteWarn {
+		t.Errorf("expected remote secrets-store warning, got %#v", remoteOp.Warnings)
+	}
+
+	// nothing-to-rewrite.yaml: server with no ${env:} must NOT carry a warning.
+	noopOp, ok := byPath[".continue/mcpServers/nothing-to-rewrite.yaml"]
+	if !ok {
+		t.Fatalf("missing nothing-to-rewrite op; paths: %v", opsPaths(ops))
+	}
+	for _, w := range noopOp.Warnings {
+		if strings.Contains(w.Message, "rewritten to") {
+			t.Errorf("unexpected rewrite warning on server with no ${env:}: %#v", w)
+		}
+	}
+}
+
+// TestContinue_MCP_SSEKnownBugWarning verifies that an SSE-transport MCP
+// server emits the SPEC §4.5.4 known-bug warning
+// (continuedev/continue#5359).
+func TestContinue_MCP_SSEKnownBugWarning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/proj/.agents",
+		MCP: []*model.MCPServer{
+			{
+				Name:      "remote-sse",
+				Transport: "sse",
+				URL:       "https://mcp.example.com/sse",
+			},
+		},
+	}
+	p := NewContinue()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	var sseOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == ".continue/mcpServers/remote-sse.yaml" {
+			sseOp = &ops[i]
+			break
+		}
+	}
+	if sseOp == nil {
+		t.Fatalf("missing remote-sse op; have: %v", opsPaths(ops))
+	}
+	found := false
+	for _, w := range sseOp.Warnings {
+		if strings.Contains(w.Message, "5359") && strings.Contains(w.Message, "SSE") {
+			found = true
+			if w.Severity != "info" {
+				t.Errorf("SSE-warning severity = %q, want info", w.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected SSE known-bug warning citing #5359, got %#v", sseOp.Warnings)
 	}
 }
 

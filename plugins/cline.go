@@ -22,18 +22,22 @@
 // so users targeting Cline can use the native names directly.
 //
 // Note on hook portability: the project-relative wrapper paths baked into
-// .clinerules/hooks/<event>.json are absolute paths from proj.Root. Cline's
-// hooks.json format has no ${PROJECT_DIR}-style substitution, so moving the
-// project tree (`mv`, `rsync`, container mount) requires re-running
-// `prism compile` to refresh the wrapper paths. Same constraint applies to
-// .cursor/hooks.json and .windsurf/hooks.json.
+// the per-event dispatcher scripts at .clinerules/hooks/<EventName> are
+// absolute paths from proj.Root. Cline's hook engine has no
+// ${PROJECT_DIR}-style substitution at the dispatcher level (only inside
+// the wrappers we generate), so moving the project tree (`mv`, `rsync`,
+// container mount) requires re-running `prism compile` to refresh the
+// dispatcher paths. Same constraint applies to .cursor/hooks.json and
+// .windsurf/hooks.json.
 //
 //   - YAML frontmatter on rule files (`paths:`, `description:`) — used
 //     to express ScopePaths natively.
 //   - Workflows at `.clinerules/workflows/<name>.md` — used for slash
 //     commands (CMDS native, replacing the old `30-command-*` rules).
-//   - Hooks at `.clinerules/hooks/<event>.json` — JSON-on-stdin /
-//     exit-2-blocks contract, matching Claude Code's hook shape.
+//   - Hooks at `.clinerules/hooks/<EventName>` (no extension, mode 0755)
+//     — per SPEC §4.4.5 Cline uses filename-dispatch, not JSON config.
+//     One executable script per event with matcher guard clauses inlined
+//     at the top.
 //   - MCP at `.cline/cline_mcp_settings.json` — project-local mirror of
 //     the CLI settings file, written in the standard `{mcpServers:{…}}`
 //     schema and merged into any existing file at that path.
@@ -45,7 +49,8 @@
 //   - Skills:         degraded — no dedicated primitive; emitted as
 //     scoped rules with `paths:` + description.
 //   - Commands:       native (workflows/<name>.md slash commands)
-//   - Hooks:          native (.clinerules/hooks/<event>.json)
+//   - Hooks:          native (filename-dispatch scripts at
+//     .clinerules/hooks/<EventName> per SPEC §4.4.5)
 //   - MCP:            native (.cline/cline_mcp_settings.json)
 //   - Agents:         unsupported (Cline subagents are SDK-based)
 //   - Permissions:    unsupported (no native primitive in v0.8.0; could
@@ -609,14 +614,15 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 	}
 	sort.Strings(permsGateRefs)
 
-	// Hooks → .clinerules/hooks/<event>.json. One JSON file per event,
-	// each carrying the standard {matcher, hooks: [{type, command}]}
-	// shape. Scoped hooks point at their scope-guard wrapper. The
-	// perms-guard gate wrappers (when permissions exist but no user
-	// hooks) are appended to PreToolUse so every tool call flows
-	// through the policy. When user hooks DO exist, each hook's
-	// command is rewritten to its per-hook perms-guard wrapper
-	// (which wraps the user script).
+	// Hooks → .clinerules/hooks/<EventName> (no extension, mode 0755)
+	// per SPEC §4.4.5: one executable script per event with matcher
+	// guard clauses inlined at the top. Scoped hooks point at their
+	// scope-guard wrapper. The perms-guard gate wrappers (when
+	// permissions exist but no user hooks) are appended as no-matcher
+	// sections on PreToolUse so every tool call flows through the
+	// policy. When user hooks DO exist, each hook's command is
+	// rewritten to its per-hook perms-guard wrapper (which wraps the
+	// user script).
 	if hookOps := buildClineHookOps(proj, wrapperPaths, permsHookWrappers, proj.Root, permsGateRefs); len(hookOps) > 0 {
 		ops = append(ops, hookOps...)
 	}
@@ -671,102 +677,149 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 	return ops, nil
 }
 
-// clineHookEntry mirrors the Claude / Cline hook entry shape used inside
-// the per-event JSON file at .clinerules/hooks/<event>.json.
-type clineHookEntry struct {
-	Type    string `json:"type"`
-	Command string `json:"command"`
+// clineHookSection holds one (matcher, handler-list) bundle inside an event
+// dispatcher script. Multiple sections for the same event are emitted in
+// stable order and each runs sequentially when the matcher hits.
+type clineHookSection struct {
+	// matcher is the resolved tool-name pattern to guard on; empty means
+	// "always run". A pipe-joined string ("Edit|Write") expresses an OR.
+	matcher string
+	// kind is "exact" or "regex" — controls the guard-clause shape. When
+	// empty, "exact" is assumed (the v0.8 Matcher string is treated as a
+	// pipe-joined exact-pattern list).
+	kind string
+	// handlers is the ordered list of shell snippets to execute once the
+	// matcher hits. Each snippet is a complete shell statement (no
+	// trailing newline); rendering joins with "\n".
+	handlers []string
+	// source is a Warning-source tag for any unsupported-handler
+	// warnings emitted while building this section.
+	source string
 }
 
-// clineHookGroup is one matcher group within a hook event.
-type clineHookGroup struct {
-	Matcher string           `json:"matcher"`
-	Hooks   []clineHookEntry `json:"hooks"`
+// clineEventScript is the in-memory form of a single dispatcher script
+// written to .clinerules/hooks/<EventName>. One script per event; multiple
+// (matcher, handler) sections fan out sequentially inside.
+type clineEventScript struct {
+	event    string
+	sections []clineHookSection
+	// warnings accumulate during build (unsupported handler kinds).
+	warnings []plugin.Warning
 }
 
-// clineHookFile is the JSON document written to
-// .clinerules/hooks/<event>.json. The top-level array of matcher groups
-// matches the schema Cline uses internally; the engine that reads it
-// dispatches by matcher and runs each command with the standard
-// JSON-on-stdin / exit-2-blocks contract.
-type clineHookFile struct {
-	Hooks []clineHookGroup `json:"hooks"`
-}
-
-// TODO(prism v0.9 Phase 2.5 — filename-dispatch hooks): SPEC §4.4.5 and
-// IMPLEMENTATION_PLAN.md §5 Phase 2 (cline note, lines 505-511) call for
-// a hook-emission REWRITE: Cline does NOT consume the
-// `.clinerules/hooks/<event>.json` shape this function emits today (see
-// the upstream Cline issue cited in the plan). The canonical shape is
-// one EXECUTABLE script per (event, matcher) pair at
-// `.clinerules/hooks/<EventName>` (no extension), with matcher guard
-// clauses inlined at the top of each script (stdin → tool_name parse →
-// exit 0 on miss), and multi-handler events collapsing into a
-// dispatcher script that fans out sequentially.
+// buildClineHookOps emits one OpWrite per hook EVENT at
+// `.clinerules/hooks/<EventName>` (no extension, mode 0755) per SPEC
+// §4.4.5. Each script reads the hook payload from stdin once, then runs
+// matched handlers sequentially. Multi-handler events collapse into a
+// single dispatcher script.
 //
-// That rewrite is deferred to Phase 2.5 because it requires regenerating
-// every cline hook golden test in the repository. This Phase 2a refresh
-// touches only Capabilities() and additive v2 reads — emission shape is
-// preserved verbatim per the task brief ("No emission shape changes").
+// Per-action canonical events (pre_shell, post_file_edit, pre_mcp_call,
+// etc.) translate to (PreToolUse|PostToolUse + matcher) via
+// MapHookEventFor; the matcher is inlined as a guard clause. The v0.8
+// Hook.Event string falls back through mapClineEvent for source files that
+// have not been re-parsed through the v2 canonicalization path.
 //
-// buildClineHookOps emits one OpWrite per Hook.Event. The known events
-// are: TaskStart, TaskResume, UserPromptSubmit, PreToolUse, PostToolUse,
-// TaskComplete, TaskCancel. We do not validate the event name here —
-// any non-empty event becomes a JSON filename, so callers can stage
-// future events without code changes.
+// Handler dispatch:
+//   - HookHandlerCommand (or legacy ScriptPath): exec the command, piping
+//     stdin through.
+//   - HookHandlerHTTP: POST the payload via `curl` (SPEC §12 keeps HTTP
+//     native on Cline via this curl shim).
+//   - HookHandlerMCPTool / Prompt / Agent: unsupported on Cline; emit a
+//     warn-level Warning and skip the handler.
 //
 // permsHookWrappers maps user hooks to their perms-guard wrapper path
 // (absolute); when present, the wrapper replaces the raw script command.
 // permsGateRefs are project-relative paths to bare perms-guard gates
-// (from emitPermsGuardWrappers, when permissions exist but no user
-// hooks did); each gate is appended as a PreToolUse entry with empty
-// matcher so the policy fires on every tool call.
+// (from emitPermsGuardWrappers, when permissions exist but no user hooks
+// did); each gate is appended as a no-matcher section on PreToolUse so the
+// policy fires on every tool call.
 //
 // Precedence: scope-guard wrappers > perms-guard wrappers > raw script.
-// (Scope-guard already wraps the perms-guard at the wrapper-script
-// level when both apply — the perms-guard wrapper invokes the user
-// script which can in turn be scope-gated by the scope-guard wrapper
-// the projection emitted alongside.)
 func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string, permsHookWrappers map[*model.Hook]string, projRoot string, permsGateRefs []string) []plugin.Operation {
 	if len(proj.Hooks) == 0 && len(permsGateRefs) == 0 {
 		return nil
 	}
 
-	buckets := map[string]map[string][]clineHookEntry{}
-	matcherOrder := map[string][]string{}
+	scripts := map[string]*clineEventScript{}
 	eventOrder := []string{}
-	addEntry := func(ev, matcher string, entry clineHookEntry) {
-		if _, ok := buckets[ev]; !ok {
-			buckets[ev] = map[string][]clineHookEntry{}
-			eventOrder = append(eventOrder, ev)
+	ensureScript := func(event string) *clineEventScript {
+		s, ok := scripts[event]
+		if !ok {
+			s = &clineEventScript{event: event}
+			scripts[event] = s
+			eventOrder = append(eventOrder, event)
 		}
-		if _, ok := buckets[ev][matcher]; !ok {
-			matcherOrder[ev] = append(matcherOrder[ev], matcher)
-		}
-		buckets[ev][matcher] = append(buckets[ev][matcher], entry)
+		return s
 	}
+
 	for _, h := range proj.Hooks {
-		// v2 additive read (SPEC §6.2): consult EventCanonical alongside
-		// the v0.8 Event string. The parser mirrors Event → EventCanonical
-		// at parse time, so both shapes observe the same data; this
-		// guards future direct-v2 inputs that populate only the typed
-		// field.
-		if h == nil || hookEventFor(h) == "" {
+		if h == nil || h.Disabled {
 			continue
 		}
-		ev := mapClineEvent(hookEventFor(h))
+		event, matcher := resolveClineEvent(h)
+		if event == "" {
+			continue
+		}
+
+		// Determine the command path to invoke for legacy ScriptPath /
+		// command handlers. Wrapper precedence applies here too.
 		cmdPath := h.ScriptPath
 		if w, ok := wrapperPaths[h]; ok {
 			cmdPath = w
 		} else if w, ok := permsHookWrappers[h]; ok {
 			cmdPath = w
 		}
-		addEntry(ev, h.Matcher, clineHookEntry{Type: "command", Command: cmdPath})
+
+		source := proj.SourceTag(h.ScriptPath)
+		if source == "" {
+			source = "hooks.yaml"
+		}
+
+		var handlers []string
+		var warnings []plugin.Warning
+
+		// v2 Handlers take precedence when populated; otherwise fall back
+		// to the legacy single ScriptPath command.
+		if len(h.Handlers) > 0 {
+			for _, hd := range h.Handlers {
+				snippet, warn := renderClineHandler(hd, cmdPath, source, h)
+				if warn != nil {
+					warnings = append(warnings, *warn)
+				}
+				if snippet != "" {
+					handlers = append(handlers, snippet)
+				}
+			}
+		} else if cmdPath != "" {
+			handlers = append(handlers, renderClineCommandSnippet(cmdPath))
+		}
+
+		if len(handlers) == 0 && len(warnings) == 0 {
+			continue
+		}
+
+		s := ensureScript(event)
+		s.warnings = append(s.warnings, warnings...)
+		if len(handlers) > 0 {
+			s.sections = append(s.sections, clineHookSection{
+				matcher:  matcher,
+				kind:     matcherKindFor(h),
+				handlers: handlers,
+				source:   source,
+			})
+		}
 	}
+
+	// Perms-guard bare gates → no-matcher sections on PreToolUse so they
+	// fire on every tool call.
 	for _, gate := range permsGateRefs {
-		addEntry("PreToolUse", "", clineHookEntry{
-			Type:    "command",
-			Command: filepath.Join(projRoot, gate),
+		gateAbs := filepath.Join(projRoot, gate)
+		s := ensureScript("PreToolUse")
+		s.sections = append(s.sections, clineHookSection{
+			matcher:  "",
+			kind:     "",
+			handlers: []string{renderClineCommandSnippet(gateAbs)},
+			source:   "permissions.yaml",
 		})
 	}
 
@@ -774,32 +827,251 @@ func buildClineHookOps(proj *model.Project, wrapperPaths map[*model.Hook]string,
 
 	var ops []plugin.Operation
 	for _, event := range eventOrder {
-		matchers := append([]string(nil), matcherOrder[event]...)
-		sort.Strings(matchers)
-		groups := make([]clineHookGroup, 0, len(matchers))
-		for _, m := range matchers {
-			groups = append(groups, clineHookGroup{
-				Matcher: m,
-				Hooks:   buckets[event][m],
-			})
+		s := scripts[event]
+		if s == nil || (len(s.sections) == 0 && len(s.warnings) == 0) {
+			continue
 		}
-		doc := clineHookFile{Hooks: groups}
-		content, err := json.MarshalIndent(doc, "", "  ")
-		if err != nil {
-			// Encoding fixed-shape structs cannot fail in practice; surface
-			// any breach as an empty file rather than dropping the op.
-			content = []byte("{}")
+
+		body := renderClineEventScript(s)
+		sources := collectClineHookSources(s)
+		op := plugin.Operation{
+			Kind:     plugin.OpWrite,
+			Path:     filepath.ToSlash(filepath.Join(".clinerules", "hooks", event)),
+			Content:  body,
+			Mode:     plugin.ModeWrite,
+			FileMode: 0o755,
+			Sources:  sources,
+			Plugin:   "cline",
+			Warnings: s.warnings,
 		}
-		ops = append(ops, plugin.Operation{
-			Kind:    plugin.OpWrite,
-			Path:    filepath.ToSlash(filepath.Join(".clinerules", "hooks", event+".json")),
-			Content: string(content) + "\n",
-			Mode:    plugin.ModeWrite,
-			Sources: []string{"hooks.yaml"},
-			Plugin:  "cline",
-		})
+		ops = append(ops, op)
 	}
 	return ops
+}
+
+// resolveClineEvent returns the wire event name + matcher hint for h on
+// Cline. The v2 EventCanonical path consults MapHookEventFor (so per-action
+// events translate to PreToolUse/PostToolUse + matcher per SPEC §4.4.4);
+// the v0.8 Event string falls through mapClineEvent verbatim. When both a
+// table-supplied matcher hint and a user-supplied pattern exist they are
+// joined with `|` (an OR group), mirroring combineMatchers in
+// hooks_claude_shape.go.
+func resolveClineEvent(h *model.Hook) (string, string) {
+	if h.EventCanonical != "" {
+		raw := string(h.EventCanonical)
+		if strings.HasPrefix(raw, "native:") {
+			return strings.TrimPrefix(raw, "native:"), matcherStringFor(h)
+		}
+		if m, ok := MapHookEventFor("cline", h.EventCanonical); ok {
+			user := matcherStringFor(h)
+			return m.Event, combineMatchers(m.Matcher, user)
+		}
+		// Canonical event with no Cline mapping — fall through to the
+		// raw event string. Plugins that lack the event will still emit
+		// the script; the hook engine simply will not fire it.
+		return mapClineEvent(raw), matcherStringFor(h)
+	}
+	return mapClineEvent(h.Event), h.Matcher
+}
+
+// matcherKindFor returns the matcher kind for h ("exact", "regex", or
+// "all"). Prefers the typed MatcherV2 struct; falls back to "exact" when
+// only the v0.8 Matcher string is set (the v0.8 contract treats the
+// pipe-joined string as a list of exact tool names).
+func matcherKindFor(h *model.Hook) string {
+	if h.MatcherV2.Kind != "" {
+		return h.MatcherV2.Kind
+	}
+	if h.Matcher == "" {
+		return "all"
+	}
+	return "exact"
+}
+
+// renderClineHandler turns one HookHandler into a shell snippet that
+// dispatches the handler. cmdPath is the (possibly wrapper-rewritten)
+// command path for v0.8-style command handlers; v2 handlers carry their
+// own Command field, which is preferred when set. Returns ("", warning)
+// for unsupported handler kinds on Cline.
+func renderClineHandler(hd model.HookHandler, cmdPath, source string, h *model.Hook) (string, *plugin.Warning) {
+	switch hd.Kind {
+	case "", model.HookHandlerCommand:
+		cmd := hd.Command
+		if cmd == "" {
+			cmd = cmdPath
+		} else if len(hd.Args) > 0 {
+			cmd = cmd + " " + strings.Join(hd.Args, " ")
+		}
+		if cmd == "" {
+			return "", nil
+		}
+		return renderClineCommandSnippet(cmd), nil
+	case model.HookHandlerHTTP:
+		if hd.URL == "" {
+			return "", nil
+		}
+		return renderClineHTTPSnippet(hd), nil
+	case model.HookHandlerMCPTool, model.HookHandlerPrompt, model.HookHandlerAgent:
+		return "", &plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline cannot dispatch %q hook handlers; %s/%s skipped.", hd.Kind, h.Event, strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))),
+		}
+	default:
+		return "", &plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline: unknown hook handler kind %q; skipped.", hd.Kind),
+		}
+	}
+}
+
+// renderClineCommandSnippet renders a shell statement that pipes the
+// captured stdin payload into the user-supplied command, propagating its
+// exit status. The hook payload is held in $payload (the dispatcher
+// preamble captures stdin once).
+func renderClineCommandSnippet(command string) string {
+	// The command string may already contain arguments; emit it verbatim
+	// so spaces and quoting in user-supplied commands keep working
+	// (mirrors how the v0.8 JSON shape passed the field straight to the
+	// hook engine).
+	return fmt.Sprintf("  printf '%%s' \"$payload\" | %s", command)
+}
+
+// renderClineHTTPSnippet emits a curl invocation that POSTs the captured
+// payload to hd.URL, propagating any user-supplied headers.
+func renderClineHTTPSnippet(hd model.HookHandler) string {
+	var b strings.Builder
+	b.WriteString("  printf '%s' \"$payload\" | curl -sS -X POST")
+	keys := make([]string, 0, len(hd.Headers))
+	for k := range hd.Headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, " -H %s", shellQuote(k+": "+hd.Headers[k]))
+	}
+	b.WriteString(" -H ")
+	b.WriteString(shellQuote("Content-Type: application/json"))
+	b.WriteString(" --data-binary @- ")
+	b.WriteString(shellQuote(hd.URL))
+	return b.String()
+}
+
+// collectClineHookSources flattens the per-section source tags into a
+// stable, deduplicated slice for Operation.Sources.
+func collectClineHookSources(s *clineEventScript) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, sec := range s.sections {
+		if sec.source == "" || seen[sec.source] {
+			continue
+		}
+		seen[sec.source] = true
+		out = append(out, sec.source)
+	}
+	if len(out) == 0 {
+		out = []string{"hooks.yaml"}
+	}
+	return out
+}
+
+// renderClineEventScript writes the bash dispatcher script for one event.
+// Layout:
+//
+//	#!/usr/bin/env bash
+//	set -euo pipefail
+//	payload=$(cat)
+//	tool_name=$(jq -r '.tool_name // empty' <<<"$payload")   # or sed fallback
+//	# section 1 (matcher: Edit|Write)
+//	if case "$tool_name" in Edit|Write) true ;; *) false ;; esac; then
+//	  ... handler ...
+//	fi
+//	# section 2 (no matcher)
+//	... handler ...
+//
+// jq is preferred for tool_name extraction when available — the fallback
+// sed pattern keeps the script jq-free for minimal container images.
+func renderClineEventScript(s *clineEventScript) string {
+	var b strings.Builder
+	b.WriteString("#!/usr/bin/env bash\n")
+	b.WriteString("# prism-generated Cline hook dispatcher (filename-dispatch per SPEC §4.4.5).\n")
+	fmt.Fprintf(&b, "# Event: %s. One script per event; sections fan out sequentially.\n", s.event)
+	b.WriteString("set -euo pipefail\n\n")
+	b.WriteString("payload=$(cat)\n")
+	b.WriteString("if command -v jq >/dev/null 2>&1; then\n")
+	b.WriteString("  tool_name=$(printf '%s' \"$payload\" | jq -r '.tool_name // empty')\n")
+	b.WriteString("else\n")
+	b.WriteString("  tool_name=$(printf '%s' \"$payload\" | sed -n 's/.*\"tool_name\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n")
+	b.WriteString("fi\n\n")
+
+	for i, sec := range s.sections {
+		b.WriteString(renderClineSection(i+1, sec))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderClineSection emits one (matcher, handler-list) section. The
+// matcher becomes a guard clause that skips this section's handlers when
+// $tool_name does not match — subsequent sections still get a chance to
+// run (handlers are not mutually exclusive across sections).
+func renderClineSection(idx int, sec clineHookSection) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# section %d", idx)
+	if sec.matcher != "" {
+		fmt.Fprintf(&b, " (matcher: %s)", sec.matcher)
+	}
+	b.WriteString("\n")
+
+	patterns := clineMatcherPatterns(sec.matcher, sec.kind)
+	if len(patterns) > 0 {
+		if sec.kind == "regex" {
+			fmt.Fprintf(&b, "if [[ \"$tool_name\" =~ %s ]]; then\n", shellQuoteRegex(sec.matcher))
+		} else {
+			fmt.Fprintf(&b, "if case \"$tool_name\" in %s) true ;; *) false ;; esac; then\n", strings.Join(patterns, "|"))
+		}
+	}
+
+	for _, snippet := range sec.handlers {
+		b.WriteString(snippet)
+		b.WriteString("\n")
+	}
+	if len(patterns) > 0 {
+		b.WriteString("fi\n")
+	}
+	return b.String()
+}
+
+// clineMatcherPatterns splits a pipe-joined matcher into its component
+// patterns. Empty matcher returns nil (no guard needed). For regex
+// kind the matcher is treated as a single pattern (no splitting).
+func clineMatcherPatterns(matcher, kind string) []string {
+	if matcher == "" {
+		return nil
+	}
+	if kind == "regex" {
+		return []string{matcher}
+	}
+	parts := strings.Split(matcher, "|")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// shellQuoteRegex returns a bash =~ -safe rendering of a regex literal.
+// =~ wants the regex unquoted, but for whitespace safety we wrap the
+// pattern in double quotes and escape internal `"` and `\`.
+func shellQuoteRegex(r string) string {
+	esc := strings.ReplaceAll(r, "\\", "\\\\")
+	esc = strings.ReplaceAll(esc, "\"", "\\\"")
+	return "\"" + esc + "\""
 }
 
 // clineMCPServerJSON is the schema Cline expects for entries under

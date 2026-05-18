@@ -200,17 +200,18 @@ func (p *GeminiPlugin) Capabilities() plugin.Capabilities {
 	}
 }
 
-// geminiHookEventMap translates prism's canonical Hook.Event values into
-// Gemini CLI's 11 supported event identifiers. Claude's PreToolUse /
-// PostToolUse map to BeforeTool / AfterTool; the rest pass through when
-// they already match a Gemini event name. Unknown events pass through
-// untouched (Gemini will warn at load time rather than silently dropping
-// them).
+// geminiLegacyEventMap translates prism's legacy v0.8 Hook.Event string
+// values into Gemini CLI's native event identifiers. v0.9 emission goes
+// through MapHookEventFor (plugins/hook_envelope.go); this map only feeds
+// the v0.8 fallback path when a hook carries Hook.Event but no typed
+// Hook.EventCanonical. Claude's PreToolUse / PostToolUse map to BeforeTool
+// / AfterTool; the rest pass through when they already match a Gemini
+// event name. Unknown events pass through untouched.
 //
 // Reference Gemini events: SessionStart, SessionEnd, BeforeAgent,
 // AfterAgent, BeforeModel, AfterModel, BeforeToolSelection, BeforeTool,
 // AfterTool, PreCompress, Notification.
-var geminiHookEventMap = map[string]string{
+var geminiLegacyEventMap = map[string]string{
 	"PreToolUse":          "BeforeTool",
 	"PostToolUse":         "AfterTool",
 	"SessionStart":        "SessionStart",
@@ -226,13 +227,66 @@ var geminiHookEventMap = map[string]string{
 	"Notification":        "Notification",
 }
 
-// mapGeminiHookEvent returns the Gemini event for a prism canonical event,
-// passing through unknown names unchanged.
-func mapGeminiHookEvent(event string) string {
-	if mapped, ok := geminiHookEventMap[event]; ok {
+// mapGeminiLegacyEvent returns the Gemini event for a prism v0.8 string
+// event, passing through unknown names unchanged. Only used by the v0.8
+// fallback path inside resolveGeminiHookEvent.
+func mapGeminiLegacyEvent(event string) string {
+	if mapped, ok := geminiLegacyEventMap[event]; ok {
 		return mapped
 	}
 	return event
+}
+
+// resolveGeminiHookEvent computes the Gemini wire-form event name + matcher
+// for a single Hook, using the shared HookEvent translation table
+// (plugins/hook_envelope.go) as the source of truth (SPEC §4.4.4).
+//
+// Resolution order:
+//
+//  1. h.EventCanonical with the "native:" prefix → strip the prefix and
+//     use the remainder verbatim as the Gemini event name. Matcher comes
+//     from MatcherV2 / Matcher unchanged. Used for opt-in passthrough of
+//     Gemini-specific event names (BeforeModel, BeforeToolSelection, etc.)
+//     authored directly in the canonical model.
+//
+//  2. h.EventCanonical set (typed) → look up via MapHookEventFor("gemini",
+//     ev). When found, the table-supplied matcher (e.g. run_shell_command
+//     for pre_shell) combines with any user-supplied MatcherV2 / Matcher
+//     via `|`. When NOT found, ok=false and the caller emits a warning
+//     ("unsupported event on gemini").
+//
+//  3. v0.8 fallback: h.Event populated, h.EventCanonical empty → use
+//     geminiLegacyEventMap (PreToolUse → BeforeTool, …) with the
+//     user-supplied Matcher unchanged.
+//
+// Returns ok=false ONLY for case 2's unknown-canonical branch. Empty input
+// (no Event and no EventCanonical) also returns ok=false.
+func resolveGeminiHookEvent(h *model.Hook) (eventName, matcher string, ok bool) {
+	user := geminiUserMatcher(h)
+	if h.EventCanonical != "" {
+		if strings.HasPrefix(string(h.EventCanonical), "native:") {
+			return strings.TrimPrefix(string(h.EventCanonical), "native:"), user, true
+		}
+		m, found := MapHookEventFor("gemini", h.EventCanonical)
+		if !found {
+			return "", "", false
+		}
+		return m.Event, combineMatchers(m.Matcher, user), true
+	}
+	if h.Event != "" {
+		return mapGeminiLegacyEvent(h.Event), user, true
+	}
+	return "", "", false
+}
+
+// geminiUserMatcher returns the user-supplied matcher string from a Hook,
+// preferring the v2 MatcherV2.Patterns slice (joined with `|`) and falling
+// back to the v0.8 Matcher string.
+func geminiUserMatcher(h *model.Hook) string {
+	if len(h.MatcherV2.Patterns) > 0 {
+		return strings.Join(h.MatcherV2.Patterns, "|")
+	}
+	return h.Matcher
 }
 
 // Plan produces the Operations needed to project proj into Gemini CLI's layout.
@@ -433,19 +487,17 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			continue
 		}
 		hookBase := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
-		// v2 additive read: prefer canonical event when v0.8 is empty
-		// (SPEC §4.4.2). Emission shape unchanged — both feed the same
-		// mapGeminiHookEvent lookup.
-		// TODO(prism v0.9): replace mapGeminiHookEvent with
-		// MapHookEventFor("gemini", h.EventCanonical) so per-action
+		// v0.9 translation (SPEC §4.4.4): the shared MapHookEventFor table
+		// (plugins/hook_envelope.go) is the source of truth. Per-action
 		// canonical events (PreShell, PostFileEdit, …) translate to
-		// BeforeTool + matcher form. Translation table lives in
-		// plugins/hook_envelope.go. See SPEC §4.4.4.
-		rawEvent := h.Event
-		if rawEvent == "" && h.EventCanonical != "" {
-			rawEvent = string(h.EventCanonical)
+		// BeforeTool/AfterTool + matcher; generic events (PreToolUse) just
+		// translate the name. Unknown canonical events surface as a warning
+		// in the settings emitter; here in the wrapper loop we skip them so
+		// no scope-guard wrapper is emitted for a hook we won't reference.
+		mappedEvent, _, ok := resolveGeminiHookEvent(h)
+		if !ok || mappedEvent == "" {
+			continue
 		}
-		mappedEvent := mapGeminiHookEvent(rawEvent)
 		wrapperFile := scopeSlug(h.ScopePath) + "-" + mappedEvent + "-" + hookBase + ".sh"
 		wrapperRel := filepath.Join(".gemini", "hooks", "__scope-guard__", wrapperFile)
 
@@ -466,11 +518,12 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	// mcpServers + hooks blocks. Emitted whenever there is any MCP
 	// server or any hook.
 	if len(proj.MCP) > 0 || len(proj.Hooks) > 0 {
-		settingsOp, err := buildGeminiSettingsOp(proj, wrapperPaths)
+		settingsOp, settingsWarnings, err := buildGeminiSettingsOp(proj, wrapperPaths)
 		if err != nil {
 			return nil, err
 		}
 		ops = append(ops, settingsOp)
+		warnings = append(warnings, settingsWarnings...)
 	}
 
 	// Permissions (global + scoped) project via prism perms-guard wrappers
@@ -740,7 +793,7 @@ type geminiHookGroup struct {
 // tree. This is the only host of the v0.8 group whose hook config supports
 // env-var interpolation — cursor / cline / windsurf all bake absolute
 // paths and require a re-`prism compile` after a move.
-func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, error) {
+func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, []plugin.Warning, error) {
 	relPath := filepath.Join(".gemini", "settings.json")
 
 	type pendingHook struct {
@@ -749,20 +802,36 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 	}
 	buckets := map[string][]pendingHook{}
 	eventOrder := []string{}
+	var warnings []plugin.Warning
 	for _, h := range proj.Hooks {
 		if h == nil {
 			continue
 		}
-		// v2 additive read: fall back to EventCanonical when the v0.8
-		// Event slot is empty. Emission shape unchanged.
-		rawEvent := h.Event
-		if rawEvent == "" && h.EventCanonical != "" {
-			rawEvent = string(h.EventCanonical)
-		}
-		if rawEvent == "" {
+		// v0.9 translation via the shared HookEvent table (SPEC §4.4.4).
+		// resolveGeminiHookEvent handles three paths: native:<verbatim>
+		// passthrough, typed EventCanonical → MapHookEventFor("gemini", ev)
+		// with matcher combine, and the v0.8 Event-string fallback.
+		mappedEvent, matcherStr, ok := resolveGeminiHookEvent(h)
+		if !ok {
+			// Unknown canonical event on Gemini — drop with a warn-level
+			// warning so the user knows the hook isn't projected. v0.8
+			// strings always resolve (the fallback passes them through
+			// verbatim), so this branch only fires for typed
+			// EventCanonical values absent from the gemini column.
+			warn := plugin.Warning{
+				Source:   proj.SourceTag(h.ScriptPath),
+				Message:  fmt.Sprintf("gemini: canonical hook event %q has no Gemini equivalent; hook not projected.", h.EventCanonical),
+				Severity: "warn",
+			}
+			if h.ScopePath != "" {
+				warn.Message = fmt.Sprintf("gemini: canonical hook event %q (scope: %s) has no Gemini equivalent; hook not projected.", h.EventCanonical, h.ScopePath)
+			}
+			warnings = append(warnings, warn)
 			continue
 		}
-		mappedEvent := mapGeminiHookEvent(rawEvent)
+		if mappedEvent == "" {
+			continue
+		}
 		if _, ok := buckets[mappedEvent]; !ok {
 			eventOrder = append(eventOrder, mappedEvent)
 		}
@@ -780,7 +849,7 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 		}
 		name := strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
 		buckets[mappedEvent] = append(buckets[mappedEvent], pendingHook{
-			matcher: h.Matcher,
+			matcher: matcherStr,
 			entry: geminiHookEntry{
 				Type:    "command",
 				Command: cmdPath,
@@ -872,7 +941,7 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 		Sources: sources,
 		Plugin:  "gemini",
 		Merger:  merger,
-	}, nil
+	}, warnings, nil
 }
 
 // SchemaVersion returns the canonical schema version this plugin

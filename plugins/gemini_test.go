@@ -509,6 +509,165 @@ func TestGemini_Hooks_SettingsMerge(t *testing.T) {
 	}
 }
 
+// TestGemini_Hooks_PerActionCanonical verifies that a Hook carrying a
+// per-action canonical event (EventCanonical = EventPreShell) translates
+// to Gemini's BeforeTool event with matcher "run_shell_command" — the
+// SPEC §4.4.4 table form. The translation is sourced from the shared
+// MapHookEventFor table in plugins/hook_envelope.go.
+func TestGemini_Hooks_PerActionCanonical(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Hooks: []*model.Hook{
+			{
+				EventCanonical: model.EventPreShell,
+				ScriptPath:     filepath.Join(agentsDir, "hooks", "audit.sh"),
+			},
+			{
+				EventCanonical: model.EventPostFileEdit,
+				ScriptPath:     filepath.Join(agentsDir, "hooks", "verify.sh"),
+			},
+			{
+				EventCanonical: model.EventPreMCPCall,
+				ScriptPath:     filepath.Join(agentsDir, "hooks", "mcp-gate.sh"),
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var settingsOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == filepath.Join(".gemini", "settings.json") {
+			settingsOp = &ops[i]
+		}
+	}
+	if settingsOp == nil {
+		t.Fatalf("missing settings.json op")
+	}
+	mergedContent := mergeContent(t, root, settingsOp)
+	var merged map[string]any
+	if err := json.Unmarshal([]byte(mergedContent), &merged); err != nil {
+		t.Fatalf("unmarshal: %v\ncontent: %s", err, mergedContent)
+	}
+	hooks, ok := merged["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("merged.hooks missing: %v", merged)
+	}
+
+	// EventPreShell → BeforeTool + matcher run_shell_command.
+	beforeTool, ok := hooks["BeforeTool"].([]any)
+	if !ok || len(beforeTool) != 2 {
+		t.Fatalf("BeforeTool groups: got %v (type %T), want 2 groups", hooks["BeforeTool"], hooks["BeforeTool"])
+	}
+	matchers := map[string]bool{}
+	for _, g := range beforeTool {
+		grp, _ := g.(map[string]any)
+		if m, _ := grp["matcher"].(string); m != "" {
+			matchers[m] = true
+		}
+	}
+	if !matchers["run_shell_command"] {
+		t.Errorf("BeforeTool group missing matcher run_shell_command; got matchers: %v", matchers)
+	}
+	if !matchers["mcp_*"] {
+		t.Errorf("BeforeTool group missing matcher mcp_*; got matchers: %v", matchers)
+	}
+
+	// EventPostFileEdit → AfterTool + matcher write_file.
+	afterTool, ok := hooks["AfterTool"].([]any)
+	if !ok || len(afterTool) != 1 {
+		t.Fatalf("AfterTool groups: got %v, want 1 group", hooks["AfterTool"])
+	}
+	atGrp, _ := afterTool[0].(map[string]any)
+	if got, want := atGrp["matcher"], "write_file"; got != want {
+		t.Errorf("AfterTool matcher = %v, want %v", got, want)
+	}
+}
+
+// TestGemini_Hooks_NativePrefixPassthrough verifies that an EventCanonical
+// carrying the "native:" prefix strips the prefix and emits the remainder
+// verbatim — used for Gemini-specific events that aren't in the canonical
+// enum (e.g. BeforeModel, BeforeToolSelection).
+func TestGemini_Hooks_NativePrefixPassthrough(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Hooks: []*model.Hook{
+			{
+				EventCanonical: model.HookEvent("native:BeforeToolSelection"),
+				ScriptPath:     filepath.Join(agentsDir, "hooks", "select.sh"),
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var settingsOp *plugin.Operation
+	for i := range ops {
+		if ops[i].Path == filepath.Join(".gemini", "settings.json") {
+			settingsOp = &ops[i]
+		}
+	}
+	if settingsOp == nil {
+		t.Fatalf("missing settings.json op")
+	}
+	mergedContent := mergeContent(t, root, settingsOp)
+	if !strings.Contains(mergedContent, `"BeforeToolSelection"`) {
+		t.Errorf("native: prefix should emit verbatim event name:\n%s", mergedContent)
+	}
+	if strings.Contains(mergedContent, `"native:BeforeToolSelection"`) {
+		t.Errorf("native: prefix should be stripped:\n%s", mergedContent)
+	}
+}
+
+// TestGemini_Hooks_UnsupportedCanonicalWarn verifies that a Hook whose
+// EventCanonical has no Gemini entry in the shared table (e.g.
+// PreCompact, SessionResume) drops with a warn-level warning instead of
+// silently passing through.
+func TestGemini_Hooks_UnsupportedCanonicalWarn(t *testing.T) {
+	root := t.TempDir()
+	agentsDir := filepath.Join(root, ".agents")
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: agentsDir,
+		Context: &model.Document{
+			SourcePath: filepath.Join(agentsDir, "context.md"),
+			Body:       "ctx",
+		},
+		Hooks: []*model.Hook{
+			{
+				EventCanonical: model.EventSessionResume,
+				ScriptPath:     filepath.Join(agentsDir, "hooks", "resume.sh"),
+			},
+		},
+	}
+	p := NewGemini()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "symlink"})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	found := false
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if w.Severity == "warn" && strings.Contains(w.Message, "session_resume") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected warn-level warning for unsupported canonical event session_resume; got ops: %+v", ops)
+	}
+}
+
 // TestGemini_Hooks_EventPassthrough verifies that a hook with a
 // Gemini-native event name (SessionStart) passes through unchanged.
 func TestGemini_Hooks_EventPassthrough(t *testing.T) {

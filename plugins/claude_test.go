@@ -209,8 +209,12 @@ func TestClaude_Commands(t *testing.T) {
 	for _, op := range ops {
 		if _, ok := wantPaths[op.Path]; ok {
 			wantPaths[op.Path] = true
-			if op.Kind != plugin.OpSymlink {
-				t.Errorf("command op %q Kind = %q, want %q", op.Path, op.Kind, plugin.OpSymlink)
+			// v2 synthesis (`disable-model-invocation: true` when
+			// AutoInvoke==false, which is the canonical default per
+			// SPEC §4.3.4) forces write mode for command files; the
+			// projected frontmatter differs from the source body.
+			if op.Kind != plugin.OpWrite {
+				t.Errorf("command op %q Kind = %q, want %q", op.Path, op.Kind, plugin.OpWrite)
 			}
 		}
 	}
@@ -515,16 +519,17 @@ func TestClaude_ScopedSkill(t *testing.T) {
 	if scriptOp == nil {
 		t.Fatalf("missing scoped skill script op at %q; got: %+v", wantScriptPath, ops)
 	}
-	if skillOp.Kind != plugin.OpSymlink {
-		t.Errorf("scoped skill Kind = %q, want %q", skillOp.Kind, plugin.OpSymlink)
+	// v2 frontmatter synthesis (`paths:` from Skill.Globs) forces write
+	// mode for the skill file; the projected SKILL.md carries injected
+	// frontmatter that differs from the source body.
+	if skillOp.Kind != plugin.OpWrite {
+		t.Errorf("scoped skill Kind = %q, want %q", skillOp.Kind, plugin.OpWrite)
 	}
 	if len(skillOp.Sources) == 0 || skillOp.Sources[0] != wantSource {
 		t.Errorf("scoped skill Sources = %v, want first entry = %q", skillOp.Sources, wantSource)
 	}
-	// LinkTarget should resolve to the scoped source under .agents/.
-	wantLink, _ := filepath.Rel(filepath.Join(root, filepath.Dir(wantSkillPath)), proj.Skills[0].Document.SourcePath)
-	if skillOp.LinkTarget != wantLink {
-		t.Errorf("scoped skill LinkTarget = %q, want %q", skillOp.LinkTarget, wantLink)
+	if !strings.Contains(skillOp.Content, "src/billing/**") {
+		t.Errorf("scoped skill content missing synthesized paths: %q\n%s", "src/billing/**", skillOp.Content)
 	}
 }
 

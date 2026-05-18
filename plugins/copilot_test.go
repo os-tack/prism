@@ -414,8 +414,12 @@ func TestCopilot_Capabilities(t *testing.T) {
 	if caps.Hooks != plugin.SupportUnsupported {
 		t.Errorf("Hooks = %v, want unsupported", caps.Hooks)
 	}
-	if caps.Permissions != plugin.SupportUnsupported {
-		t.Errorf("Permissions = %v, want unsupported", caps.Permissions)
+	// Permissions are always native via the perms-guard wrapper +
+	// sidecar policy, regardless of the preview-hooks opt-in. Hooks
+	// still gate on EnablePreviewHooks because hooks.json is what's
+	// in preview.
+	if caps.Permissions != plugin.SupportNative {
+		t.Errorf("Permissions = %v, want native (perms-guard wrapper)", caps.Permissions)
 	}
 	if caps.MCP != plugin.SupportNative {
 		t.Errorf("MCP = %v, want native", caps.MCP)
@@ -1062,8 +1066,10 @@ func TestCopilot_Preview_ScopedHook_WrapperEmitted(t *testing.T) {
 }
 
 // TestCopilot_Preview_CapabilityMatrixFlips verifies the Capabilities()
-// matrix reflects the flag: Hooks + Permissions native when on, both
-// unsupported when off.
+// matrix reflects the flag: Hooks native when on, unsupported when off.
+// Permissions are always native via the perms-guard wrapper sidecar,
+// regardless of the preview-hooks opt-in (degraded wiring path when
+// preview hooks are disabled, but the capability is still native).
 func TestCopilot_Preview_CapabilityMatrixFlips(t *testing.T) {
 	on := &CopilotPlugin{EnablePreviewHooks: true}
 	off := &CopilotPlugin{}
@@ -1076,8 +1082,162 @@ func TestCopilot_Preview_CapabilityMatrixFlips(t *testing.T) {
 	if off.Capabilities().Hooks != plugin.SupportUnsupported {
 		t.Errorf("flag off Hooks = %v, want unsupported", off.Capabilities().Hooks)
 	}
-	if off.Capabilities().Permissions != plugin.SupportUnsupported {
-		t.Errorf("flag off Permissions = %v, want unsupported", off.Capabilities().Permissions)
+	if off.Capabilities().Permissions != plugin.SupportNative {
+		t.Errorf("flag off Permissions = %v, want native (perms-guard sidecar)", off.Capabilities().Permissions)
+	}
+	// PermissionsFields.Supported must also reflect always-native.
+	if !off.Capabilities().PermissionsFields.Supported {
+		t.Errorf("flag off PermissionsFields.Supported = false, want true")
+	}
+	if !on.Capabilities().PermissionsFields.Supported {
+		t.Errorf("flag on PermissionsFields.Supported = false, want true")
+	}
+}
+
+// TestCopilot_Perms_NoPreviewHooks_EmitsSidecar verifies the v0.9.0
+// Phase 2.5 behavior: a project with Permissions but no preview-hooks
+// opt-in still emits the perms-guard sidecar policy under
+// .github/hooks/__perms-guard__/ and surfaces a single info warning
+// explaining the manual-wiring requirement. The hooks.json file is NOT
+// emitted (that's gated on preview hooks).
+func TestCopilot_Perms_NoPreviewHooks_EmitsSidecar(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	wantPolicy := filepath.Join(".github", "hooks", "__perms-guard__", "policy.json")
+	if findCopilotOp(ops, wantPolicy) == nil {
+		t.Fatalf("missing perms-guard policy at %s; got %v", wantPolicy, copilotOpPaths(ops))
+	}
+	wantGate := filepath.Join(".github", "hooks", "__perms-guard__", "global-gate.sh")
+	if findCopilotOp(ops, wantGate) == nil {
+		t.Fatalf("missing perms-guard gate at %s; got %v", wantGate, copilotOpPaths(ops))
+	}
+	// hooks.json must NOT exist when preview hooks are off.
+	for _, op := range ops {
+		if strings.HasSuffix(op.Path, "hooks.json") {
+			t.Errorf("hooks.json must not be emitted without preview hooks: %s", op.Path)
+		}
+		if strings.Contains(op.Path, "__scope-guard__") {
+			t.Errorf("scope-guard wrappers must not be emitted without preview hooks: %s", op.Path)
+		}
+	}
+	// One info warning per project naming the sidecar path and the
+	// manual-wiring requirement.
+	warningCount := 0
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "perms-guard sidecar") &&
+				strings.Contains(w.Message, "preview hooks are disabled") &&
+				strings.Contains(w.Message, "extensions.copilot.preview_hooks") {
+				warningCount++
+				if w.Severity != "info" {
+					t.Errorf("warning severity = %q, want info", w.Severity)
+				}
+				if !strings.Contains(w.Message, wantPolicy) {
+					t.Errorf("warning should reference policy path %s; got %q", wantPolicy, w.Message)
+				}
+			}
+		}
+	}
+	if warningCount != 1 {
+		t.Errorf("expected exactly 1 perms-guard manual-wiring warning, got %d", warningCount)
+	}
+}
+
+// TestCopilot_Perms_NoPreviewHooks_DisableEscapeHatch verifies that
+// extensions.copilot.disable_perms_guard: true suppresses the sidecar
+// emit entirely (no policy.json, no gate wrapper, no info warning) when
+// preview hooks are disabled.
+func TestCopilot_Perms_NoPreviewHooks_DisableEscapeHatch(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+			Deny:  []string{"bash:rm -rf *"},
+		},
+		Config: &model.Config{
+			Extensions: map[string]any{
+				"copilot": map[string]any{
+					"disable_perms_guard": true,
+				},
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("perms-guard artifact must not be emitted when disable_perms_guard is true: %s", op.Path)
+		}
+	}
+}
+
+// TestCopilot_Perms_PreviewHooksOn_DisableEscapeHatch verifies that
+// the escape hatch also suppresses perms-guard emission in the
+// preview-hooks-enabled path (mirrors the disabled-flag behavior).
+func TestCopilot_Perms_PreviewHooksOn_DisableEscapeHatch(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		Permissions: &model.Permissions{
+			Allow: []string{"bash:ls *"},
+		},
+		Config: &model.Config{
+			Extensions: map[string]any{
+				"copilot": map[string]any{
+					"disable_perms_guard": true,
+				},
+			},
+		},
+	}
+	p := &CopilotPlugin{EnablePreviewHooks: true}
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "__perms-guard__") {
+			t.Errorf("perms-guard artifact must not be emitted when disable_perms_guard is true: %s", op.Path)
+		}
+	}
+}
+
+// TestCopilot_Perms_NoPreviewHooks_ScopedPermissions verifies that
+// scoped permissions also project through perms-guard sidecar policy
+// files (one per scope) when preview hooks are off.
+func TestCopilot_Perms_NoPreviewHooks_ScopedPermissions(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/proj",
+		AgentsDir: "/tmp/proj/.agents",
+		ScopedPermissions: []*model.Permissions{
+			{
+				ScopePath: "src/billing",
+				Allow:     []string{"bash:cat *"},
+			},
+		},
+	}
+	p := NewCopilot()
+	ops, err := p.Plan(proj, model.TargetOption{Mode: "write"})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	wantScopedPolicy := filepath.Join(".github", "hooks", "__perms-guard__", "src-billing.policy.json")
+	if findCopilotOp(ops, wantScopedPolicy) == nil {
+		t.Fatalf("missing scoped policy at %s; got %v", wantScopedPolicy, copilotOpPaths(ops))
 	}
 }
 

@@ -15,19 +15,26 @@
 //     `Tool(pattern)` form (e.g. `bash:rm -rf *` → `Bash(rm -rf *)`).
 //   - `.continue/mcpServers/<name>.yaml` — one YAML file per MCP server
 //     (Continue's per-file mcpServers convention) containing `name`,
-//     `command`, `args`, `env`, `url` (only the non-empty fields).
+//     `command`, `args`, `env`, `url`, `headers` (only the non-empty
+//     fields). `${env:VAR}` in any field rewrites to `${{ secrets.VAR }}`.
+//   - `.continue/hooks.yaml` — Continue's hook schema is verbatim Claude's
+//     (SPEC §4.4) so emission goes through `plugins/hooks_claude_shape.go`
+//     rendered as YAML rather than JSON.
 //
 // As of v0.8, permissions enforce natively via Continue's own permissions
 // layer (replacing the prism perms-guard wrapper), and slash commands emit
-// natively as prompt files. Skills still degrade to scoped rule files (no
-// dedicated skill primitive in Continue). Sub-agents and hooks are
-// unsupported and emit info warnings.
+// natively as prompt files. As of v0.9 / Phase 2.5, hooks emit natively
+// via the shared Claude-shape serializer, and `${env:VAR}` references in
+// MCP fields rewrite to `${{ secrets.VAR }}` with one info warning per
+// affected server. Skills still degrade to scoped rule files (no
+// dedicated skill primitive in Continue). Sub-agents stay unsupported.
 package plugins
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -39,8 +46,8 @@ import (
 )
 
 // ContinuePlugin projects Project state into `.continue/rules/*.md`,
-// `.continue/prompts/*.md`, `.continue/permissions.yaml`, and
-// `.continue/mcpServers/*.yaml` files.
+// `.continue/prompts/*.md`, `.continue/permissions.yaml`,
+// `.continue/mcpServers/*.yaml`, and `.continue/hooks.yaml` files.
 type ContinuePlugin struct{}
 
 // NewContinue constructs a ContinuePlugin.
@@ -66,12 +73,10 @@ func (p *ContinuePlugin) Detect(root string) bool {
 //
 // Continue natively supports per-glob rule attachment (ScopePaths),
 // description-triggered attachment (ScopeSemantic), invokable prompt files
-// (Commands), permissions.yaml (Permissions), and per-file MCP server
-// configuration. Skills degrade to scoped rule files (no dedicated skill
-// primitive). Agents and Hooks are unsupported in v0.8; the Phase 2.5
-// hooks-native flip is tracked via SPEC §4.4 and
-// `plugins/hooks_claude_shape.go` (Continue's hooks schema is verbatim
-// Claude's).
+// (Commands), permissions.yaml (Permissions), per-file MCP server
+// configuration, and lifecycle hooks (Phase 2.5: schema is verbatim
+// Claude's per SPEC §4.4). Skills degrade to scoped rule files (no
+// dedicated skill primitive). Agents stay unsupported.
 //
 // v0.8 coarse cells (Context, ScopePaths, …, MCP) are preserved unchanged
 // so existing engine paths keep working. v2 per-field FieldCapabilities
@@ -86,7 +91,7 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 		Skills:        plugin.SupportDegraded,
 		Commands:      plugin.SupportNative, // .continue/prompts/<name>.md with invokable: true
 		Agents:        plugin.SupportUnsupported,
-		Hooks:         plugin.SupportUnsupported,
+		Hooks:         plugin.SupportNative, // .continue/hooks.yaml (verbatim Claude schema, SPEC §4.4)
 		Permissions:   plugin.SupportNative, // .continue/permissions.yaml (project-local override)
 		MCP:           plugin.SupportNative,
 
@@ -155,17 +160,36 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 			Extensions: []string{p.Name()},
 		},
 		// HookFields: Continue's hooks schema is verbatim Claude's
-		// (SPEC §4.4); per IMPLEMENTATION_PLAN.md Phase 2.5 the flip to
-		// native uses plugins/hooks_claude_shape.go.
-		// TODO(Phase 2.5): once hooks_claude_shape.go is wired in,
-		// populate the per-field cells per SPEC §12 (Continue Hook column —
-		// most fields N) and flip Supported true. For now Continue
-		// declares hooks unsupported across the board so callers see
-		// honest degradation warnings.
+		// (SPEC §4.4) — emission delegates to
+		// `plugins/hooks_claude_shape.go` rendered as YAML at
+		// `.continue/hooks.yaml`. Per-field cells follow SPEC §12 Hook
+		// table (Continue column `con`).
 		HookFields: plugin.FieldCapabilities{
-			Supported: false,
+			Supported: true,
 			Fields: map[string]plugin.FieldSupport{
-				"*": plugin.FieldUnsupported,
+				"Name":              plugin.FieldSilent,
+				"Description":       plugin.FieldSilent,
+				"Event":             plugin.FieldNative,
+				"Event.ClaudeOnly":  plugin.FieldNative, // Continue mirrors Claude verbatim
+				"Matcher.exact":     plugin.FieldNative,
+				"Matcher.regex":     plugin.FieldNative,
+				"Handlers.command":  plugin.FieldNative,
+				"Handlers.http":     plugin.FieldNative,
+				"Handlers.mcp_tool": plugin.FieldUnsupported,
+				"Handlers.prompt":   plugin.FieldNative,
+				"Handlers.agent":    plugin.FieldNative,
+				"Sequential":        plugin.FieldSilent,
+				"Disabled":          plugin.FieldNative,
+				"TimeoutMs":         plugin.FieldNative,
+				"StatusMessage":     plugin.FieldNative,
+				"Async":             plugin.FieldNative,
+				"FailClosed":        plugin.FieldUnsupported,
+				"Once":              plugin.FieldNative,
+				"If":                plugin.FieldNative,
+				"Cwd":               plugin.FieldSilent,
+				"Env":               plugin.FieldUnsupported,
+				"BashPowershell":    plugin.FieldUnsupported,
+				"ScopePath":         plugin.FieldDegraded,
 			},
 			Extensions: []string{p.Name()},
 		},
@@ -174,8 +198,8 @@ func (p *ContinuePlugin) Capabilities() plugin.Capabilities {
 			Fields: map[string]plugin.FieldSupport{
 				"Name":               plugin.FieldNative,
 				"Transport.stdio":    plugin.FieldNative,
-				"Transport.http":    plugin.FieldNative,
-				"Transport.sse":     plugin.FieldDegraded,
+				"Transport.http":     plugin.FieldNative,
+				"Transport.sse":      plugin.FieldDegraded,
 				"Command":            plugin.FieldNative,
 				"Args":               plugin.FieldNative,
 				"Env":                plugin.FieldNative,
@@ -426,28 +450,19 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Severity: "info",
 		})
 	}
-	for _, h := range proj.Hooks {
-		if h == nil {
-			continue
-		}
-		// v2 additive read: prefer the v0.8 Event string but fall back
-		// to EventCanonical (typed enum, SPEC §4.4.2) when Event is
-		// empty. The parser populates both in v2 emissions; older
-		// fixtures may only set one.
-		eventName := h.Event
-		if eventName == "" {
-			eventName = string(h.EventCanonical)
-		}
-		msg := fmt.Sprintf("Continue has no hook primitive; %s:%s not projected", eventName, h.Matcher)
-		if h.ScopePath != "" {
-			msg = fmt.Sprintf("Continue has no hook primitive; scoped hook %s:%s (scope: %s) not projected", eventName, h.Matcher, h.ScopePath)
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   h.ScriptPath,
-			Message:  msg,
-			Severity: "info",
-		})
+
+	// Hooks → .continue/hooks.yaml (verbatim Claude schema, YAML form).
+	// Continue's hook contract is a literal copy of Claude's per SPEC §4.4,
+	// so we route through plugins/hooks_claude_shape.go and render the
+	// resulting groups as YAML.
+	hookOp, hookWarnings, err := buildContinueHooksOp(p, proj)
+	if err != nil {
+		return nil, err
 	}
+	if hookOp != nil {
+		ops = append(ops, *hookOp)
+	}
+	warnings = append(warnings, hookWarnings...)
 
 	// Native permissions → .continue/permissions.yaml.
 	//
@@ -474,18 +489,19 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if srv == nil || srv.Name == "" {
 			continue
 		}
-		op, err := buildContinueMCPOp(p, srv)
+		op, mcpWarnings, err := buildContinueMCPOp(p, srv)
 		if err != nil {
 			return nil, err
 		}
-		ops = append(ops, op)
+		op.Warnings = append(op.Warnings, mcpWarnings...)
 		if srv.ScopePath != "" {
-			warnings = append(warnings, plugin.Warning{
+			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   "",
 				Message:  fmt.Sprintf("Continue has no per-scope MCP; scoped server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
 				Severity: "info",
 			})
 		}
+		ops = append(ops, op)
 	}
 
 	// Attach orphan warnings to the first available op.
@@ -494,6 +510,210 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	return ops, nil
+}
+
+// buildContinueHooksOp builds the `.continue/hooks.yaml` op (or returns
+// nil if no hooks are set). Continue's hook schema is verbatim Claude's
+// per SPEC §4.4, so emission routes through ClaudeShapeHooks. The shared
+// helper returns map[string][]ClaudeHookGroup keyed by event; we render
+// it as YAML rather than JSON since Continue's hook config file is YAML.
+//
+// Hooks whose canonical event has no Continue mapping are dropped with a
+// per-hook info warning (rare — Continue's mapping table tracks every
+// canonical event Claude supports). Scoped hooks fold into the same flat
+// file with a per-hook merge warning (Continue has no per-scope hooks).
+func buildContinueHooksOp(p *ContinuePlugin, proj *model.Project) (*plugin.Operation, []plugin.Warning, error) {
+	if len(proj.Hooks) == 0 {
+		return nil, nil, nil
+	}
+
+	var warnings []plugin.Warning
+	var sources []string
+	for _, h := range proj.Hooks {
+		if h == nil || h.Disabled {
+			continue
+		}
+		// Probe the resolver: if the event has no mapping, emit a
+		// per-hook info warning. ClaudeShapeHooks itself silently
+		// drops unmappable events; we shadow the check here for the
+		// warning surface.
+		ev, _ := resolveClaudeEvent(h, "continue")
+		if ev == "" {
+			eventName := h.Event
+			if eventName == "" {
+				eventName = string(h.EventCanonical)
+			}
+			label := h.Name
+			if label == "" {
+				label = fmt.Sprintf("%s:%s", eventName, h.Matcher)
+			}
+			warnings = append(warnings, plugin.Warning{
+				Source:   h.ScriptPath,
+				Message:  fmt.Sprintf("Continue has no native expression for hook event %q; %s not projected", eventName, label),
+				Severity: "info",
+			})
+			continue
+		}
+		if h.ScriptPath != "" {
+			sources = append(sources, h.ScriptPath)
+		}
+		if h.ScopePath != "" {
+			label := h.Name
+			if label == "" {
+				label = fmt.Sprintf("%s:%s", ev, h.Matcher)
+			}
+			warnings = append(warnings, plugin.Warning{
+				Source:   h.ScriptPath,
+				Message:  fmt.Sprintf("Continue has no per-scope hooks; ScopePath on hook %s (scope: %s) merged into .continue/hooks.yaml", label, h.ScopePath),
+				Severity: "info",
+			})
+		}
+		// Per-handler field-level unsupported warnings (SPEC §12 Continue
+		// column: FailClosed, Env, BashPowershell, mcp_tool/agent handler
+		// kinds are unsupported on Continue). The shared ClaudeShapeHooks
+		// serializer drops these silently; we surface one warn-level
+		// Warning per affected handler so users know the wire form omits
+		// the field.
+		for _, hd := range h.Handlers {
+			if hd.FailClosed {
+				warnings = append(warnings, plugin.Warning{
+					Source:   h.ScriptPath,
+					Message:  fmt.Sprintf("Continue: hook handler FailClosed unsupported; dropped (event %q)", ev),
+					Severity: "warn",
+				})
+			}
+			if len(hd.Env) > 0 {
+				warnings = append(warnings, plugin.Warning{
+					Source:   h.ScriptPath,
+					Message:  fmt.Sprintf("Continue: hook handler Env unsupported; %d entries dropped (event %q)", len(hd.Env), ev),
+					Severity: "warn",
+				})
+			}
+			if hd.Bash != "" || hd.Powershell != "" {
+				warnings = append(warnings, plugin.Warning{
+					Source:   h.ScriptPath,
+					Message:  fmt.Sprintf("Continue: hook handler Bash/Powershell platform-override script keys unsupported (event %q)", ev),
+					Severity: "warn",
+				})
+			}
+			switch hd.Kind {
+			case model.HookHandlerMCPTool:
+				warnings = append(warnings, plugin.Warning{
+					Source:   h.ScriptPath,
+					Message:  fmt.Sprintf("Continue: hook handler kind mcp_tool unsupported; dropped (event %q)", ev),
+					Severity: "warn",
+				})
+			}
+		}
+	}
+
+	groups := ClaudeShapeHooks(proj.Hooks, "continue")
+	if len(groups) == 0 {
+		// Every hook was dropped (disabled or unmappable). Warnings
+		// already emitted above; no file op.
+		return nil, warnings, nil
+	}
+
+	content, err := renderClaudeShapeYAML(groups)
+	if err != nil {
+		return nil, warnings, fmt.Errorf("continue: marshal hooks: %w", err)
+	}
+
+	if len(sources) == 0 {
+		sources = []string{"hooks.yaml"}
+	}
+
+	op := &plugin.Operation{
+		Kind:    plugin.OpWrite,
+		Path:    ".continue/hooks.yaml",
+		Content: content,
+		Mode:    plugin.ModeWrite,
+		Plugin:  p.Name(),
+		Sources: sources,
+	}
+	return op, warnings, nil
+}
+
+// renderClaudeShapeYAML mirrors RenderClaudeShapeJSON but emits YAML.
+// Continue's hooks config file is `.continue/hooks.yaml` — the same shape
+// Claude carries under settings.json's `hooks:` key, just YAML syntax.
+//
+// Keys are emitted in sorted order for deterministic output. Within each
+// event the group order follows the slice order returned by
+// ClaudeShapeHooks (already sorted by matcher).
+func renderClaudeShapeYAML(groups map[string][]ClaudeHookGroup) (string, error) {
+	if len(groups) == 0 {
+		return "", nil
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	root := &yaml.Node{Kind: yaml.MappingNode}
+	for _, ev := range keys {
+		evSeq := &yaml.Node{Kind: yaml.SequenceNode}
+		for _, g := range groups[ev] {
+			gNode := &yaml.Node{Kind: yaml.MappingNode}
+			if g.Matcher != "" {
+				gNode.Content = append(gNode.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Value: "matcher"},
+					&yaml.Node{Kind: yaml.ScalarNode, Value: g.Matcher},
+				)
+			}
+			hooksSeq := &yaml.Node{Kind: yaml.SequenceNode}
+			for _, h := range g.Hooks {
+				hNode := &yaml.Node{Kind: yaml.MappingNode}
+				if h.Type != "" {
+					hNode.Content = append(hNode.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "type"},
+						&yaml.Node{Kind: yaml.ScalarNode, Value: h.Type},
+					)
+				}
+				if h.Command != "" {
+					hNode.Content = append(hNode.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "command"},
+						&yaml.Node{Kind: yaml.ScalarNode, Value: h.Command},
+					)
+				}
+				if h.Timeout > 0 {
+					hNode.Content = append(hNode.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "timeout"},
+						&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", h.Timeout)},
+					)
+				}
+				if h.URL != "" {
+					hNode.Content = append(hNode.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "url"},
+						&yaml.Node{Kind: yaml.ScalarNode, Value: h.URL},
+					)
+				}
+				if h.Prompt != "" {
+					hNode.Content = append(hNode.Content,
+						&yaml.Node{Kind: yaml.ScalarNode, Value: "prompt"},
+						&yaml.Node{Kind: yaml.ScalarNode, Value: h.Prompt},
+					)
+				}
+				hooksSeq.Content = append(hooksSeq.Content, hNode)
+			}
+			gNode.Content = append(gNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "hooks"},
+				hooksSeq,
+			)
+			evSeq.Content = append(evSeq.Content, gNode)
+		}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: ev},
+			evSeq,
+		)
+	}
+
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // buildContinuePermissionsOp builds the .continue/permissions.yaml op (or
@@ -737,14 +957,68 @@ func renderContinuePrompt(name, description, body string, extra map[string]any) 
 	return b.String()
 }
 
+// continueEnvVarRegex matches the canonical `${env:VAR}` substitution form
+// (SPEC §4.5.3). Variable names follow shell convention: letter or
+// underscore followed by alphanumerics/underscores.
+var continueEnvVarRegex = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// rewriteContinueEnvVar replaces every `${env:VAR}` occurrence in s with
+// Continue's secrets-store syntax `${{ secrets.VAR }}`. Returns the new
+// string plus true if any rewrite happened (used by the caller to decide
+// whether to emit the secrets-store info warning).
+func rewriteContinueEnvVar(s string) (string, bool) {
+	if !strings.Contains(s, "${env:") {
+		return s, false
+	}
+	out := continueEnvVarRegex.ReplaceAllString(s, "${{ secrets.$1 }}")
+	return out, out != s
+}
+
 // buildContinueMCPOp constructs the OpWrite for a single MCP server file at
 // `.continue/mcpServers/<slug>.yaml`. Only non-empty fields from srv are
 // emitted. URL-only servers omit command/args/env.
-func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operation, error) {
+//
+// `${env:VAR}` references in any string field (command, args, env values,
+// url, headers) rewrite to Continue's secrets-store form
+// `${{ secrets.VAR }}` per SPEC §4.5.3. When at least one rewrite fires
+// for a given server, the returned warnings include one info-level entry
+// pointing the user at the Continue secrets store. SSE transport on a
+// YAML mcpServers file emits the SPEC §4.5.4 known-bug warning
+// (continuedev/continue#5359).
+func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operation, []plugin.Warning, error) {
+	var warnings []plugin.Warning
+	var rewrote bool
+
+	// Apply ${env:VAR} → ${{ secrets.VAR }} rewrite to every string
+	// field. We deep-copy the slices/maps so the canonical model
+	// (read by other plugins in the same Plan() pass) stays untouched.
+	rewrite := func(s string) string {
+		out, did := rewriteContinueEnvVar(s)
+		if did {
+			rewrote = true
+		}
+		return out
+	}
+
+	cmd := rewrite(srv.Command)
+	url := rewrite(srv.URL)
+	args := make([]string, len(srv.Args))
+	for i, a := range srv.Args {
+		args[i] = rewrite(a)
+	}
+	env := make(map[string]string, len(srv.Env))
+	for k, v := range srv.Env {
+		env[k] = rewrite(v)
+	}
+	headers := make(map[string]string, len(srv.Headers))
+	for k, v := range srv.Headers {
+		headers[k] = rewrite(v)
+	}
+
 	// Use yaml.Node so we control key order deterministically and emit only
 	// non-empty fields. A plain map[string]any would still serialize but
 	// yaml.v3 sorts map keys non-alphabetically; a node tree keeps the order
-	// stable: name, command, args, env, url.
+	// stable: name, command, args, env, url, headers.
 	root := &yaml.Node{Kind: yaml.MappingNode}
 	addStr := func(key, val string) {
 		if val == "" {
@@ -756,10 +1030,10 @@ func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operati
 		)
 	}
 	addStr("name", srv.Name)
-	addStr("command", srv.Command)
-	if len(srv.Args) > 0 {
+	addStr("command", cmd)
+	if len(args) > 0 {
 		argsNode := &yaml.Node{Kind: yaml.SequenceNode}
-		for _, a := range srv.Args {
+		for _, a := range args {
 			argsNode.Content = append(argsNode.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: a})
 		}
 		root.Content = append(root.Content,
@@ -767,18 +1041,18 @@ func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operati
 			argsNode,
 		)
 	}
-	if len(srv.Env) > 0 {
+	if len(env) > 0 {
 		envNode := &yaml.Node{Kind: yaml.MappingNode}
 		// Sort env keys for deterministic output.
-		keys := make([]string, 0, len(srv.Env))
-		for k := range srv.Env {
+		keys := make([]string, 0, len(env))
+		for k := range env {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
 			envNode.Content = append(envNode.Content,
 				&yaml.Node{Kind: yaml.ScalarNode, Value: k},
-				&yaml.Node{Kind: yaml.ScalarNode, Value: srv.Env[k]},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: env[k]},
 			)
 		}
 		root.Content = append(root.Content,
@@ -786,21 +1060,56 @@ func buildContinueMCPOp(p *ContinuePlugin, srv *model.MCPServer) (plugin.Operati
 			envNode,
 		)
 	}
-	addStr("url", srv.URL)
+	addStr("url", url)
+	if len(headers) > 0 {
+		hdrNode := &yaml.Node{Kind: yaml.MappingNode}
+		keys := make([]string, 0, len(headers))
+		for k := range headers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			hdrNode.Content = append(hdrNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: k},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: headers[k]},
+			)
+		}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "headers"},
+			hdrNode,
+		)
+	}
 
 	raw, err := yaml.Marshal(root)
 	if err != nil {
-		return plugin.Operation{}, fmt.Errorf("continue: marshal mcp server %q: %w", srv.Name, err)
+		return plugin.Operation{}, nil, fmt.Errorf("continue: marshal mcp server %q: %w", srv.Name, err)
 	}
 
-	return plugin.Operation{
+	if rewrote {
+		warnings = append(warnings, plugin.Warning{
+			Source:   "mcp.yaml",
+			Message:  fmt.Sprintf("Continue: ${env:VAR} rewritten to ${{ secrets.VAR }} for server %q; value must live in Continue secrets store, not just shell env.", srv.Name),
+			Severity: "info",
+		})
+	}
+	// SSE on YAML config: known upstream bug per SPEC §4.5.4 (#5359).
+	if strings.EqualFold(srv.Transport, "sse") {
+		warnings = append(warnings, plugin.Warning{
+			Source:   "mcp.yaml",
+			Message:  fmt.Sprintf("Continue: SSE transport on YAML mcpServers config is not fully supported (continuedev/continue#5359); server %q may not connect.", srv.Name),
+			Severity: "info",
+		})
+	}
+
+	op := plugin.Operation{
 		Kind:    plugin.OpWrite,
 		Path:    filepath.ToSlash(filepath.Join(".continue", "mcpServers", skillSlug(srv.Name)+".yaml")),
 		Content: string(raw),
 		Mode:    plugin.ModeWrite,
 		Plugin:  p.Name(),
 		Sources: []string{"mcp.yaml"},
-	}, nil
+	}
+	return op, warnings, nil
 }
 
 // renderContinueRule formats the YAML frontmatter + markdown body for a
@@ -868,13 +1177,10 @@ func continueExtensions(ext map[string]any) map[string]any {
 // output. Values are marshaled via yaml.v3 so nested maps, lists, and
 // scalars all round-trip without manual escaping.
 //
-// TODO(Phase 2.5, SPEC §4.5.3): Continue's `${env:VAR}` rewrite is
-// `${{ secrets.VAR }}` plus a one-per-server info warning ("value must
-// live in Continue secrets store, not just shell env"). The rewrite is
-// applied to MCP fields (command/args/env/url/headers) at emit; this
-// rule-frontmatter passthrough currently emits values verbatim. Wire
-// up the rewrite + warning in the MCP emit path during the Phase 2.5
-// sweep; for now extension blobs round-trip unchanged.
+// Extension blobs round-trip verbatim — the `${env:VAR}` rewrite is
+// applied to MCP fields (command/args/env/url/headers) at emit, not to
+// rule frontmatter passthrough. Plugin-namespaced extensions are an
+// escape hatch for verbatim user input per SPEC §5.1.
 func writeExtensionsYAML(b *strings.Builder, extra map[string]any) {
 	if len(extra) == 0 {
 		return

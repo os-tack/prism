@@ -697,11 +697,12 @@ func TestCline_MCP_Projects(t *testing.T) {
 	}
 }
 
-// TestCline_Hooks_Emit verifies hooks project to
-// .clinerules/hooks/<event>.json with one file per event, the
-// {hooks:[{matcher,hooks:[{type,command}]}]} schema, and the global
-// hook's command set to the raw script path (no wrapper, since it's
-// unscoped).
+// TestCline_Hooks_Emit verifies hooks project to filename-dispatch
+// executable scripts at .clinerules/hooks/<EventName> (no extension, mode
+// 0755) per SPEC §4.4.5. Each script reads stdin once, parses tool_name,
+// guards on the matcher, and execs the user command piping stdin through.
+// The global hook's command is the raw script path (no wrapper, since
+// it's unscoped).
 func TestCline_Hooks_Emit(t *testing.T) {
 	proj := &model.Project{
 		AgentsDir: "/tmp/.agents",
@@ -715,45 +716,49 @@ func TestCline_Hooks_Emit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}
-	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse")
 	if preOp == nil {
-		t.Fatalf("missing PreToolUse.json op; got %v", opPathSet(ops))
+		t.Fatalf("missing PreToolUse op; got %v", opPathSet(ops))
 	}
-	postOp := findOpByPath(ops, ".clinerules/hooks/PostToolUse.json")
+	postOp := findOpByPath(ops, ".clinerules/hooks/PostToolUse")
 	if postOp == nil {
-		t.Fatalf("missing PostToolUse.json op; got %v", opPathSet(ops))
+		t.Fatalf("missing PostToolUse op; got %v", opPathSet(ops))
 	}
 	if preOp.Kind != plugin.OpWrite {
 		t.Errorf("kind = %v, want OpWrite", preOp.Kind)
 	}
-	// Parse PreToolUse JSON and assert structure.
-	var preDoc struct {
-		Hooks []struct {
-			Matcher string `json:"matcher"`
-			Hooks   []struct {
-				Type    string `json:"type"`
-				Command string `json:"command"`
-			} `json:"hooks"`
-		} `json:"hooks"`
+	if preOp.FileMode != 0o755 {
+		t.Errorf("PreToolUse file mode = %v, want 0755 (executable script)", preOp.FileMode)
 	}
-	if err := json.Unmarshal([]byte(preOp.Content), &preDoc); err != nil {
-		t.Fatalf("invalid JSON for PreToolUse: %v\n%s", err, preOp.Content)
+	// Filename-dispatch shape: a shebang, payload capture, tool_name
+	// extraction, and a case-style guard on the matcher must all be
+	// present.
+	if !strings.HasPrefix(preOp.Content, "#!/usr/bin/env bash\n") {
+		t.Errorf("PreToolUse script missing shebang:\n%s", preOp.Content)
 	}
-	if len(preDoc.Hooks) != 1 {
-		t.Fatalf("expected 1 matcher group, got %d", len(preDoc.Hooks))
+	if !strings.Contains(preOp.Content, "set -euo pipefail") {
+		t.Errorf("PreToolUse script missing strict-mode preamble:\n%s", preOp.Content)
 	}
-	if preDoc.Hooks[0].Matcher != "Edit" {
-		t.Errorf("matcher = %q, want Edit", preDoc.Hooks[0].Matcher)
+	if !strings.Contains(preOp.Content, "payload=$(cat)") {
+		t.Errorf("PreToolUse script missing stdin capture:\n%s", preOp.Content)
 	}
-	if len(preDoc.Hooks[0].Hooks) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(preDoc.Hooks[0].Hooks))
+	if !strings.Contains(preOp.Content, "tool_name=") {
+		t.Errorf("PreToolUse script missing tool_name extraction:\n%s", preOp.Content)
 	}
-	entry := preDoc.Hooks[0].Hooks[0]
-	if entry.Type != "command" {
-		t.Errorf("type = %q, want command", entry.Type)
+	// Matcher guard: "Edit" appears in the case alternation.
+	if !strings.Contains(preOp.Content, "case \"$tool_name\" in Edit) true ;; *) false ;; esac") {
+		t.Errorf("PreToolUse script missing Edit matcher guard:\n%s", preOp.Content)
 	}
-	if entry.Command != "/tmp/.agents/hooks/lint.sh" {
-		t.Errorf("command = %q, want raw script path /tmp/.agents/hooks/lint.sh", entry.Command)
+	// Command dispatch: payload is piped into the user script.
+	if !strings.Contains(preOp.Content, "| /tmp/.agents/hooks/lint.sh") {
+		t.Errorf("PreToolUse script missing pipe to user command lint.sh:\n%s", preOp.Content)
+	}
+	// PostToolUse mirror: Bash matcher + audit.sh dispatch.
+	if !strings.Contains(postOp.Content, "case \"$tool_name\" in Bash) true ;; *) false ;; esac") {
+		t.Errorf("PostToolUse script missing Bash matcher guard:\n%s", postOp.Content)
+	}
+	if !strings.Contains(postOp.Content, "| /tmp/.agents/hooks/audit.sh") {
+		t.Errorf("PostToolUse script missing pipe to user command audit.sh:\n%s", postOp.Content)
 	}
 }
 
@@ -800,14 +805,15 @@ func TestCline_ScopedHook_WrapperEmitted(t *testing.T) {
 		t.Errorf("wrapper missing strict-mode preamble:\n%s", wrapperOp.Content)
 	}
 
-	// The hook JSON's command should point at the wrapper's absolute path.
-	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	// The dispatcher script should pipe stdin into the wrapper's
+	// absolute path.
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse")
 	if preOp == nil {
-		t.Fatalf("missing PreToolUse.json op")
+		t.Fatalf("missing PreToolUse op")
 	}
 	wantCmd := filepath.Join(projRoot, wrapperRel)
-	if !strings.Contains(preOp.Content, wantCmd) {
-		t.Errorf("hook JSON should reference wrapper at %s, got:\n%s", wantCmd, preOp.Content)
+	if !strings.Contains(preOp.Content, "| "+wantCmd) {
+		t.Errorf("dispatcher should pipe payload into wrapper at %s, got:\n%s", wantCmd, preOp.Content)
 	}
 
 	// DisableHookWrappers turns wrappers off and inlines the source script.
@@ -819,9 +825,9 @@ func TestCline_ScopedHook_WrapperEmitted(t *testing.T) {
 	if findOpByPath(ops2, wrapperRel) != nil {
 		t.Errorf("wrapper should not be emitted when DisableHookWrappers=true")
 	}
-	preOp2 := findOpByPath(ops2, ".clinerules/hooks/PreToolUse.json")
+	preOp2 := findOpByPath(ops2, ".clinerules/hooks/PreToolUse")
 	if preOp2 == nil {
-		t.Fatalf("missing PreToolUse.json op (disable wrappers)")
+		t.Fatalf("missing PreToolUse op (disable wrappers)")
 	}
 	if !strings.Contains(preOp2.Content, "/tmp/p/.agents/src/billing/hooks/verify.sh") {
 		t.Errorf("disabled wrapper should inline raw script path; got:\n%s", preOp2.Content)
@@ -912,7 +918,8 @@ func extractFrontmatter(t *testing.T, content string) string {
 
 // TestCline_PermsGuard_GlobalEmits verifies that a global Permissions
 // block (no hooks) projects a policy sidecar + global gate wrapper under
-// .cline/hooks/__perms-guard__/, and wires the gate into PreToolUse.json.
+// .cline/hooks/__perms-guard__/, and wires the gate into the
+// .clinerules/hooks/PreToolUse dispatcher script.
 func TestCline_PermsGuard_GlobalEmits(t *testing.T) {
 	projRoot := "/tmp/p"
 	proj := &model.Project{
@@ -936,13 +943,15 @@ func TestCline_PermsGuard_GlobalEmits(t *testing.T) {
 	if findOpByPath(ops, wantGate) == nil {
 		t.Fatalf("missing gate at %s; got %v", wantGate, opPathSet(ops))
 	}
-	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse")
 	if preOp == nil {
-		t.Fatalf("missing PreToolUse.json op; got %v", opPathSet(ops))
+		t.Fatalf("missing PreToolUse op; got %v", opPathSet(ops))
 	}
 	wantCmd := filepath.Join(projRoot, wantGate)
-	if !strings.Contains(preOp.Content, wantCmd) {
-		t.Errorf("PreToolUse.json missing perms-guard gate %s; got %s", wantCmd, preOp.Content)
+	// The bare gate fires on every tool call, so it appears as a
+	// no-matcher section piping the payload directly into the gate.
+	if !strings.Contains(preOp.Content, "| "+wantCmd) {
+		t.Errorf("PreToolUse dispatcher missing perms-guard gate pipe to %s; got %s", wantCmd, preOp.Content)
 	}
 }
 
@@ -989,14 +998,15 @@ func TestCline_PermsGuard_CoexistsWithUserHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse.json")
+	preOp := findOpByPath(ops, ".clinerules/hooks/PreToolUse")
 	if preOp == nil {
-		t.Fatalf("missing PreToolUse.json op")
+		t.Fatalf("missing PreToolUse op")
 	}
-	// When user hooks + perms both exist, the hook command is rewritten
-	// to its per-hook perms-guard wrapper (which wraps the user script).
+	// When user hooks + perms both exist, the dispatcher pipes payload
+	// into the per-hook perms-guard wrapper (which in turn wraps the
+	// user script).
 	if !strings.Contains(preOp.Content, "__perms-guard__/PreToolUse-lint.sh") {
-		t.Errorf("PreToolUse.json missing per-hook perms-guard wrapper:\n%s", preOp.Content)
+		t.Errorf("PreToolUse dispatcher missing per-hook perms-guard wrapper:\n%s", preOp.Content)
 	}
 	// The wrapper itself was emitted as an op AND references the user script.
 	wrapperOp := findOpByPath(ops, ".cline/hooks/__perms-guard__/PreToolUse-lint.sh")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -240,9 +241,15 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		ops = append(ops, op)
 	}
 
-	// Per-scope CLAUDE.md files. Pass extensions.claude.* through.
+	// Per-scope CLAUDE.md files. Pass extensions.claude.* through. Scopes
+	// with non-empty Globs additionally project as `.claude/rules/<name>.md`
+	// below (the cascade form is preserved for filesystem-anchored scopes).
 	for _, sc := range proj.Scopes {
 		if sc == nil || sc.Document == nil {
+			continue
+		}
+		// Skip the cascade emission when the scope is glob-only (no Path).
+		if sc.Path == "" && len(sc.Globs) > 0 {
 			continue
 		}
 		path := filepath.Join(sc.Path, "CLAUDE.md")
@@ -250,12 +257,97 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if err != nil {
 			return nil, err
 		}
+		// Degradation warnings for non-native scope fields (Name,
+		// Priority, IsOverride). Tags are silent per SPEC §4.7.4.
+		if sc.Name != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope Name=%q degraded on Claude (filename-derived; no `name:` frontmatter)", sc.Name),
+				Severity: "info",
+			})
+		}
+		if sc.Priority != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope Priority=%s degraded on Claude (approximated via cascade depth; no native priority key)", sc.Priority),
+				Severity: "info",
+			})
+		}
+		if sc.IsOverride {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope IsOverride unsupported on Claude (no native override semantic; emitted as leading HTML comment in scope %q)", sc.Path),
+				Severity: "warn",
+			})
+		}
 		ops = append(ops, op)
 	}
 
-	// Skills (global + scoped). Scoped skills are projected natively under
-	// `.claude/skills/<scopeSlug>-<name>/SKILL.md`; the body (with `globs:`
-	// frontmatter) is unchanged from a global skill.
+	// Per-scope rule files (frontmatter-globbed). Scopes with non-empty
+	// Globs and a glob-style activation project to
+	// `.claude/rules/<name>.md` with a `paths:` key in frontmatter so
+	// Claude can match the rule at runtime. Path-cascaded scopes (Globs
+	// empty OR Activation=Cascade) continue to project as
+	// `<scope>/CLAUDE.md` per the cascade above.
+	for _, sc := range proj.Scopes {
+		if sc == nil || sc.Document == nil {
+			continue
+		}
+		if len(sc.Globs) == 0 {
+			continue
+		}
+		// Only EXPLICITLY glob-active scopes project as rule files;
+		// cascade scopes (including those with empty Activation, which
+		// defaults to cascade per SPEC §4.7.2) already projected above
+		// as <Path>/CLAUDE.md.
+		if sc.Activation != model.ScopeActivationGlob {
+			continue
+		}
+		name := sc.Name
+		if name == "" {
+			// Fall back to a deterministic slug from the path.
+			name = strings.ReplaceAll(strings.Trim(sc.Path, "/"), "/", "-")
+		}
+		if name == "" {
+			continue
+		}
+		path := filepath.Join(".claude", "rules", name+".md")
+		synth := map[string]any{
+			"paths": sc.Globs,
+		}
+		op, err := buildOpExtSynth(proj, sc.Document, path, mode, synth, claudeExtensions(sc.Extensions))
+		if err != nil {
+			return nil, err
+		}
+		if sc.IsOverride {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope %q IsOverride degraded on Claude (emitted as leading HTML comment; no native override semantic)", name),
+				Severity: "warn",
+			})
+		}
+		if sc.Name != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope %q Name degraded on Claude (filename-derived; no `name:` frontmatter key)", sc.Name),
+				Severity: "info",
+			})
+		}
+		if sc.Priority != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sc.Document.SourcePath),
+				Message:  fmt.Sprintf("scope priority=%s degraded on Claude (cascade depth approximation; no native priority key)", sc.Priority),
+				Severity: "info",
+			})
+		}
+		ops = append(ops, op)
+	}
+
+	// Skills (global + scoped). Scoped skills project natively under
+	// `.claude/skills/<scopeSlug>-<name>/SKILL.md`. v2 frontmatter
+	// synthesis (paths, allowed-tools, arguments, when_to_use, model,
+	// context/agent) is folded with the source's existing frontmatter
+	// and any `extensions.claude.*` pass-through.
 	for _, sk := range proj.Skills {
 		if sk == nil || sk.Document == nil {
 			continue
@@ -263,9 +355,18 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		dirName := scopedName(sk.ScopePath, sk.Name)
 		skillDir := filepath.Join(".claude", "skills", dirName)
 		skillPath := filepath.Join(skillDir, "SKILL.md")
-		op, err := buildOpExt(proj, sk.Document, skillPath, mode, claudeExtensions(sk.Extensions))
+		synth, skillWarnings := synthClaudeSkillFrontmatter(proj, sk)
+		op, err := buildOpExtSynth(proj, sk.Document, skillPath, mode, synth, claudeExtensions(sk.Extensions))
 		if err != nil {
 			return nil, err
+		}
+		op.Warnings = append(op.Warnings, skillWarnings...)
+		if sk.ScopePath != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   proj.SourceTag(sk.Document.SourcePath),
+				Message:  fmt.Sprintf("scoped skill %q projected with scopepath %q via <slug>-<name> dir prefix (Claude skills are global)", sk.Name, sk.ScopePath),
+				Severity: "info",
+			})
 		}
 		ops = append(ops, op)
 
@@ -291,14 +392,15 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		}
 		fileName := scopedName(cmd.ScopePath, cmd.Name) + ".md"
 		path := filepath.Join(".claude", "commands", fileName)
-		op, err := buildOpExt(proj, cmd.Document, path, mode, claudeExtensions(cmd.Extensions))
+		synth := synthClaudeCommandFrontmatter(cmd)
+		op, err := buildOpExtSynth(proj, cmd.Document, path, mode, synth, claudeExtensions(cmd.Extensions))
 		if err != nil {
 			return nil, err
 		}
 		if cmd.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   proj.SourceTag(cmd.Document.SourcePath),
-				Message:  fmt.Sprintf("scoped command %q projected without path enforcement (Claude commands are global)", cmd.Name),
+				Message:  fmt.Sprintf("scoped command %q (scopepath %s) projected without path enforcement (Claude commands are global)", cmd.Name, cmd.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -313,14 +415,16 @@ func (p *ClaudePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		}
 		fileName := scopedName(ag.ScopePath, ag.Name) + ".md"
 		path := filepath.Join(".claude", "agents", fileName)
-		op, err := buildOpExt(proj, ag.Document, path, mode, claudeExtensions(ag.Extensions))
+		synth, agentWarnings := synthClaudeAgentFrontmatter(proj, ag)
+		op, err := buildOpExtSynth(proj, ag.Document, path, mode, synth, claudeExtensions(ag.Extensions))
 		if err != nil {
 			return nil, err
 		}
+		op.Warnings = append(op.Warnings, agentWarnings...)
 		if ag.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   proj.SourceTag(ag.Document.SourcePath),
-				Message:  fmt.Sprintf("scoped agent %q projected without path enforcement (Claude agents are global)", ag.Name),
+				Message:  fmt.Sprintf("scoped agent %q (scopepath %s) projected without path enforcement (Claude agents are global)", ag.Name, ag.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -602,6 +706,252 @@ func claudeExtensions(ext map[string]any) map[string]any {
 	return v
 }
 
+// buildOpExtSynth is buildOpExt with a v2-synthesized frontmatter layer
+// merged underneath the extensions.claude.* hoist. Synth keys are
+// populated by the per-primitive helpers (synthClaudeAgentFrontmatter,
+// synthClaudeSkillFrontmatter, synthClaudeCommandFrontmatter). Layering
+// order (later wins): Document.Frontmatter, synth, extensions.claude.*.
+// When both synth and claudeExt are empty this collapses to buildOpExt.
+func buildOpExtSynth(proj *model.Project, doc *model.Document, targetPath string, mode plugin.Mode, synth, claudeExt map[string]any) (plugin.Operation, error) {
+	if len(synth) == 0 {
+		return buildOpExt(proj, doc, targetPath, mode, claudeExt)
+	}
+	// Synthesized frontmatter forces write mode (we mutate the body).
+	merged := map[string]any{}
+	for k, v := range synth {
+		merged[k] = v
+	}
+	for k, v := range claudeExt {
+		merged[k] = v
+	}
+	downgraded := doc.NeedsWrite()
+	if mode == plugin.ModeSymlink {
+		mode = plugin.ModeWrite
+	}
+	sources := []string{proj.SourceTag(doc.SourcePath)}
+	for _, inc := range doc.Includes {
+		sources = append(sources, proj.SourceTag(inc))
+	}
+	op := plugin.Operation{
+		Kind:    plugin.OpWrite,
+		Path:    targetPath,
+		Mode:    mode,
+		Sources: sources,
+		Plugin:  "claude",
+		Content: renderBodyWithExtensions(doc, merged),
+	}
+	if downgraded {
+		op.Warnings = append(op.Warnings, plugin.Warning{
+			Source:   proj.SourceTag(doc.SourcePath),
+			Message:  "downgraded to write mode: contains @include directives",
+			Severity: "info",
+		})
+	}
+	return op, nil
+}
+
+// synthClaudeAgentFrontmatter renders the v2 Agent-shape frontmatter
+// Claude understands (SPEC §4.1.4 / §12 cla column). Returns the
+// synthesized keys plus warnings for non-native fields (ReadOnly,
+// UserInvocable, ModelInvocable degrade with info warnings; nothing
+// else triggers a warning at the agent layer — extensions take care of
+// arbitrary overrides).
+//
+// Layout:
+//   - model:               from Agent.Model
+//   - tools:               Agent.Tools + Agent(name) entries from AllowedSubagents
+//   - disallowedTools:     from Agent.DisallowedTools
+//   - permissionMode: plan when *Agent.ReadOnly == true (degraded)
+//   - background: true     when *Agent.Background == true
+//   - maxTurns:            from *Agent.MaxTurns
+//   - initialPrompt:       from Agent.InitialPrompt
+//   - mcpServers:          name list from Agent.MCPServers
+func synthClaudeAgentFrontmatter(proj *model.Project, ag *model.Agent) (map[string]any, []plugin.Warning) {
+	if ag == nil {
+		return nil, nil
+	}
+	out := map[string]any{}
+	var warnings []plugin.Warning
+	if ag.Model != "" {
+		out["model"] = ag.Model
+	}
+	tools := append([]string(nil), ag.Tools...)
+	for _, sub := range ag.AllowedSubagents {
+		if sub == "" {
+			continue
+		}
+		tools = append(tools, "Agent("+sub+")")
+	}
+	if len(tools) > 0 {
+		out["tools"] = tools
+	}
+	if len(ag.DisallowedTools) > 0 {
+		out["disallowedTools"] = ag.DisallowedTools
+	}
+	if ag.ReadOnly != nil && *ag.ReadOnly {
+		out["permissionMode"] = "plan"
+		warnings = append(warnings, plugin.Warning{
+			Source:   proj.SourceTag(ag.Document.SourcePath),
+			Message:  fmt.Sprintf("agent %q ReadOnly degraded to permissionMode: plan on Claude (no native readonly flag)", ag.Name),
+			Severity: "info",
+		})
+	}
+	if ag.Background != nil && *ag.Background {
+		out["background"] = true
+	}
+	if ag.MaxTurns != nil {
+		out["maxTurns"] = *ag.MaxTurns
+	}
+	if ag.InitialPrompt != "" {
+		out["initialPrompt"] = ag.InitialPrompt
+	}
+	if ag.UserInvocable != nil {
+		warnings = append(warnings, plugin.Warning{
+			Source:   proj.SourceTag(ag.Document.SourcePath),
+			Message:  fmt.Sprintf("agent %q UserInvocable=%v degraded on Claude (no native flag; convention is to move the agent file under a non-scanned dir to suppress invocation)", ag.Name, *ag.UserInvocable),
+			Severity: "info",
+		})
+	}
+	if ag.ModelInvocable != nil {
+		warnings = append(warnings, plugin.Warning{
+			Source:   proj.SourceTag(ag.Document.SourcePath),
+			Message:  fmt.Sprintf("agent %q ModelInvocable=%v degraded on Claude (no native flag; emit a permissions.deny rule on the agent name to suppress model invocation)", ag.Name, *ag.ModelInvocable),
+			Severity: "info",
+		})
+	}
+	if len(ag.MCPServers) > 0 {
+		names := make([]string, 0, len(ag.MCPServers))
+		for _, ref := range ag.MCPServers {
+			if ref.Name != "" {
+				names = append(names, ref.Name)
+			}
+		}
+		if len(names) > 0 {
+			out["mcpServers"] = names
+		}
+	}
+	return out, warnings
+}
+
+// synthClaudeSkillFrontmatter renders the v2 Skill-shape frontmatter
+// Claude understands (SPEC §4.2.5).
+//
+// Layout:
+//   - paths:                from Activation.Globs (falls back to Skill.Globs)
+//   - allowed-tools:        from AllowedTools
+//   - arguments:            name list from Arguments
+//   - when_to_use:          from WhenToUse
+//   - model:                from Model
+//   - context: fork, agent: <subagent> when Subagent != ""
+//   - user-invocable:       from Activation.UserInvocable
+//   - disable-model-invocation: true when Activation.ModelInvocable == false
+//
+// Warnings: Activation.ContentRegex is unsupported on Claude;
+// Activation.Modes.Always degrades (body persists; no native always).
+func synthClaudeSkillFrontmatter(proj *model.Project, sk *model.Skill) (map[string]any, []plugin.Warning) {
+	if sk == nil {
+		return nil, nil
+	}
+	out := map[string]any{}
+	var warnings []plugin.Warning
+
+	globs := sk.Activation.Globs
+	if len(globs) == 0 {
+		globs = sk.Globs
+	}
+	if len(globs) > 0 {
+		out["paths"] = globs
+	}
+	if len(sk.AllowedTools) > 0 {
+		out["allowed-tools"] = sk.AllowedTools
+	}
+	if len(sk.Arguments) > 0 {
+		names := make([]string, 0, len(sk.Arguments))
+		for _, a := range sk.Arguments {
+			if a.Name != "" {
+				names = append(names, a.Name)
+			}
+		}
+		if len(names) > 0 {
+			out["arguments"] = names
+		}
+	}
+	if sk.WhenToUse != "" {
+		out["when_to_use"] = sk.WhenToUse
+	}
+	if sk.Model != "" {
+		out["model"] = sk.Model
+	}
+	if sk.Subagent != "" {
+		out["context"] = "fork"
+		out["agent"] = sk.Subagent
+	}
+	if sk.Activation.UserInvocable != nil && *sk.Activation.UserInvocable {
+		out["user-invocable"] = true
+	}
+	if sk.Activation.ModelInvocable != nil && !*sk.Activation.ModelInvocable {
+		out["disable-model-invocation"] = true
+	}
+	if sk.Activation.ContentRegex != "" {
+		warnings = append(warnings, plugin.Warning{
+			Source:   proj.SourceTag(sk.Document.SourcePath),
+			Message:  fmt.Sprintf("skill %q Activation.ContentRegex unsupported by Claude (no content-regex activation; drop or move to a custom hook)", sk.Name),
+			Severity: "warn",
+		})
+	}
+	for _, m := range sk.Activation.Modes {
+		if m == model.SkillActivationAlways {
+			warnings = append(warnings, plugin.Warning{
+				Source:   proj.SourceTag(sk.Document.SourcePath),
+				Message:  fmt.Sprintf("skill %q Activation.Modes.Always degraded on Claude (body persists; no native always)", sk.Name),
+				Severity: "info",
+			})
+		}
+	}
+	return out, warnings
+}
+
+// synthClaudeCommandFrontmatter renders the v2 Command-shape frontmatter
+// Claude understands (SPEC §4.3.4).
+//
+// Layout:
+//   - description:                from Command.Description
+//   - argument-hint:              from ArgumentHint
+//   - arguments:                  list from Arguments
+//   - allowed-tools:              from Tools
+//   - model:                      from Model
+//   - agent:                      from Agent (when set; emits context: fork)
+//   - disable-model-invocation:   true when AutoInvoke == false
+func synthClaudeCommandFrontmatter(cmd *model.Command) map[string]any {
+	if cmd == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if cmd.Description != "" {
+		out["description"] = cmd.Description
+	}
+	if cmd.ArgumentHint != "" {
+		out["argument-hint"] = cmd.ArgumentHint
+	}
+	if len(cmd.Arguments) > 0 {
+		out["arguments"] = cmd.Arguments
+	}
+	if len(cmd.Tools) > 0 {
+		out["allowed-tools"] = cmd.Tools
+	}
+	if cmd.Model != "" {
+		out["model"] = cmd.Model
+	}
+	if cmd.Agent != "" {
+		out["agent"] = cmd.Agent
+		out["context"] = "fork"
+	}
+	if !cmd.AutoInvoke {
+		out["disable-model-invocation"] = true
+	}
+	return out
+}
+
 // buildScriptOp constructs an Operation that places a skill script under
 // `<skillDir>/scripts/<basename>`. Scripts are symlinks (or copies in write
 // mode) pointing at the original absolute path in .agents/.
@@ -661,63 +1011,102 @@ type hookGroup struct {
 // a Merger closure that the engine invokes with the file's existing bytes;
 // Plan() itself does no filesystem I/O so plugin behavior is reproducible
 // from (proj, wrapperPaths) alone.
+//
+// Permissions are fanned out through the shared canonical permission grammar
+// (`plugins/perms_grammar.go`): `fs:` expands to Edit/Read/Write triples,
+// `network:` becomes `WebFetch(domain:...)`, `mcp:` becomes
+// `mcp__<server>__<tool>`, and a leading `!` routes the rule to the Deny
+// bucket. Hooks are serialized through the shared Claude-shape emitter
+// (`plugins/hooks_claude_shape.go`) so per-action canonical events translate
+// to (PreToolUse/PostToolUse + matcher) and typed Handlers materialize.
 func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (plugin.Operation, error) {
 	var warnings []plugin.Warning
 
-	allow, deny, ask := []string{}, []string{}, []string{}
-	if proj.Permissions != nil {
-		allow = append(allow, proj.Permissions.Allow...)
-		deny = append(deny, proj.Permissions.Deny...)
-		ask = append(ask, proj.Permissions.Ask...)
-	}
+	allow, deny, ask, permWarnings := claudePermissionEntries(proj)
+	warnings = append(warnings, permWarnings...)
+
 	for _, sp := range proj.ScopedPermissions {
 		if sp == nil {
 			continue
 		}
-		allow = append(allow, sp.Allow...)
-		deny = append(deny, sp.Deny...)
-		ask = append(ask, sp.Ask...)
 		warnings = append(warnings, plugin.Warning{
 			Source:   sp.ScopePath + "/permissions.yaml",
 			Message:  fmt.Sprintf("permissions from %s/permissions.yaml applied project-wide; Claude Code has no per-scope permissions", sp.ScopePath),
 			Severity: "info",
 		})
 	}
-	allow = dedupeStrings(allow)
-	deny = dedupeStrings(deny)
-	ask = dedupeStrings(ask)
-	buckets := map[string]map[string][]hookEntry{}
-	eventOrder := []string{}
+
+	// Hook warnings for non-native handler fields (Cwd, Env, FailClosed) and
+	// scoped hooks (ScopePath). Emitted regardless of wrapper materialization.
 	for _, h := range proj.Hooks {
 		if h == nil {
 			continue
 		}
-		// v2 additive read: prefer h.Event (v0.8 shape) but fall back to
-		// h.EventCanonical (v2 typed enum) when only the v2 path is set.
-		// The parser populates both for v0.8-shape inputs; v2-only inputs
-		// will arrive with Event == "" once Phase 2.5 retires the v0.8
-		// shape, so this fallback keeps Plan() compatible across both
-		// importer shapes.
-		event := h.Event
-		if event == "" && h.EventCanonical != "" {
-			event = string(h.EventCanonical)
+		if h.ScopePath != "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   proj.SourceTag(h.ScriptPath),
+				Message:  fmt.Sprintf("scoped hook (scopepath %s) projected with __scope-guard__ wrapper; Claude Code has no per-scope hooks", h.ScopePath),
+				Severity: "info",
+			})
 		}
-		if event == "" {
+		for _, hd := range h.Handlers {
+			if hd.Cwd != "" {
+				warnings = append(warnings, plugin.Warning{
+					Source:   proj.SourceTag(h.ScriptPath),
+					Message:  fmt.Sprintf("hook handler cwd=%q not natively honored by Claude (degraded; wrap the command in a `cd && exec` shell script)", hd.Cwd),
+					Severity: "info",
+				})
+			}
+			if len(hd.Env) > 0 {
+				envKeys := make([]string, 0, len(hd.Env))
+				for k := range hd.Env {
+					envKeys = append(envKeys, k)
+				}
+				sort.Strings(envKeys)
+				warnings = append(warnings, plugin.Warning{
+					Source:   proj.SourceTag(h.ScriptPath),
+					Message:  fmt.Sprintf("hook handler env=%v unsupported by Claude (drop or wrap in a shell script)", envKeys),
+					Severity: "warn",
+				})
+			}
+			if hd.FailClosed {
+				warnings = append(warnings, plugin.Warning{
+					Source:   proj.SourceTag(h.ScriptPath),
+					Message:  "hook handler FailClosed unsupported by Claude (Claude treats non-block exit codes as fail-open; wrap in a shell script that maps non-zero to a block-exit code)",
+					Severity: "warn",
+				})
+			}
+		}
+	}
+
+	// Render hooks via the shared Claude-shape serializer so per-action
+	// canonical events translate to (generic + matcher) form and typed
+	// Handlers (HTTP/Prompt/Command) materialize correctly.
+	hookGroups := ClaudeShapeHooks(proj.Hooks, "claude")
+	// Apply wrapper-path substitution: scoped hooks that materialized a
+	// __scope-guard__ wrapper should point at that wrapper's absolute path
+	// rather than the user's source script (so the gate fires at hook
+	// invocation time). We map by source command path here.
+	wrapperByScript := map[string]string{}
+	for h, wp := range wrapperPaths {
+		if h == nil {
 			continue
 		}
-		if _, ok := buckets[event]; !ok {
-			buckets[event] = map[string][]hookEntry{}
-			eventOrder = append(eventOrder, event)
-		}
-		cmdPath := h.ScriptPath
-		if w, ok := wrapperPaths[h]; ok {
-			cmdPath = w
-		}
-		buckets[event][h.Matcher] = append(buckets[event][h.Matcher], hookEntry{
-			Type:    "command",
-			Command: cmdPath,
-		})
+		wrapperByScript[h.ScriptPath] = wp
 	}
+	if len(wrapperByScript) > 0 {
+		for event, groups := range hookGroups {
+			for gi := range groups {
+				for hi := range groups[gi].Hooks {
+					if w, ok := wrapperByScript[groups[gi].Hooks[hi].Command]; ok {
+						groups[gi].Hooks[hi].Command = w
+					}
+				}
+			}
+			hookGroups[event] = groups
+		}
+	}
+
 	relPath := filepath.Join(".claude", "settings.json")
 
 	merger := func(existing []byte) (string, error) {
@@ -745,25 +1134,12 @@ func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (
 			settings["permissions"] = perms
 		}
 
-		if len(proj.Hooks) > 0 {
+		if len(hookGroups) > 0 {
 			hooksRoot, _ := settings["hooks"].(map[string]any)
 			if hooksRoot == nil {
 				hooksRoot = map[string]any{}
 			}
-			for _, event := range eventOrder {
-				matcherMap := buckets[event]
-				matchers := make([]string, 0, len(matcherMap))
-				for m := range matcherMap {
-					matchers = append(matchers, m)
-				}
-				sort.Strings(matchers)
-				var groups []hookGroup
-				for _, m := range matchers {
-					groups = append(groups, hookGroup{
-						Matcher: m,
-						Hooks:   matcherMap[m],
-					})
-				}
+			for event, groups := range hookGroups {
 				hooksRoot[event] = groups
 			}
 			settings["hooks"] = hooksRoot
@@ -801,16 +1177,193 @@ func buildSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]string) (
 	}, nil
 }
 
+// claudePermissionEntries fans out canonical Permission rules (SPEC §4.6)
+// into Claude's wire form. Uses the shared `ParsePermRule` + `FSFanOut` +
+// `ClaudeRuleForm` grammar so emit-side semantics stay in sync with every
+// other plugin: `fs:src/**` allow → three Allow rules (Edit/Read/Write);
+// `network:github.com` → `WebFetch(domain:github.com)`; `mcp:srv:tool` →
+// `mcp__srv__tool`; a leading `!` reroutes the entry to the Deny bucket;
+// `**` recursive globs pass through to Claude's native glob dialect.
+//
+// Warnings: degraded fan-outs (fs:, network:, mcp:, ** preservation,
+// negation routing) emit an "info" Warning per rule per category so the
+// per-field capability contract (§12) round-trips.
+func claudePermissionEntries(proj *model.Project) (allow, deny, ask []string, warnings []plugin.Warning) {
+	allow = []string{}
+	deny = []string{}
+	ask = []string{}
+	if proj.Permissions != nil {
+		a, d, k, w := claudeRuleBucket(proj.Permissions.Allow, "allow", "")
+		allow = append(allow, a...)
+		deny = append(deny, d...)
+		ask = append(ask, k...)
+		warnings = append(warnings, w...)
+		_, d2, _, w2 := claudeRuleBucket(proj.Permissions.Deny, "deny", "")
+		deny = append(deny, d2...)
+		warnings = append(warnings, w2...)
+		_, _, k2, w3 := claudeRuleBucket(proj.Permissions.Ask, "ask", "")
+		ask = append(ask, k2...)
+		warnings = append(warnings, w3...)
+	}
+	for _, sp := range proj.ScopedPermissions {
+		if sp == nil {
+			continue
+		}
+		a, d, k, w := claudeRuleBucket(sp.Allow, "allow", sp.ScopePath)
+		allow = append(allow, a...)
+		deny = append(deny, d...)
+		ask = append(ask, k...)
+		warnings = append(warnings, w...)
+		_, d2, _, w2 := claudeRuleBucket(sp.Deny, "deny", sp.ScopePath)
+		deny = append(deny, d2...)
+		warnings = append(warnings, w2...)
+		_, _, k2, w3 := claudeRuleBucket(sp.Ask, "ask", sp.ScopePath)
+		ask = append(ask, k2...)
+		warnings = append(warnings, w3...)
+	}
+	allow = dedupeStrings(allow)
+	deny = dedupeStrings(deny)
+	ask = dedupeStrings(ask)
+	return allow, deny, ask, warnings
+}
+
+// claudeRuleBucket parses each rule string and emits the appropriate
+// Claude wire-form entries plus any degradation warnings. bucket names
+// the source bucket ("allow"/"deny"/"ask") so warnings can be specific.
+// Returns (allow, deny, ask, warnings); negated rules in the Allow
+// bucket flip to Deny entries.
+func claudeRuleBucket(rules []string, bucket, scopePath string) (allow, deny, ask []string, warnings []plugin.Warning) {
+	source := "permissions.yaml"
+	if scopePath != "" {
+		source = scopePath + "/permissions.yaml"
+	}
+	for _, rule := range rules {
+		pr := ParsePermRule(rule)
+		// fs: rule fan-out → three FS entries.
+		if pr.Target == PermTargetFS {
+			warnings = append(warnings, plugin.Warning{
+				Source:   source,
+				Message:  fmt.Sprintf("fs rule %q fanned out to Edit/Read/Write on Claude (no native fs: target)", rule),
+				Severity: "info",
+			})
+		}
+		// network: → WebFetch(domain:...).
+		if pr.Target == PermTargetNetwork {
+			warnings = append(warnings, plugin.Warning{
+				Source:   source,
+				Message:  fmt.Sprintf("network rule %q projected as WebFetch(domain:%s) on Claude (no native network: target)", rule, pr.Pattern),
+				Severity: "info",
+			})
+		}
+		// mcp: → mcp__server__tool.
+		if pr.Target == PermTargetMCP {
+			warnings = append(warnings, plugin.Warning{
+				Source:   source,
+				Message:  fmt.Sprintf("mcp rule %q projected as %s on Claude", rule, pr.ClaudeRuleForm()),
+				Severity: "info",
+			})
+		}
+		// `**` recursive globs survive intact in Claude's dialect but are a
+		// degraded fallback for tools that only support `*` — surface for
+		// audit symmetry per SPEC §4.6.4.
+		if strings.Contains(pr.Pattern, "**") {
+			warnings = append(warnings, plugin.Warning{
+				Source:   source,
+				Message:  fmt.Sprintf("recursive_glob rule %q preserved verbatim in Claude's glob dialect", rule),
+				Severity: "info",
+			})
+		}
+		// Negation routes to deny regardless of the source bucket.
+		if pr.Negated {
+			warnings = append(warnings, plugin.Warning{
+				Source:   source,
+				Message:  fmt.Sprintf("negation rule %q routed to deny bucket (Claude has no inline negation form)", rule),
+				Severity: "info",
+			})
+		}
+		entries := claudeRuleWireForms(pr)
+		targetBucket := bucket
+		if pr.Negated {
+			targetBucket = "deny"
+		}
+		switch targetBucket {
+		case "allow":
+			allow = append(allow, entries...)
+		case "deny":
+			deny = append(deny, entries...)
+		case "ask":
+			ask = append(ask, entries...)
+		}
+	}
+	return allow, deny, ask, warnings
+}
+
+// claudeRuleWireForms returns the Claude wire form(s) for one parsed
+// rule. fs: rules expand to three entries (Edit/Read/Write); every other
+// rule produces a single entry.
+func claudeRuleWireForms(pr PermRule) []string {
+	if pr.Target == PermTargetFS {
+		out := make([]string, 0, 3)
+		for _, sub := range pr.FSFanOut() {
+			out = append(out, sub.ClaudeRuleForm())
+		}
+		return out
+	}
+	return []string{pr.ClaudeRuleForm()}
+}
+
 // mcpServerJSON is the schema Claude Code expects for entries under
-// `.mcp.json`'s `mcpServers` map.
+// `.mcp.json`'s `mcpServers` map. v2 fields: Type carries the transport
+// (`stdio`/`http`/`sse`); Headers and URL accompany http/sse transports.
 type mcpServerJSON struct {
+	Type    string            `json:"type,omitempty"`
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// claudeEnvVarRewrite rewrites prism's canonical `${env:VAR}` substitution to
+// Claude's native `${VAR}` form (SPEC §4.5.3). Applied to MCP `env`,
+// `command`, `args`, `url`, and `headers` values at emit. Bare `${VAR}` in
+// user input passes through unchanged.
+var claudeEnvVarRewrite = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+func rewriteClaudeEnvVars(s string) string {
+	return claudeEnvVarRewrite.ReplaceAllString(s, "${$1}")
+}
+
+func rewriteClaudeEnvVarsSlice(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = rewriteClaudeEnvVars(v)
+	}
+	return out
+}
+
+func rewriteClaudeEnvVarsMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = rewriteClaudeEnvVars(v)
+	}
+	return out
 }
 
 // buildMCPOp merges proj.MCP into any existing .mcp.json at proj.Root.
+// Transport drives the `type` field (stdio/http/sse). Auth.Scheme controls
+// header injection: bearer prepends `Authorization: Bearer <token>`,
+// header merges Auth.Headers, oauth emits one info warning per server and
+// does NOT emit credentials. `${env:VAR}` substitution rewrites to
+// `${VAR}` (SPEC §4.5.3). Known upstream bugs (anthropics/claude-code#6204:
+// `${env:VAR}` in headers + http/sse) emit a warning citing the issue.
+//
 // Scoped MCP servers are merged into the same mcpServers map as globals
 // (Claude Code has no native per-scope MCP) with one info warning per
 // scoped server.
@@ -834,19 +1387,118 @@ func buildMCPOp(proj *model.Project) (plugin.Operation, error) {
 		if srv == nil || srv.Name == "" {
 			continue
 		}
+		if srv.Disabled {
+			continue
+		}
+
 		entry := mcpServerJSON{
-			Command: srv.Command,
-			Args:    srv.Args,
-			Env:     srv.Env,
+			Type:    srv.Transport,
+			Command: rewriteClaudeEnvVars(srv.Command),
+			Args:    rewriteClaudeEnvVarsSlice(srv.Args),
+			Env:     rewriteClaudeEnvVarsMap(srv.Env),
+			URL:     rewriteClaudeEnvVars(srv.URL),
+			Headers: rewriteClaudeEnvVarsMap(srv.Headers),
 		}
-		if srv.Command == "" && srv.URL != "" {
-			entry.URL = srv.URL
+		if entry.URL == "" && srv.Command == "" && srv.URL != "" {
+			// Back-compat: when only the v0.8 URL is set with no
+			// transport, still emit the URL.
+			entry.URL = rewriteClaudeEnvVars(srv.URL)
 		}
+
+		// Auth handling (SPEC §4.5.2). One info warning per server with an
+		// Auth.Scheme to surface the degradation (Claude has no native
+		// `auth:` block; we inline the credentials into the headers when
+		// possible, or warn-only for oauth).
+		if srv.Auth != nil && srv.Auth.Scheme != "" {
+			scheme := strings.ToLower(srv.Auth.Scheme)
+			switch scheme {
+			case "bearer":
+				if srv.Auth.Token != "" {
+					if entry.Headers == nil {
+						entry.Headers = map[string]string{}
+					}
+					entry.Headers["Authorization"] = "Bearer " + rewriteClaudeEnvVars(srv.Auth.Token)
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   "mcp.yaml",
+					Message:  fmt.Sprintf("MCP server %q Auth.Scheme=bearer degraded on Claude (no native auth block; injected as Authorization header)", srv.Name),
+					Severity: "info",
+				})
+			case "header":
+				if len(srv.Auth.Headers) > 0 {
+					if entry.Headers == nil {
+						entry.Headers = map[string]string{}
+					}
+					for k, v := range srv.Auth.Headers {
+						entry.Headers[k] = rewriteClaudeEnvVars(v)
+					}
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   "mcp.yaml",
+					Message:  fmt.Sprintf("MCP server %q Auth.Scheme=header degraded on Claude (no native auth block; merged into headers)", srv.Name),
+					Severity: "info",
+				})
+			case "oauth":
+				warnings = append(warnings, plugin.Warning{
+					Source:   "mcp.yaml",
+					Message:  fmt.Sprintf("MCP server %q Auth.Scheme=oauth degraded on Claude (configure OAuth in Claude UI; no credentials emitted)", srv.Name),
+					Severity: "info",
+				})
+			}
+		}
+
+		// Known upstream bug: `${env:VAR}` in http/sse headers
+		// (anthropics/claude-code#6204).
+		if (srv.Transport == "http" || srv.Transport == "sse") && hasEnvVarTemplate(srv.Headers) {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q: ${env:VAR} in http/sse headers may not resolve at runtime (anthropics/claude-code#6204)", srv.Name),
+				Severity: "info",
+			})
+		}
+
+		// Drop unsupported / silent fields with warnings (SPEC §12).
+		if srv.TimeoutMs > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q TimeoutMs=%d unsupported by Claude (no per-server timeout; use --request-timeout CLI flag)", srv.Name, srv.TimeoutMs),
+				Severity: "warn",
+			})
+		}
+		if len(srv.AutoApprove) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q AutoApprove unsupported by Claude (use --dangerously-skip-permissions or per-call prompts)", srv.Name),
+				Severity: "warn",
+			})
+		}
+		if srv.Trust {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q Trust unsupported by Claude (no native trust flag; falls back to runtime prompts)", srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.IncludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q IncludeTools unsupported by Claude (no per-server tool allowlist)", srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.ExcludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q ExcludeTools unsupported by Claude (no per-server tool denylist)", srv.Name),
+				Severity: "warn",
+			})
+		}
+
 		servers[srv.Name] = entry
 		if srv.ScopePath != "" {
 			warnings = append(warnings, plugin.Warning{
 				Source:   srv.ScopePath + "/mcp.yaml",
-				Message:  fmt.Sprintf("scoped MCP server %q from %s/mcp.yaml applied project-wide; Claude Code has no per-scope MCP", srv.Name, srv.ScopePath),
+				Message:  fmt.Sprintf("scoped MCP server %q (scopepath %s) applied project-wide; Claude Code has no per-scope MCP", srv.Name, srv.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -867,6 +1519,17 @@ func buildMCPOp(proj *model.Project) (plugin.Operation, error) {
 		Plugin:   "claude",
 		Warnings: warnings,
 	}, nil
+}
+
+// hasEnvVarTemplate reports whether any value in headers contains a
+// `${env:VAR}` template that triggers anthropics/claude-code#6204.
+func hasEnvVarTemplate(headers map[string]string) bool {
+	for _, v := range headers {
+		if claudeEnvVarRewrite.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // SchemaVersion returns the canonical schema version this plugin

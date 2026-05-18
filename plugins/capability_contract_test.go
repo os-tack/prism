@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -281,8 +282,14 @@ func skipKey(plugin, primitive, field string) string {
 	return plugin + "/" + primitive + "/" + field
 }
 
-// shouldSkip returns the registered skip (or nil) for a cell.
+// shouldSkip returns the registered skip (or nil) for a cell. Honors the
+// PRISM_CONTRACT_NO_SKIPS env var as a one-shot escape hatch for the
+// Phase 2.5 sweep: when set, all skips are ignored so the test surfaces
+// every currently-failing cell. Production runs do not set this.
 func shouldSkip(plugin, primitive, field string) *phase25Skip {
+	if os.Getenv("PRISM_CONTRACT_NO_SKIPS") != "" {
+		return nil
+	}
 	if s, ok := phase25Skips[skipKey(plugin, primitive, field)]; ok {
 		return &s
 	}

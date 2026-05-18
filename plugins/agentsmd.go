@@ -232,6 +232,13 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 
 	var sources []string
 	var warnings []plugin.Warning
+	// overrideOps collects per-scope AGENTS.override.md emissions for scopes
+	// with IsOverride==true && Path!="". SPEC §4.7.4 marks AGENTS.md as the
+	// only plugin that round-trips IsOverride natively, via this filename
+	// split. The override body replaces — rather than augments — the parent
+	// guidance, so it lives in its own file at the scope path rather than
+	// being inlined into the root AGENTS.md.
+	var overrideOps []plugin.Operation
 
 	var b strings.Builder
 	b.WriteString(generatedHeader)
@@ -263,6 +270,59 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	})
 
 	for _, sc := range scopes {
+		src := relAgentsMDSource(proj, sc.Document.SourcePath)
+
+		// v2 IsOverride round-trip (SPEC §4.7.4): AGENTS.md is the only
+		// plugin that honors IsOverride natively, by emitting the scope body
+		// to a sibling `AGENTS.override.md` file at the scope path instead
+		// of inlining a `## When working in <path>` section in the root
+		// AGENTS.md. Per SPEC, the override file REPLACES — rather than
+		// augments — the parent guidance.
+		//
+		// Edge case: IsOverride with Path=="" is meaningless (there is no
+		// parent to override at the root). Emit an info warning and fall
+		// through to the regular inline-section emission below.
+		if sc.IsOverride && sc.Path != "" {
+			body := strings.TrimSpace(sc.Document.Body)
+			var ob strings.Builder
+			ob.WriteString(generatedHeader)
+			ob.WriteString("\n")
+			if body != "" {
+				ob.WriteString("\n")
+				ob.WriteString(body)
+				ob.WriteString("\n")
+			}
+
+			overrideSources := []string{}
+			if src != "" {
+				overrideSources = append(overrideSources, src)
+			}
+
+			overrideOps = append(overrideOps, plugin.Operation{
+				Kind:    plugin.OpWrite,
+				Path:    sc.Path + "/AGENTS.override.md",
+				Content: ob.String(),
+				Mode:    plugin.ModeWrite,
+				Sources: overrideSources,
+				Plugin:  "agents-md",
+			})
+
+			// Source still belongs in the root op's source list for
+			// provenance bookkeeping.
+			if src != "" {
+				sources = append(sources, src)
+			}
+			continue
+		}
+
+		if sc.IsOverride && sc.Path == "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   src,
+				Message:  "IsOverride on root scope has no parent to override; emitting to root AGENTS.md as a regular section.",
+				Severity: "info",
+			})
+		}
+
 		// Separator between root context (or previous scope) and this scope.
 		b.WriteString("\n---\n\n")
 		b.WriteString("## When working in ")
@@ -297,7 +357,6 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			b.WriteString("\n")
 		}
 
-		src := relAgentsMDSource(proj, sc.Document.SourcePath)
 		if src != "" {
 			sources = append(sources, src)
 		}
@@ -308,19 +367,6 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Message:  "loaded always — AGENTS.md has no scope enforcement",
 			Severity: "info",
 		})
-
-		// v2 additive read: surface IsOverride (SPEC §4.7.2 / §12 — agm is
-		// the only plugin that round-trips this natively via
-		// AGENTS.override.md). Emission as a separate file is deferred;
-		// for Phase 2a we surface a warning so downstream tooling can
-		// detect the canonical intent without an emission-shape change.
-		if sc.IsOverride {
-			warnings = append(warnings, plugin.Warning{
-				Source:   src,
-				Message:  "v2 IsOverride detected — canonical AGENTS.override.md round-trip not yet emitted (Phase 2a additive read only).",
-				Severity: "info",
-			})
-		}
 	}
 
 	// 3. Skills (global only — scoped skills go under their per-scope
@@ -637,7 +683,9 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		Warnings: warnings,
 	}
 
-	return []plugin.Operation{op}, nil
+	ops := []plugin.Operation{op}
+	ops = append(ops, overrideOps...)
+	return ops, nil
 }
 
 // scopedCapsBundle groups every scoped capability that targets the same

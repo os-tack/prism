@@ -102,18 +102,24 @@ func (p *CopilotPlugin) Detect(root string) bool {
 // ScopeSemantic stays degraded — `applyTo` is glob-only, with no
 // description-driven trigger. Skills degrade to scoped instructions.
 //
-// Hooks and Permissions flip on the EnablePreviewHooks opt-in (v0.8.2).
-// Both surfaces ride the Copilot preview hooks API; Permissions enforcement
-// is wrapper-based (PreToolUse + perms-guard sidecar), Hooks projects the
-// canonical Hook slice into the preview .github/hooks/hooks.json schema.
-// When the flag is off, both stay `----` (the v0.8.1 default behaviour).
+// Hooks flips on the EnablePreviewHooks opt-in (v0.8.2). Permissions are
+// always native via the prism perms-guard wrapper + sidecar policy
+// (matches SPEC §12 Copilot column footnote ¹): with preview hooks on,
+// the gate wires natively into preToolUse; with preview hooks off, the
+// sidecar is still emitted and users wire the wrapper into their own
+// hook pipeline (a degraded path, but functional). The
+// `extensions.copilot.disable_perms_guard: true` escape hatch suppresses
+// sidecar emission entirely for projects that want to opt out.
 func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 	hooks := plugin.SupportUnsupported
-	perms := plugin.SupportUnsupported
 	if p.EnablePreviewHooks {
 		hooks = plugin.SupportNative
-		perms = plugin.SupportNative
 	}
+	// Permissions: always native via the perms-guard wrapper, regardless
+	// of the preview-hooks opt-in. The sidecar policy emit honors
+	// `extensions.copilot.disable_perms_guard: true` but the capability
+	// matrix advertises native support so callers know to wire it.
+	perms := plugin.SupportNative
 
 	// v2 per-field capabilities (SPEC §12 Copilot column). Absent
 	// fields default to FieldNative; we only enumerate the non-native
@@ -195,12 +201,14 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 		Extensions: []string{"copilot"},
 	}
 
-	// Permissions — native via the preview perms-guard sidecar when
-	// EnablePreviewHooks is on; unsupported otherwise. Every
-	// sub-cell in SPEC §12 collapses to FieldNative on the wrapper
-	// so we leave the Fields map empty (defaults to FieldNative).
+	// Permissions — always native via the perms-guard sidecar. With
+	// preview hooks enabled the gate wires natively into preToolUse;
+	// otherwise users wire the wrapper into their own hook pipeline.
+	// Every sub-cell in SPEC §12 collapses to FieldNative on the
+	// wrapper so we leave the Fields map empty (defaults to
+	// FieldNative).
 	permsFields := plugin.FieldCapabilities{
-		Supported:  p.EnablePreviewHooks,
+		Supported:  true,
 		Extensions: []string{"copilot"},
 	}
 
@@ -556,27 +564,51 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 				Severity: "info",
 			})
 		}
-		if proj.Permissions != nil {
-			if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
-				warnings = append(warnings, plugin.Warning{
-					Source:   "permissions.yaml",
-					Message:  "Copilot has no permissions primitive without preview hooks; permissions not projected (pass --enable-preview-hooks to opt in).",
-					Severity: "info",
-				})
-			}
-		}
+
+		// Emit the perms-guard sidecar even without preview hooks so users
+		// still get permissions enforcement (degraded path: wrapper must
+		// be wired into hook commands manually). The escape hatch
+		// `extensions.copilot.disable_perms_guard: true` suppresses the
+		// emit entirely.
+		hasGlobalPerms := proj.Permissions != nil && (len(proj.Permissions.Allow)+len(proj.Permissions.Deny)+len(proj.Permissions.Ask) > 0)
+		hasScopedPerms := false
 		for _, sp := range proj.ScopedPermissions {
 			if sp == nil {
 				continue
 			}
-			if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
-				continue
+			if len(sp.Allow)+len(sp.Deny)+len(sp.Ask) > 0 {
+				hasScopedPerms = true
+				break
 			}
-			warnings = append(warnings, plugin.Warning{
-				Source:   "permissions.yaml",
-				Message:  fmt.Sprintf("Copilot has no permissions primitive without preview hooks; scoped permissions (scope: %s) not projected (pass --enable-preview-hooks to opt in).", sp.ScopePath),
-				Severity: "info",
-			})
+		}
+		if (hasGlobalPerms || hasScopedPerms) && !copilotPermsGuardDisabled(proj) {
+			permsOps, permsWarnings, err := emitPermsGuardWrappersAt(p.Name(), filepath.Join(".github", "hooks"), proj, p.DisableHookWrappers)
+			if err != nil {
+				return nil, err
+			}
+			ops = append(ops, permsOps...)
+			warnings = append(warnings, permsWarnings...)
+			if len(permsOps) > 0 {
+				// Pick the policy.json path (global) for the info
+				// warning when present, otherwise the first emitted
+				// sidecar path. The warning is per-project, not
+				// per-scope, so we surface it once.
+				sidecarPath := ""
+				for _, op := range permsOps {
+					if strings.HasSuffix(op.Path, "policy.json") {
+						sidecarPath = op.Path
+						break
+					}
+				}
+				if sidecarPath == "" {
+					sidecarPath = permsOps[0].Path
+				}
+				warnings = append(warnings, plugin.Warning{
+					Source:   "permissions.yaml",
+					Message:  fmt.Sprintf("copilot: emitting perms-guard sidecar at %s; Permissions enforcement requires the wrapper to be wired into hook commands manually since preview hooks are disabled. Set extensions.copilot.preview_hooks: true for first-class enforcement.", sidecarPath),
+					Severity: "info",
+				})
+			}
 		}
 	}
 
@@ -995,6 +1027,33 @@ func copilotExtensionKeys(ext map[string]any) map[string]any {
 	return out
 }
 
+// copilotPermsGuardDisabled reports whether
+// `extensions.copilot.disable_perms_guard: true` is set on the project
+// config. When true, perms-guard sidecar emission is suppressed entirely
+// — callers wire their own enforcement (or accept the no-enforcement
+// posture). The flag is read from Project.Config.Extensions["copilot"]
+// only; per-primitive Extensions slots are intentionally not consulted
+// because the toggle is project-wide.
+func copilotPermsGuardDisabled(proj *model.Project) bool {
+	if proj == nil || proj.Config == nil || proj.Config.Extensions == nil {
+		return false
+	}
+	raw, ok := proj.Config.Extensions["copilot"]
+	if !ok {
+		return false
+	}
+	asMap, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	v, ok := asMap["disable_perms_guard"]
+	if !ok {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
+}
+
 // copilotHookEntry mirrors a single hook command entry inside hooks.json.
 // Schema is {type: "command", command: "<path>"} matching Claude's contract
 // (Copilot picked the same shape for cross-tool compatibility).
@@ -1051,7 +1110,12 @@ func (p *CopilotPlugin) planPreviewHooks(proj *model.Project) ([]plugin.Operatio
 	// hooks exist) or bare gate wrappers (when only permissions exist).
 	// Per-hook wrappers replace the raw command in hooks.json below;
 	// gate wrappers append as standalone preToolUse entries.
-	permsOps, permsWarnings, err := emitPermsGuardWrappersAt(p.Name(), filepath.Join(".github", "hooks"), proj, p.DisableHookWrappers)
+	//
+	// The project-wide `extensions.copilot.disable_perms_guard: true`
+	// escape hatch short-circuits all perms-guard emission (matches
+	// the disabled-flag path).
+	permsDisabled := p.DisableHookWrappers || copilotPermsGuardDisabled(proj)
+	permsOps, permsWarnings, err := emitPermsGuardWrappersAt(p.Name(), filepath.Join(".github", "hooks"), proj, permsDisabled)
 	if err != nil {
 		return nil, nil, err
 	}

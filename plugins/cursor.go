@@ -251,12 +251,19 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	var ops []plugin.Operation
 	var warnings []plugin.Warning
 
-	// Phase 2.5 TODO (SPEC §4.1.4 / IMPLEMENTATION_PLAN §7.4): when both
-	// `claude` and `cursor` targets are enabled, Cursor agents should
-	// emit to `.cursor/agents/` only (Cursor reads `.claude/agents/`
-	// directly) and emit a single info warning per project. De-dup logic
-	// + the per-project warning shim live in Phase 2.5 — this plugin
-	// continues to emit unconditionally here.
+	// Cross-emit dedup (SPEC §4.1.4 / IMPLEMENTATION_PLAN §7.4): when both
+	// `claude` and `cursor` targets are enabled, Cursor reads
+	// `.claude/agents/` natively, so we avoid double-emission by emitting
+	// agents to `.cursor/agents/` only and surfacing ONE info-level
+	// warning per project (not per agent) at the start of the agent emit
+	// loop.
+	//
+	// Override: `extensions.cursor.disable_dedup: true` on the project
+	// Config skips the dedup logic and suppresses the warning (agents
+	// still emit to `.cursor/agents/` as their native location regardless;
+	// the override exists so the `.claude/` plugin also keeps emitting
+	// agents in its own tree without the extra info warning here).
+	emitCursorDedupWarning := cursorCrossEmitActive(proj) && !cursorDedupDisabled(proj)
 
 	if proj.Context != nil {
 		content := renderMDC("Project-wide context", nil, true, proj.Context.Body, nil)
@@ -358,6 +365,19 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	}
 
 	// Agents → `.cursor/agents/<n>.md` (native).
+	//
+	// When the cross-emit dedup condition holds (claude target also
+	// active and override not set), emit a single project-level info
+	// warning explaining that we're skipping the `.claude/agents/`
+	// double-emission. The warning fires once regardless of how many
+	// agents the project has (SPEC §4.1.4 / IMPLEMENTATION_PLAN §7.4).
+	if emitCursorDedupWarning && len(proj.Agents) > 0 {
+		warnings = append(warnings, plugin.Warning{
+			Source:   "",
+			Message:  "cursor: emitting agents to .cursor/agents/ only; Cursor reads .claude/agents/ natively when present, so we're avoiding double-emission. Set extensions.cursor.disable_dedup: true on the project to override.",
+			Severity: "info",
+		})
+	}
 	for _, ag := range proj.Agents {
 		if ag == nil || ag.Document == nil {
 			continue
@@ -911,6 +931,66 @@ func cursorExtensionKVs(ext map[string]any) [][2]string {
 		out = append(out, [2]string{k, string(val)})
 	}
 	return out
+}
+
+// cursorCrossEmitActive reports whether the project has both `claude`
+// and `cursor` targets active simultaneously — the trigger for the
+// cross-emit dedup info warning (SPEC §4.1.4).
+//
+// Two modes:
+//
+//   - Explicit: proj.Config.Targets is non-empty and contains both
+//     "claude" and "cursor".
+//   - Autodetect: proj.Config is nil OR Targets is empty — fall back
+//     to checking whether `.claude/` exists under proj.Root (the
+//     autodetect signal that Claude is also active). proj.Root is only
+//     consulted in autodetect mode so test fixtures with synthetic
+//     paths don't get tripped up.
+func cursorCrossEmitActive(proj *model.Project) bool {
+	if proj == nil {
+		return false
+	}
+	if proj.Config != nil && len(proj.Config.Targets) > 0 {
+		var hasClaude, hasCursor bool
+		for _, t := range proj.Config.Targets {
+			switch t {
+			case "claude":
+				hasClaude = true
+			case "cursor":
+				hasCursor = true
+			}
+		}
+		return hasClaude && hasCursor
+	}
+	// Autodetect: claude is active iff `.claude/` exists under proj.Root.
+	if proj.Root == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(proj.Root, ".claude"))
+	return err == nil && info.IsDir()
+}
+
+// cursorDedupDisabled reports whether the project's
+// `extensions.cursor.disable_dedup` key is truthy, in which case the
+// cross-emit dedup warning is suppressed.
+func cursorDedupDisabled(proj *model.Project) bool {
+	if proj == nil || proj.Config == nil || proj.Config.Extensions == nil {
+		return false
+	}
+	raw, ok := proj.Config.Extensions["cursor"]
+	if !ok {
+		return false
+	}
+	asMap, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	v, ok := asMap["disable_dedup"]
+	if !ok {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
 }
 
 // SchemaVersion returns the canonical schema version this plugin

@@ -940,6 +940,229 @@ func TestCursor_ScopedSkill(t *testing.T) {
 	}
 }
 
+// TestCursor_CrossEmitDedup_ExplicitTargets verifies that when both
+// `claude` AND `cursor` are in proj.Config.Targets, the Cursor plugin
+// emits EXACTLY ONE info warning ("emitting agents to .cursor/agents/
+// only ...") at the project level, regardless of how many agents are
+// present. Agent operations still land at .cursor/agents/<name>.md.
+func TestCursor_CrossEmitDedup_ExplicitTargets(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Config: &model.Config{
+			Targets: []string{"claude", "cursor"},
+		},
+		Agents: []*model.Agent{
+			{
+				Name: "alpha",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/alpha.md",
+					Body:       "alpha body",
+				},
+			},
+			{
+				Name: "beta",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/beta.md",
+					Body:       "beta body",
+				},
+			},
+			{
+				Name: "gamma",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/gamma.md",
+					Body:       "gamma body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	// Count dedup warnings across every op; expect exactly one.
+	dedupWarnings := 0
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "emitting agents to .cursor/agents/ only") {
+				dedupWarnings++
+				if w.Severity != "info" {
+					t.Errorf("dedup warning severity = %q, want info", w.Severity)
+				}
+			}
+		}
+	}
+	if dedupWarnings != 1 {
+		t.Errorf("expected exactly 1 dedup warning, got %d", dedupWarnings)
+	}
+
+	// Agents still land at .cursor/agents/<name>.md.
+	wantPaths := map[string]bool{
+		".cursor/agents/alpha.md": true,
+		".cursor/agents/beta.md":  true,
+		".cursor/agents/gamma.md": true,
+	}
+	gotAgents := map[string]bool{}
+	for _, op := range ops {
+		if strings.HasPrefix(op.Path, ".cursor/agents/") {
+			gotAgents[op.Path] = true
+		}
+	}
+	for want := range wantPaths {
+		if !gotAgents[want] {
+			t.Errorf("missing agent op at %q; got: %v", want, opsPaths(ops))
+		}
+	}
+}
+
+// TestCursor_CrossEmitDedup_CursorOnly_NoWarning verifies that when only
+// `cursor` is enabled (no `claude` target), the dedup warning is NOT
+// emitted. Agents continue to emit normally — this is the existing v0.8
+// behavior and must remain unchanged.
+func TestCursor_CrossEmitDedup_CursorOnly_NoWarning(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Config: &model.Config{
+			Targets: []string{"cursor"},
+		},
+		Agents: []*model.Agent{
+			{
+				Name: "alpha",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/alpha.md",
+					Body:       "alpha body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "emitting agents to .cursor/agents/ only") {
+				t.Errorf("unexpected dedup warning when claude target absent: %#v", w)
+			}
+		}
+	}
+	if len(ops) != 1 || ops[0].Path != ".cursor/agents/alpha.md" {
+		t.Errorf("expected single agent op at .cursor/agents/alpha.md, got: %v", opsPaths(ops))
+	}
+}
+
+// TestCursor_CrossEmitDedup_DisableOverride verifies that
+// `extensions.cursor.disable_dedup: true` on the project config
+// suppresses the cross-emit dedup warning even when both targets are
+// active.
+func TestCursor_CrossEmitDedup_DisableOverride(t *testing.T) {
+	proj := &model.Project{
+		AgentsDir: "/tmp/.agents",
+		Config: &model.Config{
+			Targets: []string{"claude", "cursor"},
+			Extensions: map[string]any{
+				"cursor": map[string]any{
+					"disable_dedup": true,
+				},
+			},
+		},
+		Agents: []*model.Agent{
+			{
+				Name: "alpha",
+				Document: &model.Document{
+					SourcePath: "/tmp/.agents/agents/alpha.md",
+					Body:       "alpha body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "emitting agents to .cursor/agents/ only") {
+				t.Errorf("disable_dedup override should suppress warning, got: %#v", w)
+			}
+		}
+	}
+}
+
+// TestCursor_CrossEmitDedup_Autodetect verifies that when no explicit
+// Targets list is set but `.claude/` exists under proj.Root, the dedup
+// warning still fires (autodetect mode).
+func TestCursor_CrossEmitDedup_Autodetect(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir .claude: %v", err)
+	}
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: filepath.Join(root, ".agents"),
+		Agents: []*model.Agent{
+			{
+				Name: "alpha",
+				Document: &model.Document{
+					SourcePath: filepath.Join(root, ".agents/agents/alpha.md"),
+					Body:       "alpha body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	dedupWarnings := 0
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "emitting agents to .cursor/agents/ only") {
+				dedupWarnings++
+			}
+		}
+	}
+	if dedupWarnings != 1 {
+		t.Errorf("expected 1 autodetect dedup warning, got %d", dedupWarnings)
+	}
+}
+
+// TestCursor_CrossEmitDedup_Autodetect_NoClaudeDir verifies that
+// without an explicit Targets list AND no `.claude/` under proj.Root,
+// the dedup warning is NOT emitted.
+func TestCursor_CrossEmitDedup_Autodetect_NoClaudeDir(t *testing.T) {
+	root := t.TempDir()
+	proj := &model.Project{
+		Root:      root,
+		AgentsDir: filepath.Join(root, ".agents"),
+		Agents: []*model.Agent{
+			{
+				Name: "alpha",
+				Document: &model.Document{
+					SourcePath: filepath.Join(root, ".agents/agents/alpha.md"),
+					Body:       "alpha body",
+				},
+			},
+		},
+	}
+	p := NewCursor()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	for _, op := range ops {
+		for _, w := range op.Warnings {
+			if strings.Contains(w.Message, "emitting agents to .cursor/agents/ only") {
+				t.Errorf("unexpected dedup warning when no .claude/ dir present: %#v", w)
+			}
+		}
+	}
+}
+
 // TestCursor_ScopedSkillCollision verifies that the same skill name in two
 // different scopes produces two distinct files, one per scope.
 func TestCursor_ScopedSkillCollision(t *testing.T) {

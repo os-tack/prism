@@ -110,13 +110,15 @@ func TestRoundTrip_Cline_V08(t *testing.T) {
 	cmdBody := readBody(t, root, cmdOut)
 	assertBodyContains(t, cmdOut, cmdBody, "Run the release script with --confirm.")
 
-	// Hook re-emitted.
-	hooksData, err := os.ReadFile(filepath.Join(root, ".clinerules", "hooks", "PreToolUse.json"))
+	// Hook re-emitted as a filename-dispatch script (no .json extension)
+	// per SPEC §4.4.5. The v0.8 fixture's .json shape is imported; the
+	// new emit is an executable bash script.
+	hooksData, err := os.ReadFile(filepath.Join(root, ".clinerules", "hooks", "PreToolUse"))
 	if err != nil {
-		t.Fatalf("read hooks/PreToolUse.json: %v", err)
+		t.Fatalf("read hooks/PreToolUse: %v", err)
 	}
 	if !strings.Contains(string(hooksData), "/usr/local/bin/preflight.sh") {
-		t.Errorf("hooks/PreToolUse.json missing preflight.sh: %s", string(hooksData))
+		t.Errorf("hooks/PreToolUse missing preflight.sh: %s", string(hooksData))
 	}
 
 	// MCP merged into project-local file.
@@ -314,13 +316,14 @@ func TestRoundTrip_Cline_V082_Perms(t *testing.T) {
 		t.Errorf("policy.json missing deny rule:\n%s", policyData)
 	}
 
-	// PreToolUse.json wires the gate wrapper.
-	preData, err := os.ReadFile(filepath.Join(root, ".clinerules", "hooks", "PreToolUse.json"))
+	// PreToolUse (filename-dispatch script, no .json) wires the gate
+	// wrapper.
+	preData, err := os.ReadFile(filepath.Join(root, ".clinerules", "hooks", "PreToolUse"))
 	if err != nil {
-		t.Fatalf("read PreToolUse.json: %v", err)
+		t.Fatalf("read PreToolUse: %v", err)
 	}
 	if !strings.Contains(string(preData), "__perms-guard__") {
-		t.Errorf("PreToolUse.json missing perms-guard reference:\n%s", preData)
+		t.Errorf("PreToolUse missing perms-guard reference:\n%s", preData)
 	}
 }
 

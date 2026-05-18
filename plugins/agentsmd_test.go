@@ -948,3 +948,231 @@ func TestAgentsMD_ScopedAndGlobalMix(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentsMD_ScopeIsOverride: a scope with IsOverride=true && Path!=""
+// must NOT be inlined as a `## When working in <path>` section in the root
+// AGENTS.md. Instead, the plugin emits a separate Operation writing the
+// scope body to `<Path>/AGENTS.override.md`. SPEC §4.7.4 marks AGENTS.md
+// as the only plugin that round-trips IsOverride natively.
+func TestAgentsMD_ScopeIsOverride(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Context: &model.Document{
+			SourcePath: "/tmp/fake/.agents/context.md",
+			Body:       "Root context body",
+		},
+		Scopes: []*model.Scope{
+			{
+				Path:        "src/billing",
+				IsOverride:  true,
+				Globs:       []string{"src/billing/**"},
+				Description: "Billing override",
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/context.md",
+					Body:       "Billing override body",
+				},
+			},
+		},
+	}
+
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 ops (root + override), got %d (%+v)", len(ops), ops)
+	}
+
+	// First op: the root AGENTS.md. Must NOT contain the inlined
+	// `## When working in src/billing` section, since the override scope is
+	// emitted to its own file.
+	rootOp := ops[0]
+	if rootOp.Path != "AGENTS.md" {
+		t.Errorf("rootOp.Path = %q, want %q", rootOp.Path, "AGENTS.md")
+	}
+	if strings.Contains(rootOp.Content, "## When working in src/billing") {
+		t.Errorf("root AGENTS.md must not inline override scope as a section\n---\n%s", rootOp.Content)
+	}
+	if strings.Contains(rootOp.Content, "Billing override body") {
+		t.Errorf("root AGENTS.md must not contain override scope body\n---\n%s", rootOp.Content)
+	}
+	if !strings.Contains(rootOp.Content, "Root context body") {
+		t.Errorf("root AGENTS.md should still contain root context body\n---\n%s", rootOp.Content)
+	}
+	// The phase-2a info warning about "Phase 2a additive read only" must be
+	// gone — round-trip is now native.
+	for _, w := range rootOp.Warnings {
+		if strings.Contains(w.Message, "Phase 2a additive read only") {
+			t.Errorf("phase-2a placeholder warning leaked through: %+v", w)
+		}
+		if strings.Contains(w.Message, "canonical AGENTS.override.md round-trip not yet emitted") {
+			t.Errorf("stale not-yet-emitted warning leaked through: %+v", w)
+		}
+	}
+	// The "no scope enforcement" warning is per-scope-section. Since the
+	// override scope is NOT a section, it should not contribute this
+	// warning.
+	for _, w := range rootOp.Warnings {
+		if w.Source == "src/billing/context.md" &&
+			strings.Contains(w.Message, "no scope enforcement") {
+			t.Errorf("override scope should not produce inline-section enforcement warning: %+v", w)
+		}
+	}
+
+	// Second op: the override file.
+	overrideOp := ops[1]
+	if overrideOp.Path != "src/billing/AGENTS.override.md" {
+		t.Errorf("overrideOp.Path = %q, want %q", overrideOp.Path, "src/billing/AGENTS.override.md")
+	}
+	if overrideOp.Kind != plugin.OpWrite {
+		t.Errorf("overrideOp.Kind = %q, want %q", overrideOp.Kind, plugin.OpWrite)
+	}
+	if overrideOp.Mode != plugin.ModeWrite {
+		t.Errorf("overrideOp.Mode = %q, want %q", overrideOp.Mode, plugin.ModeWrite)
+	}
+	if overrideOp.Plugin != "agents-md" {
+		t.Errorf("overrideOp.Plugin = %q, want %q", overrideOp.Plugin, "agents-md")
+	}
+	if !strings.Contains(overrideOp.Content, generatedHeader) {
+		t.Errorf("overrideOp content missing generated header:\n%s", overrideOp.Content)
+	}
+	if !strings.Contains(overrideOp.Content, "Billing override body") {
+		t.Errorf("overrideOp content missing scope body:\n%s", overrideOp.Content)
+	}
+	// The override file is the scope body alone — it should NOT inherit
+	// the root context or any other scope wrapping.
+	if strings.Contains(overrideOp.Content, "Root context body") {
+		t.Errorf("override file should not contain root context\n---\n%s", overrideOp.Content)
+	}
+	if strings.Contains(overrideOp.Content, "## When working in") {
+		t.Errorf("override file should not have a section header\n---\n%s", overrideOp.Content)
+	}
+	// Source attribution: the scope's source must be on the override op.
+	hasSrc := false
+	for _, s := range overrideOp.Sources {
+		if s == "src/billing/context.md" {
+			hasSrc = true
+		}
+	}
+	if !hasSrc {
+		t.Errorf("override op missing scope source path (got %v)", overrideOp.Sources)
+	}
+}
+
+// TestAgentsMD_ScopeIsOverrideRoot: a scope with IsOverride=true && Path==""
+// is the edge case — there is no parent to override at the root. The plugin
+// must NOT emit AGENTS.override.md (there is no path prefix); instead it
+// falls back to inlining the scope, and an info warning explains why.
+func TestAgentsMD_ScopeIsOverrideRoot(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:       "",
+				IsOverride: true,
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/context.md",
+					Body:       "Root-scoped override body",
+				},
+			},
+		},
+	}
+
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+
+	// Only the root AGENTS.md op — no second AGENTS.override.md emission
+	// at the root.
+	if len(ops) != 1 {
+		t.Fatalf("expected exactly 1 op (no root-level override file), got %d (%+v)", len(ops), ops)
+	}
+	for _, op := range ops {
+		if strings.Contains(op.Path, "AGENTS.override.md") {
+			t.Errorf("did not expect any AGENTS.override.md op at root, got path %q", op.Path)
+		}
+	}
+
+	// Info warning explaining the root-IsOverride no-op behavior.
+	found := false
+	for _, w := range ops[0].Warnings {
+		if w.Severity == "info" &&
+			strings.Contains(w.Message, "IsOverride on root scope has no parent to override") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected info warning about root IsOverride no-op, got %#v", ops[0].Warnings)
+	}
+}
+
+// TestAgentsMD_ScopeIsOverrideAndRegularMix: when one scope is IsOverride
+// and another is a regular cascade scope, the regular scope must still be
+// inlined as `## When working in <path>` in the root AGENTS.md, while only
+// the override scope is split out to its own file.
+func TestAgentsMD_ScopeIsOverrideAndRegularMix(t *testing.T) {
+	proj := &model.Project{
+		Root:      "/tmp/fake",
+		AgentsDir: "/tmp/fake/.agents",
+		Scopes: []*model.Scope{
+			{
+				Path:  "src/auth",
+				Globs: []string{"src/auth/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/auth/context.md",
+					Body:       "Auth context body",
+				},
+			},
+			{
+				Path:       "src/billing",
+				IsOverride: true,
+				Globs:      []string{"src/billing/**"},
+				Document: &model.Document{
+					SourcePath: "/tmp/fake/.agents/src/billing/context.md",
+					Body:       "Billing override body",
+				},
+			},
+		},
+	}
+
+	p := NewAgentsMD()
+	ops, err := p.Plan(proj, model.TargetOption{})
+	if err != nil {
+		t.Fatalf("Plan error: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 ops (root + 1 override), got %d", len(ops))
+	}
+
+	rootOp := ops[0]
+	if rootOp.Path != "AGENTS.md" {
+		t.Errorf("rootOp.Path = %q, want AGENTS.md", rootOp.Path)
+	}
+	// Regular scope inlined.
+	if !strings.Contains(rootOp.Content, "## When working in src/auth") {
+		t.Errorf("expected auth scope inlined in root\n---\n%s", rootOp.Content)
+	}
+	if !strings.Contains(rootOp.Content, "Auth context body") {
+		t.Errorf("expected auth body in root\n---\n%s", rootOp.Content)
+	}
+	// Override scope NOT inlined.
+	if strings.Contains(rootOp.Content, "## When working in src/billing") {
+		t.Errorf("override scope must not be inlined\n---\n%s", rootOp.Content)
+	}
+	if strings.Contains(rootOp.Content, "Billing override body") {
+		t.Errorf("override body must not be inlined\n---\n%s", rootOp.Content)
+	}
+
+	overrideOp := ops[1]
+	if overrideOp.Path != "src/billing/AGENTS.override.md" {
+		t.Errorf("overrideOp.Path = %q, want src/billing/AGENTS.override.md", overrideOp.Path)
+	}
+	if !strings.Contains(overrideOp.Content, "Billing override body") {
+		t.Errorf("override op missing billing body\n---\n%s", overrideOp.Content)
+	}
+}
