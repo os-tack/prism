@@ -1,6 +1,11 @@
+# Scoped overrides for src/billing/. v2 grammar (SPEC §4.6.2): the
+# canonical fs: synonym fans out to Edit+Read+Write; specific Edit:
+# patterns are still valid and shown here for didactic contrast.
 deny:
   - "Edit:src/billing/migrations/*"
   - "bash:psql *"
+  # Recursive ** glob denying secrets under any depth.
+  - "fs:src/billing/**/secrets/**"
 
 ask:
   - "Edit:src/billing/*"

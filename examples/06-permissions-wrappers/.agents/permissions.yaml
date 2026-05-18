@@ -1,20 +1,31 @@
-# Rule format: "<tool>:<pattern>" with optional trailing "*" glob.
-# Tool match is case-insensitive. Bash actions are matched against the
-# command string; Edit/Write/Read actions against the file path.
-#
-# These strings are passed through verbatim to .claude/settings.json
-# under permissions.{allow,deny,ask}; Claude Code is generally lenient
-# about formats it doesn't recognize, but if you only target Claude you
-# can also use its native "Tool(pattern)" syntax instead.
+# yaml-language-server: $schema=https://prism.dev/schema/v2/permissions.schema.json
+# Canonical v2 grammar (SPEC §4.6.2): <target>:<pattern>.
+# Targets: bash, Read/Write/Edit/MultiEdit, fs (= R+W+E synonym),
+# network, mcp:<server>[:<tool>]. Patterns support exact, trailing *,
+# recursive **, and a leading ! for negation.
 allow:
   - "bash:go test *"
   - "bash:go build *"
   - "bash:npm test *"
+  # fs: fans out to Read+Write+Edit at emit (SPEC §4.6.3).
+  - "fs:src/**"
+  # Negation prefix expands to a deny at emit time.
+  - "fs:!src/billing/migrations/*"
+  # Network rule — translates to e.g. WebFetch(domain:github.com) on Claude.
+  - "network:github.com"
+  - "network:*.npmjs.org"
+  # MCP rule — server-scoped wildcard.
+  - "mcp:github:*"
 
 deny:
   - "bash:rm -rf *"
   - "bash:git push *"
+  # Tool-specific keeps working for didactic contrast with the fs: synonym.
+  - "Edit:.ssh/**"
+  # Specific MCP tool deny.
+  - "mcp:github:delete_repository"
 
 ask:
   - "bash:npm install *"
   - "Edit:.env*"
+  - "mcp:github:create_issue"

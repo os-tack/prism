@@ -1,5 +1,10 @@
+# yaml-language-server: $schema=https://prism.dev/schema/v2/mcpserver.schema.json
+# Canonical v2 shape (SPEC §4.5.5): servers is a list; each entry MUST
+# declare transport: stdio | http | sse. Bearer auth uses ${env:VAR}
+# substitution so secrets never land in the file.
 servers:
-  postgres:
+  - name: postgres
+    transport: stdio
     command: npx
     args:
       - "-y"
@@ -8,5 +13,9 @@ servers:
     env:
       PGCONNECT_TIMEOUT: "5"
 
-  linear:
+  - name: linear
+    transport: sse
     url: https://mcp.linear.app/sse
+    auth:
+      scheme: bearer
+      token: ${env:LINEAR_API_KEY}

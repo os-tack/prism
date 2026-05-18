@@ -160,46 +160,131 @@ hardening release.
   encoding (was filename-prefix in v0.7 and earlier). The filename
   prefix is still readable by the importer for backward compat.
 
-### Deferred / Phase 2.5 (still pending in this release)
+### Phase 2.5 (emission rewrites — landed in v0.9.0)
 
-Several Phase 2.5 plumbing items remain — the canonical schema lands
-in v0.9.0 but a handful of plugin-side emit paths still need the new
-shared serializer wiring:
+All seven Phase 2.5 items landed in the v0.9.0 line via follow-up
+commits to the foundation. Every plugin now honors the v2 canonical
+fields in its wire-form emission, not just in the data model:
 
-- **Continue HOOKS** (`plugins/continue_plugin.go`). Continue grew a
-  native hooks surface; the canonical model carries the events but the
-  Continue plugin still emits "unsupported (warn)" for every hook
-  pending the shared serializer flip. Planned for Phase 2.5.
-- **Claude permission rule fan-out**: the dimension-aware `fs:` /
-  `network:` / `mcp:` grammar parses canonically, but Claude's
-  `Edit/Read/Write/WebFetch/mcp__*` fan-out (SPEC §4.6.3) is still
-  driven by the v0.8 string-rewrite path. Migration to the shared
-  emitter is Phase 2.5.
-- **MCP wire shape from typed transport/auth**: plugins still hand-roll
-  the JSON for the most part. The shared `mcp.WireFormat(server,
-  plugin)` helper is wired in only on claude + gemini today; the
-  remaining six plugins continue to use their v0.8 path.
-- **Cline filename-dispatch hooks emission rewrite**: per SPEC §4.4.5,
-  Cline writes one executable script per `(event, matcher)` pair with
-  guard-clause inlining. The current Cline plugin still emits the v0.8
-  JSON-block shape; the filename-dispatch rewrite is Phase 2.5.
-- **Cursor cross-emit dedup + per-project warning**: Cursor reads
-  `.claude/agents/` directly when present. SPEC §4.1.4 says Cursor
-  should suppress `.cursor/agents/` emission when claude is also a
-  target, with **one info warning per project**. v0.9.0 still
-  double-emits.
-- **Gemini per-action event translation via shared map**: §4.4.4's
-  translation table is hand-maintained in the Gemini plugin today; the
-  shared `hookevents.TranslateForPlugin(event, plugin)` helper is
-  wired into the canonical model but the Gemini plugin still uses its
-  v0.8 inline switch.
-- **AGENTS.override.md filename split**: the AGENTS.md plugin
-  recognizes `IsOverride` but emits everything as `AGENTS.md` for now;
-  the filename split (`AGENTS.override.md` vs `AGENTS.md`) is Phase
-  2.5.
+- **Continue HOOKS — native via shared `ClaudeShapeHooks`.** Continue
+  emits `.continue/hooks.yaml` carrying the same shape Claude carries
+  under `settings.json`'s `hooks:` key (their schemas are verbatim
+  equivalent per SPEC §4.4). The shared renderer makes them
+  bit-compatible; if Claude's schema diverges later, snapshot
+  regressions in `testdata/shared-hooks-shape.json` will catch it.
+  Continue's `${env:VAR}` → `${{ secrets.VAR }}` rewrite also lands
+  for MCP `command`/`args`/`env`/`url`/`headers`, with one info
+  warning per server when any rewrite fires (SPEC §4.5.3). SSE
+  transport on Continue YAML emits the continuedev/continue#5359
+  known-bug warning per SPEC §4.5.4.
+- **Claude permission rule fan-out via the shared parser.** Allow /
+  Deny entries flow through `plugins.ParsePermRule` →
+  `PermRule.FSFanOut()` / `ClaudeRuleForm()`: `fs:src/**` → three
+  `Edit/Read/Write(src/**)` entries; `network:github.com` →
+  `WebFetch(domain:github.com)`; `mcp:github:create_issue` →
+  `mcp__github__create_issue`; negation prefix `!` routes to deny
+  bucket at emit. Recursive `**` translates into Claude's glob
+  dialect; emits info warnings on dimension-aware constructs per SPEC
+  §4.6.3.
+- **MCP transport-aware wire shape on every plugin.** Claude / Cline /
+  Continue / Copilot / Cursor / Gemini / Windsurf all read
+  `MCPServer.Transport` and the `MCPAuth` struct directly: `type:`
+  field from Transport (with each target's wire spelling —
+  `streamableHttp` on Cline, `streamable-http` on Continue,
+  `httpUrl`-vs-`url` on Gemini), `Authorization: Bearer <token>` from
+  `Auth.Scheme=bearer`, header merge from `Auth.Scheme=header`,
+  oauth-warning-but-no-credentials from `Auth.Scheme=oauth`,
+  `${env:VAR}` → `${VAR}` rewrite, and the anthropics/claude-code#6204
+  known-bug warning on Claude when `${env:VAR}` appears in http/sse
+  headers.
+- **Cline filename-dispatch hooks per SPEC §4.4.5.** Cline now emits
+  one executable script per `(event, matcher)` pair at
+  `.clinerules/hooks/<EventName>` (no extension, mode 0755) instead
+  of the v0.8 `.json` config Cline never actually consumed
+  (cline/cline#6). Matcher is inlined as a `case "$tool_name" in
+  ...` guard clause at the top of the script; multi-handler events
+  fan out sequentially through a single dispatcher script. HTTP
+  handlers are wrapped via a `curl -sS -X POST` shim;
+  `mcp_tool`/`prompt`/`agent` handlers warn-drop per the SPEC §12
+  cli column.
+- **Cursor cross-emit dedup.** When both `claude` and `cursor` are
+  active targets (either via explicit `Config.Targets` or via
+  `.claude/` autodetect), Cursor emits agents to `.cursor/agents/`
+  ONLY and surfaces **one info warning per project** explaining the
+  dedup. Honors `extensions.cursor.disable_dedup: true` as the
+  escape hatch.
+- **Gemini per-action canonical events via shared map.** The Phase 1
+  `plugins.MapHookEventFor("gemini", ev)` table is now Gemini's
+  source of truth — `pre_shell` → `BeforeTool + run_shell_command`,
+  `post_file_edit` → `AfterTool + write_file`, `pre_mcp_call` →
+  `BeforeTool + mcp_*`, etc. Round-trip with the importer is exact.
+  `native:<verbatim>` events pass through with the prefix stripped.
+- **AGENTS.override.md filename split.** When `Scope.IsOverride` is
+  true AND `Scope.Path != ""`, the agentsmd plugin emits to
+  `<Path>/AGENTS.override.md` instead of `<Path>/AGENTS.md`. AGENTS.md
+  is the only plugin that round-trips IsOverride natively per SPEC
+  §4.7.4.
 
-These items are tracked as v0.9.x follow-ups; none of them block the
-canonical-schema contract.
+### Phase 2.6 (contract test enforcement — landed)
+
+The capability contract test (`plugins/capability_contract_test.go`)
+was added in Phase 4 with a 218-entry `phase25Skips` map staging the
+above emission gaps. After Phase 2.5 landed, **every cell now passes
+the strict substring matcher** — 196 cells refined across 7 plugins
+(per-field warning messages now mention the canonical field name
+verbatim), 22 Claude cells already verified during Phase 2.5. The
+`phase25Skips` map is empty after this commit. The
+`PRISM_CONTRACT_NO_SKIPS` env-var escape hatch stays for staging
+future SPEC additions.
+
+### Phase 2.7 (parser v2 YAML support — landed)
+
+End-to-end verification on `examples/07-canonical-coverage` surfaced
+the parser had not been updated to read the v2 YAML shapes the fixture
+(and SPEC §4.4 / §4.5) require:
+
+- `parseHooks` now accepts BOTH the v0.8 flat `matcher: "Edit"` /
+  `script: ...` shape AND the v2 structured `matcher: {kind, patterns}`
+  + `handlers: [...]` shape (typed `HookHandler` list with every field).
+  Matcher is read as a `yaml.Node` and branched on `ScalarNode` vs
+  `MappingNode`.
+- `parseMCP` now accepts BOTH the v0.8 map shape (`servers: {github:
+  {...}}`) and the v2 canonical list shape (`servers: [{name, transport,
+  ...}]` per SPEC §4.5.5). Populates the full v2 surface: Transport,
+  Cwd, Headers, Auth (with MCPAuth scheme/token/headers), the six
+  policy fields, ScopePath, and Extensions.
+- `cmd/prism/migrate.go` (NEW) reserves the `prism migrate` subcommand
+  per IMPLEMENTATION_PLAN.md §3. v0.9.0 is greenfield (SPEC §10) so the
+  command is a no-op that prints an informational notice and exits 0.
+
+End-to-end: `prism compile --dry-run` on `examples/07-canonical-coverage`
+produces 51 ops + 151 informational warnings (the fixture's whole
+purpose — surface every plugin's declared degradation/unsupported
+field). go vet clean, all 16 packages pass go test ./....
+
+### Still deferred (v0.9.x or v0.10+)
+
+These are SPEC §11.1 items intentionally out of v0.9.0 scope:
+
+- **Permissions rate-limiting** — no surveyed tool supports it; defer
+  until one does. `extensions.<plugin>.rate_limits` is the
+  pass-through in the meantime.
+- **Continue per-agent file shapes** — Continue's Assistant is 1:1
+  with `config.yaml`. v0.9 projects the first Agent and warns per
+  extra; v0.10+ may emit N config files.
+- **HTTP handler shimming** for Cursor/Gemini/Cline/Windsurf — drops
+  with warning today; v0.10+ may ship an opt-in `--shim-http` flag.
+- **Single-tool hook events** (`pre_model`, `post_model`,
+  `instructions_loaded`, etc.) — addable as `native:<verbatim>` today.
+- **MCP per-server per-scope enforcement** — no tool supports it;
+  ScopePath preserved on MCPServer for attribution only.
+- **Cursor file-event scope-guard envelope widening** — Cursor's
+  `beforeReadFile` and `afterFileEdit` events put `file_path` at the
+  root of the stdin envelope, not under `tool_input`. Tracked as a
+  small v0.9.x follow-up to `cmd/prism/scope-guard.go`.
+- **`schema_version` parser hardening** from warning → error per
+  SPEC §3.1.1 — TODO breadcrumb in `internal/parser/parser.go`
+  citing the section. v0.9.x.
 
 ## v0.8.2
 

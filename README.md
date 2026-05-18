@@ -132,7 +132,7 @@ PLUGIN     CONTEXT  PATHS   SEMANTIC  SKILLS  CMDS    AGENTS  HOOKS   PERMS   MC
 agents-md  native   degr.   degr.     degr.   degr.   degr.   degr.   degr.   degr.
 claude     native   native  degr.     native  native  native  native  native  native
 cline      native   native  native    degr.   native  ----    native  native  native
-continue   native   native  native    degr.   native  ----    --†    native  native
+continue   native   native  native    degr.   native  ----    native native  native
 copilot    native   native  degr.     degr.   native  native  native* native* native
 cursor     native   native  native    native  native  native  native  ----    native
 gemini     native   native  degr.     degr.   native  native  native  native  native
@@ -141,7 +141,7 @@ windsurf   native   native  native    degr.   degr.   ----    native  ----    na
 
 - **native**: 1:1 mapping; full fidelity.
 - **native\*** (copilot Hooks + Perms): native projection, opt-in via `--enable-preview-hooks` because the underlying Copilot hook API is in public preview at the GitHub side. Default OFF; flip on per-run or in CI.
-- **--†** (continue Hooks): Continue grew a native hooks surface; the canonical model carries the events but the plugin still emits "unsupported (warn)" pending Phase 2.5 shared-serializer wiring. See [CHANGELOG.md](CHANGELOG.md) v0.9.0 "Deferred / Phase 2.5" for the full list.
+- All v0.9.0 Phase 2.5 plumbing items (continue hooks-native, claude permission rule fan-out, MCP transport-aware wire shape, cline filename-dispatch hooks, cursor cross-emit dedup, gemini per-action event translation, AGENTS.override.md split) **landed in the v0.9.0 line**. See [CHANGELOG.md](CHANGELOG.md) for the per-cell breakdown. Remaining out-of-scope items (rate-limiting, http handler shimming, single-tool events, etc.) are listed under "Still deferred".
 - **degr.** (degraded): approximated in the target's nearest equivalent; some semantics lost. The plugin emits an info warning explaining what was lost.
 - **----** (unsupported): not projected. Plugin emits a warning naming the dropped item.
 
@@ -151,7 +151,7 @@ registry and any third-party plugins. The fine-grained per-field
 capability matrix (which fields are silent vs unsupported on which
 plugins) lives in [SPEC.md §12](SPEC.md).
 
-As of v0.8.2, **20 cells have flipped from `----` or `degr.` to `native`** across the v0.8 series. v0.8.0 rewrote six of eight plugins for May 2026 feature parity (17 cells). v0.8.2 added cline PERMS plus copilot HOOKS + PERMS (3 cells; copilot is preview-gated). See [CHANGELOG.md](CHANGELOG.md) for the per-plugin breakdown.
+As of v0.9.0, **the schema v2 canonical contract is live and every plugin honors it in wire form** — Continue HOOKS flipped from `----` to `native` via the shared Claude-shape serializer, cline hooks rewrote to filename-dispatch scripts per SPEC §4.4.5, claude permissions fan out through the dimension-aware grammar, MCP servers carry full transport + auth + 6 policy fields. The 218-entry Phase 2.5 punch list in the capability contract test (`plugins/capability_contract_test.go`) is empty after Phase 2.6 — every (plugin × primitive × field) cell now passes the strict contract. See [CHANGELOG.md](CHANGELOG.md) v0.9.0 for the per-cell breakdown.
 
 Show the matrix with `prism capabilities`.
 

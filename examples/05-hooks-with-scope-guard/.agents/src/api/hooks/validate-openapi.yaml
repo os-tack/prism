@@ -1,3 +1,13 @@
-event: PreToolUse
-matcher: Edit|Write
-script: validate-openapi.sh
+# yaml-language-server: $schema=https://prism.dev/schema/v2/hook.schema.json
+# Canonical v2 shape (SPEC §4.4.2): event uses snake_case canonical names;
+# matcher is a struct with kind + patterns; handlers is a typed list.
+event: pre_tool_use
+matcher:
+  kind: exact
+  patterns:
+    - Edit
+    - Write
+handlers:
+  - kind: command
+    command: validate-openapi.sh
+    timeout_ms: 5000
