@@ -268,10 +268,45 @@ func parseHooks(hooksDir string) ([]*model.Hook, error) {
 		}
 		return nil, fmt.Errorf("parser: read %s: %w", hooksDir, err)
 	}
+	// hookYAML accepts both v0.8 flat (Matcher string, Script) AND v2
+	// (matcher struct, handlers list, name/description/sequential/
+	// disabled/scope_path/extensions). Matcher is a yaml.Node so we
+	// branch on scalar (v0.8) vs mapping (v2). Handlers is v2-only.
+	type rawHandlerYAML struct {
+		Kind           string            `yaml:"kind"`
+		TimeoutMs      int               `yaml:"timeout_ms"`
+		StatusMessage  string            `yaml:"status_message"`
+		Async          bool              `yaml:"async"`
+		FailClosed     bool              `yaml:"fail_closed"`
+		Once           bool              `yaml:"once"`
+		If             string            `yaml:"if"`
+		Command        string            `yaml:"command"`
+		Args           []string          `yaml:"args"`
+		Cwd            string            `yaml:"cwd"`
+		Env            map[string]string `yaml:"env"`
+		Shell          string            `yaml:"shell"`
+		Bash           string            `yaml:"bash"`
+		Powershell     string            `yaml:"powershell"`
+		URL            string            `yaml:"url"`
+		Headers        map[string]string `yaml:"headers"`
+		AllowedEnvVars []string          `yaml:"allowed_env_vars"`
+		MCPServer      string            `yaml:"mcp_server"`
+		MCPName        string            `yaml:"mcp_name"`
+		MCPInput       map[string]any    `yaml:"mcp_input"`
+		Prompt         string            `yaml:"prompt"`
+		Model          string            `yaml:"model"`
+	}
 	type hookYAML struct {
-		Event   string `yaml:"event"`
-		Matcher string `yaml:"matcher"`
-		Script  string `yaml:"script"`
+		Name        string           `yaml:"name"`
+		Description string           `yaml:"description"`
+		Event       string           `yaml:"event"`
+		Matcher     yaml.Node        `yaml:"matcher"`
+		Script      string           `yaml:"script"`
+		Handlers    []rawHandlerYAML `yaml:"handlers"`
+		Sequential  *bool            `yaml:"sequential"`
+		Disabled    bool             `yaml:"disabled"`
+		ScopePath   string           `yaml:"scope_path"`
+		Extensions  map[string]any   `yaml:"extensions"`
 	}
 	type named struct {
 		name string
@@ -305,21 +340,77 @@ func parseHooks(hooksDir string) ([]*model.Hook, error) {
 			scriptPath = abs
 		}
 		baseName := strings.TrimSuffix(strings.TrimSuffix(n, ".yaml"), ".yml")
-		h := &model.Hook{
-			Event:      raw.Event,
-			Matcher:    raw.Matcher,
-			ScriptPath: scriptPath,
-		}
-		// v2 additive populations (SPEC §4.4.2). EventCanonical mirrors
-		// Event as a typed enum; MatcherV2 mirrors Matcher as the
-		// {Kind, Patterns} struct so v2 readers and v0.8 readers see the
-		// same hook data through different access paths.
-		h.EventCanonical = model.HookEvent(raw.Event)
-		if raw.Matcher != "" {
-			h.MatcherV2 = model.HookMatcher{
-				Kind:     "exact",
-				Patterns: []string{raw.Matcher},
+
+		// Matcher: scalar (v0.8) vs mapping (v2).
+		var matcherStr string
+		var matcherV2 model.HookMatcher
+		switch raw.Matcher.Kind {
+		case yaml.ScalarNode:
+			matcherStr = raw.Matcher.Value
+			if matcherStr != "" {
+				matcherV2 = model.HookMatcher{Kind: "exact", Patterns: []string{matcherStr}}
 			}
+		case yaml.MappingNode:
+			var mv struct {
+				Kind     string   `yaml:"kind"`
+				Patterns []string `yaml:"patterns"`
+			}
+			if err := raw.Matcher.Decode(&mv); err != nil {
+				return nil, fmt.Errorf("parser: parse %s matcher: %w", path, err)
+			}
+			matcherV2 = model.HookMatcher{Kind: mv.Kind, Patterns: mv.Patterns}
+			if len(mv.Patterns) > 0 {
+				matcherStr = strings.Join(mv.Patterns, "|")
+			}
+		}
+
+		// Handlers: v2 typed list. When absent (v0.8), legacy
+		// plugin code falls back to h.ScriptPath.
+		handlers := make([]model.HookHandler, 0, len(raw.Handlers))
+		for _, rh := range raw.Handlers {
+			kind := model.HookHandlerKind(rh.Kind)
+			if kind == "" {
+				kind = model.HookHandlerCommand
+			}
+			handlers = append(handlers, model.HookHandler{
+				Kind:           kind,
+				TimeoutMs:      rh.TimeoutMs,
+				StatusMessage:  rh.StatusMessage,
+				Async:          rh.Async,
+				FailClosed:     rh.FailClosed,
+				Once:           rh.Once,
+				If:             rh.If,
+				Command:        rh.Command,
+				Args:           rh.Args,
+				Cwd:            rh.Cwd,
+				Env:            rh.Env,
+				Shell:          rh.Shell,
+				Bash:           rh.Bash,
+				Powershell:     rh.Powershell,
+				URL:            rh.URL,
+				Headers:        rh.Headers,
+				AllowedEnvVars: rh.AllowedEnvVars,
+				MCPServer:      rh.MCPServer,
+				MCPName:        rh.MCPName,
+				MCPInput:       rh.MCPInput,
+				Prompt:         rh.Prompt,
+				Model:          rh.Model,
+			})
+		}
+
+		h := &model.Hook{
+			Name:           raw.Name,
+			Description:    raw.Description,
+			Event:          raw.Event,
+			Matcher:        matcherStr,
+			ScriptPath:     scriptPath,
+			EventCanonical: model.HookEvent(raw.Event),
+			MatcherV2:      matcherV2,
+			Handlers:       handlers,
+			Sequential:     raw.Sequential,
+			Disabled:       raw.Disabled,
+			ScopePath:      raw.ScopePath,
+			Extensions:     raw.Extensions,
 		}
 		named_hooks = append(named_hooks, named{
 			name: baseName,
@@ -361,6 +452,11 @@ func parsePermissions(path string) (*model.Permissions, error) {
 }
 
 // parseMCP parses .agents/mcp.yaml. Missing file → nil slice.
+//
+// Accepts both the v0.8 map shape (`servers: {github: {...}}`) and the
+// v2 canonical list shape (`servers: [{name: github, ...}]` per SPEC
+// §4.5.5). The v2 shape carries the full canonical surface: Transport,
+// Headers, Auth, Cwd, and the six policy fields.
 func parseMCP(path string) ([]*model.MCPServer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -369,32 +465,99 @@ func parseMCP(path string) ([]*model.MCPServer, error) {
 		}
 		return nil, fmt.Errorf("parser: read %s: %w", path, err)
 	}
-	var raw struct {
-		Servers map[string]struct {
-			Command string            `yaml:"command"`
-			Args    []string          `yaml:"args"`
-			Env     map[string]string `yaml:"env"`
-			URL     string            `yaml:"url"`
-		} `yaml:"servers"`
+	type rawAuth struct {
+		Scheme  string            `yaml:"scheme"`
+		Token   string            `yaml:"token"`
+		Headers map[string]string `yaml:"headers"`
 	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	// v2 server entry (also handles v0.8 stdio shape via overlap).
+	type rawServerV2 struct {
+		Name         string            `yaml:"name"`
+		Transport    string            `yaml:"transport"`
+		Command      string            `yaml:"command"`
+		Args         []string          `yaml:"args"`
+		Env          map[string]string `yaml:"env"`
+		Cwd          string            `yaml:"cwd"`
+		URL          string            `yaml:"url"`
+		Headers      map[string]string `yaml:"headers"`
+		Auth         *rawAuth          `yaml:"auth"`
+		TimeoutMs    int               `yaml:"timeout_ms"`
+		Disabled     bool              `yaml:"disabled"`
+		AutoApprove  []string          `yaml:"auto_approve"`
+		Trust        bool              `yaml:"trust"`
+		IncludeTools []string          `yaml:"include_tools"`
+		ExcludeTools []string          `yaml:"exclude_tools"`
+		ScopePath    string            `yaml:"scope_path"`
+		Extensions   map[string]any    `yaml:"extensions"`
+	}
+	type rawRoot struct {
+		Servers yaml.Node `yaml:"servers"`
+	}
+	var root rawRoot
+	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("parser: parse %s: %w", path, err)
 	}
-	names := make([]string, 0, len(raw.Servers))
-	for n := range raw.Servers {
-		names = append(names, n)
+
+	build := func(s rawServerV2) *model.MCPServer {
+		srv := &model.MCPServer{
+			Name:         s.Name,
+			Transport:    s.Transport,
+			Command:      s.Command,
+			Args:         s.Args,
+			Env:          s.Env,
+			Cwd:          s.Cwd,
+			URL:          s.URL,
+			Headers:      s.Headers,
+			TimeoutMs:    s.TimeoutMs,
+			Disabled:     s.Disabled,
+			AutoApprove:  s.AutoApprove,
+			Trust:        s.Trust,
+			IncludeTools: s.IncludeTools,
+			ExcludeTools: s.ExcludeTools,
+			ScopePath:    s.ScopePath,
+			Extensions:   s.Extensions,
+		}
+		if s.Auth != nil {
+			srv.Auth = &model.MCPAuth{
+				Scheme:  s.Auth.Scheme,
+				Token:   s.Auth.Token,
+				Headers: s.Auth.Headers,
+			}
+		}
+		return srv
 	}
-	sort.Strings(names)
-	out := make([]*model.MCPServer, 0, len(names))
-	for _, n := range names {
-		s := raw.Servers[n]
-		out = append(out, &model.MCPServer{
-			Name:    n,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-			URL:     s.URL,
-		})
+
+	var out []*model.MCPServer
+	switch root.Servers.Kind {
+	case yaml.SequenceNode:
+		// v2 list shape: servers: [{name: ..., transport: ..., ...}, ...]
+		var list []rawServerV2
+		if err := root.Servers.Decode(&list); err != nil {
+			return nil, fmt.Errorf("parser: parse %s servers list: %w", path, err)
+		}
+		out = make([]*model.MCPServer, 0, len(list))
+		for _, s := range list {
+			out = append(out, build(s))
+		}
+	case yaml.MappingNode:
+		// v0.8 map shape: servers: {github: {command: ..., ...}, ...}
+		var m map[string]rawServerV2
+		if err := root.Servers.Decode(&m); err != nil {
+			return nil, fmt.Errorf("parser: parse %s servers map: %w", path, err)
+		}
+		names := make([]string, 0, len(m))
+		for n := range m {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		out = make([]*model.MCPServer, 0, len(names))
+		for _, n := range names {
+			s := m[n]
+			if s.Name == "" {
+				s.Name = n
+			}
+			out = append(out, build(s))
+		}
 	}
 	return out, nil
 }
