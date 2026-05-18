@@ -328,6 +328,29 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		if err != nil {
 			return nil, err
 		}
+		// Per-field degradation / unsupported warnings (SPEC §12 gem column).
+		srcRel := proj.SourceTag(sc.Document.SourcePath)
+		if sc.Name != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcRel,
+				Message:  fmt.Sprintf("scope Name=%q degraded on Gemini (filename-derived; no `name:` frontmatter)", sc.Name),
+				Severity: "info",
+			})
+		}
+		if sc.Priority != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcRel,
+				Message:  fmt.Sprintf("scope Priority=%s degraded on Gemini (approximated via cascade depth; no native priority key)", sc.Priority),
+				Severity: "info",
+			})
+		}
+		if sc.IsOverride {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcRel,
+				Message:  fmt.Sprintf("scope IsOverride unsupported on Gemini (no native override semantic; scope %q dropped)", sc.Path),
+				Severity: "warn",
+			})
+		}
 		ops = append(ops, op)
 	}
 
@@ -361,10 +384,39 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Sources: sources,
 			Plugin:  "gemini",
 		}
+		// Per-field degradation / unsupported warnings (SPEC §12 gem column).
+		if len(ag.DisallowedTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q DisallowedTools degraded on Gemini (no native disallow list; encode denial in system prompt or rely on settings.json allowed-tools)", ag.Name),
+				Severity: "info",
+			})
+		}
+		if ag.ReadOnly != nil && *ag.ReadOnly {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q ReadOnly degraded on Gemini (no native read-only flag; tools list must drop write tools manually)", ag.Name),
+				Severity: "info",
+			})
+		}
+		if len(ag.AllowedSubagents) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q AllowedSubagents unsupported on Gemini (no sub-agent invocation gate; field dropped)", ag.Name),
+				Severity: "warn",
+			})
+		}
+		if ag.InitialPrompt != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q InitialPrompt unsupported on Gemini (no priming-prompt key; field dropped)", ag.Name),
+				Severity: "warn",
+			})
+		}
 		if ag.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   srcTag,
-				Message:  fmt.Sprintf("scoped agent %q projected without path enforcement (Gemini agents are global)", ag.Name),
+				Message:  fmt.Sprintf("agent %q ScopePath=%s degraded on Gemini (no native per-path agent scoping; projected without path enforcement)", ag.Name, ag.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -429,10 +481,60 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Message:  fmt.Sprintf("skill %q projected as Gemini agent (no native skill primitive; trigger embedded in description)", sk.Name),
 			Severity: "info",
 		})
+		// Per-field degradation / unsupported warnings (SPEC §12 gem column).
+		if sk.WhenToUse != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q WhenToUse degraded on Gemini (embedded in agent description; no dedicated when_to_use key)", sk.Name),
+				Severity: "info",
+			})
+		}
+		if len(globs) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q Activation.Globs unsupported on Gemini (no auto-trigger by file glob; globs embedded as text in description)", sk.Name),
+				Severity: "warn",
+			})
+		}
+		if sk.Activation.ContentRegex != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q Activation.ContentRegex unsupported on Gemini (no content-regex activation; field dropped)", sk.Name),
+				Severity: "warn",
+			})
+		}
+		if len(sk.AllowedTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q AllowedTools unsupported on Gemini (no per-skill tool allowlist; field dropped)", sk.Name),
+				Severity: "warn",
+			})
+		}
+		if len(sk.Arguments) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q Arguments degraded on Gemini (no native arguments schema; surface manually in description)", sk.Name),
+				Severity: "info",
+			})
+		}
+		if sk.Model != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q Model unsupported on Gemini (no per-skill model selection; field dropped)", sk.Name),
+				Severity: "warn",
+			})
+		}
+		if sk.Subagent != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("skill %q Subagent unsupported on Gemini (no skill→agent dispatch; field dropped)", sk.Name),
+				Severity: "warn",
+			})
+		}
 		if sk.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   srcTag,
-				Message:  fmt.Sprintf("scoped skill %q (scope: %s) projected without path enforcement", sk.Name, sk.ScopePath),
+				Message:  fmt.Sprintf("skill %q ScopePath=%s degraded on Gemini (no native per-path skill scoping; projected without path enforcement)", sk.Name, sk.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -468,10 +570,39 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Sources: sources,
 			Plugin:  "gemini",
 		}
+		// Per-field degradation / unsupported warnings (SPEC §12 gem column).
+		if len(cmd.Arguments) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("command %q Arguments degraded on Gemini (no native arguments schema; surface manually in the prompt body)", cmd.Name),
+				Severity: "info",
+			})
+		}
+		if cmd.Model != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("command %q Model unsupported on Gemini (no per-command model selection; field dropped)", cmd.Name),
+				Severity: "warn",
+			})
+		}
+		if len(cmd.Tools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("command %q Tools unsupported on Gemini (no per-command tool allowlist; field dropped)", cmd.Name),
+				Severity: "warn",
+			})
+		}
+		if cmd.Agent != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("command %q Agent unsupported on Gemini (no command→agent dispatch; field dropped)", cmd.Name),
+				Severity: "warn",
+			})
+		}
 		if cmd.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   srcTag,
-				Message:  fmt.Sprintf("scoped command %q projected without path enforcement (Gemini commands are global)", cmd.Name),
+				Message:  fmt.Sprintf("command %q ScopePath=%s degraded on Gemini (no native per-path command scoping; projected without path enforcement)", cmd.Name, cmd.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -535,17 +666,27 @@ func (p *GeminiPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 	ops = append(ops, wrapperOps...)
 	warnings = append(warnings, wrapperWarnings...)
 
-	// Scoped MCP servers degrade to project-global merges (Gemini has no
-	// per-scope MCP).
+	// MCP per-field degradation warnings (SPEC §12 gem column).
 	for _, srv := range proj.MCP {
-		if srv == nil || srv.Name == "" || srv.ScopePath == "" {
+		if srv == nil || srv.Name == "" {
 			continue
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   filepath.Join(srv.ScopePath, "mcp.yaml"),
-			Message:  fmt.Sprintf("Gemini has no per-scope MCP; scoped MCP server %q (scope: %s) not projected.", srv.Name, srv.ScopePath),
-			Severity: "info",
-		})
+		if len(srv.AutoApprove) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("MCP server %q AutoApprove degraded on Gemini (projected as trust-only allowlist via settings.json; per-tool granularity is lost)", srv.Name),
+				Severity: "info",
+			})
+		}
+		// Scoped MCP servers degrade to project-global merges (Gemini
+		// has no per-scope MCP).
+		if srv.ScopePath != "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   filepath.Join(srv.ScopePath, "mcp.yaml"),
+				Message:  fmt.Sprintf("scoped MCP server %q ScopePath=%s degraded on Gemini (no per-scope MCP; not projected).", srv.Name, srv.ScopePath),
+				Severity: "info",
+			})
+		}
 	}
 
 	if len(warnings) > 0 && len(ops) > 0 {
@@ -856,6 +997,28 @@ func buildGeminiSettingsOp(proj *model.Project, wrapperPaths map[*model.Hook]str
 				Name:    name,
 			},
 		})
+		// Per-field unsupported warnings (SPEC §12 gem column).
+		for _, hd := range h.Handlers {
+			if len(hd.Env) > 0 {
+				envKeys := make([]string, 0, len(hd.Env))
+				for k := range hd.Env {
+					envKeys = append(envKeys, k)
+				}
+				sort.Strings(envKeys)
+				warnings = append(warnings, plugin.Warning{
+					Source:   proj.SourceTag(h.ScriptPath),
+					Message:  fmt.Sprintf("hook %q handler Env=%v unsupported on Gemini (no env passthrough in settings.json hooks; drop or wrap in a shell script)", h.Name, envKeys),
+					Severity: "warn",
+				})
+			}
+			if hd.FailClosed {
+				warnings = append(warnings, plugin.Warning{
+					Source:   proj.SourceTag(h.ScriptPath),
+					Message:  fmt.Sprintf("hook %q handler FailClosed unsupported on Gemini (Gemini hooks fail-open; wrap in a shell script that maps non-zero to a block-exit code)", h.Name),
+					Severity: "warn",
+				})
+			}
+		}
 	}
 
 	merger := func(existing []byte) (string, error) {

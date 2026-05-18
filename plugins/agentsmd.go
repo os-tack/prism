@@ -361,10 +361,13 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			sources = append(sources, src)
 		}
 
-		// AGENTS.md has no native scope enforcement — note this on every scope.
+		// AGENTS.md has no native scope enforcement — note this on every
+		// scope. The message names every degraded Scope field (Name,
+		// Description, Priority, Tags) so SPEC §12 per-field contract tests
+		// see the field-name mention they require.
 		warnings = append(warnings, plugin.Warning{
 			Source:   src,
-			Message:  "loaded always — AGENTS.md has no scope enforcement",
+			Message:  "scope Name, Description, Priority, and Tags rendered as text only — AGENTS.md has no scope enforcement (loaded always).",
 			Severity: "info",
 		})
 	}
@@ -477,7 +480,7 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			}
 			warnings = append(warnings, plugin.Warning{
 				Source:   src,
-				Message:  "documented as text; AGENTS.md-only tools cannot invoke as a command.",
+				Message:  "slash command rendered as prose: Name, Description, and ScopePath emitted as documentation; cannot invoke as a command.",
 				Severity: "info",
 			})
 		}
@@ -541,6 +544,13 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			warnings = append(warnings, plugin.Warning{
 				Source:   src,
 				Message:  "documented as text; AGENTS.md-only tools cannot dispatch to subagents.",
+				Severity: "info",
+			})
+			// Sub-agent SystemPrompt is SPEC §12 D for agm — surfaces as
+			// body prose but no native dispatch.
+			warnings = append(warnings, plugin.Warning{
+				Source:   src,
+				Message:  "sub-agent SystemPrompt rendered as body prose; not natively dispatchable.",
 				Severity: "info",
 			})
 		}
@@ -613,7 +623,7 @@ func (p *AgentsMDPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		sources = append(sources, "permissions.yaml")
 		warnings = append(warnings, plugin.Warning{
 			Source:   "permissions.yaml",
-			Message:  "documented as text; AGENTS.md-only tools cannot enforce permissions.",
+			Message:  "Permissions Allow/Deny/Ask documented as text; AGENTS.md-only tools cannot enforce permissions.",
 			Severity: "info",
 		})
 	}
@@ -851,7 +861,7 @@ func renderAgentsMDScopedCapabilities(b *strings.Builder, proj *model.Project) (
 				}
 				warnings = append(warnings, plugin.Warning{
 					Source:   src,
-					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped command /%s (scope: %s) listed as documentation only.", c.Name, scopePath),
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped command /%s ScopePath=%s listed as documentation only.", c.Name, scopePath),
 					Severity: "info",
 				})
 			}
@@ -881,8 +891,8 @@ func renderAgentsMDScopedCapabilities(b *strings.Builder, proj *model.Project) (
 				}
 				warnings = append(warnings, plugin.Warning{
 					Source:   src,
-					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md has no scope enforcement; scoped agent @%s (scope: %s) listed as documentation only.", a.Name, scopePath),
-					Severity: "info",
+					Message:  fmt.Sprintf("loaded always \u2014 AGENTS.md cannot enforce scoped sub-agent ScopePath; scoped agent @%s ScopePath=%s dropped from native dispatch (rendered as documentation only).", a.Name, scopePath),
+					Severity: "warn",
 				})
 			}
 			b.WriteString("\n")

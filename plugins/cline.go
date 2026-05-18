@@ -667,14 +667,334 @@ func (p *ClinePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plug
 			Message:  msg,
 			Severity: "info",
 		})
+		// Per-field unsupported warnings (SPEC §12 cli column). One warn-level
+		// Warning per (agent, unsupported field) so downstream tooling can
+		// surface exactly what was dropped.
+		orphanWarnings = append(orphanWarnings, clineAgentFieldWarnings(agent, src)...)
 	}
 	orphanWarnings = append(orphanWarnings, permsWarnings...)
 
+	// Per-field degradation / drop warnings for Skill / Command / Hook /
+	// MCPServer / Scope per SPEC §12 cli column. Each function returns one
+	// Warning per (primitive, non-zero field) pair so the contract test can
+	// observe the projection's lossiness.
+	for _, sk := range proj.Skills {
+		if sk == nil {
+			continue
+		}
+		src := ""
+		if sk.Document != nil {
+			src = proj.SourceTag(sk.Document.SourcePath)
+		}
+		orphanWarnings = append(orphanWarnings, clineSkillFieldWarnings(sk, src)...)
+	}
+	for _, cmd := range proj.Commands {
+		if cmd == nil {
+			continue
+		}
+		src := ""
+		if cmd.Document != nil {
+			src = proj.SourceTag(cmd.Document.SourcePath)
+		}
+		orphanWarnings = append(orphanWarnings, clineCommandFieldWarnings(cmd, src)...)
+	}
+	for _, h := range proj.Hooks {
+		if h == nil {
+			continue
+		}
+		src := proj.SourceTag(h.ScriptPath)
+		if src == "" {
+			src = "hooks.yaml"
+		}
+		orphanWarnings = append(orphanWarnings, clineHookFieldWarnings(h, src)...)
+	}
+	for _, srv := range proj.MCP {
+		if srv == nil {
+			continue
+		}
+		src := "mcp.yaml"
+		if srv.ScopePath != "" {
+			src = srv.ScopePath + "/mcp.yaml"
+		}
+		orphanWarnings = append(orphanWarnings, clineMCPFieldWarnings(srv, src)...)
+	}
+	for _, sc := range proj.Scopes {
+		if sc == nil {
+			continue
+		}
+		src := ""
+		if sc.Document != nil {
+			src = proj.SourceTag(sc.Document.SourcePath)
+		}
+		orphanWarnings = append(orphanWarnings, clineScopeFieldWarnings(sc, src)...)
+	}
+
+	// Synthesize a no-content carrier op when orphan warnings exist but no
+	// other op was produced (e.g. project only has Agents). The carrier op
+	// is OpWrite with Mode=ModeHook so the engine treats it as advisory and
+	// does not touch the filesystem — its sole purpose is to surface the
+	// warnings so callers (and the capability-contract test) can see them.
+	if len(orphanWarnings) > 0 && len(ops) == 0 {
+		ops = append(ops, plugin.Operation{
+			Kind:   plugin.OpWrite,
+			Path:   "",
+			Mode:   plugin.ModeHook,
+			Plugin: p.Name(),
+		})
+	}
 	if len(orphanWarnings) > 0 && len(ops) > 0 {
 		ops[0].Warnings = append(ops[0].Warnings, orphanWarnings...)
 	}
 
 	return ops, nil
+}
+
+// clineAgentFieldWarnings emits one warn-level Warning per non-zero
+// Unsupported field on agent (SPEC §12 Agent table, cli column). Cline
+// has no subagent primitive at all, so every Agent field that carries
+// data is dropped — each gets its own warning naming the field so
+// downstream tooling can attribute the loss.
+func clineAgentFieldWarnings(agent *model.Agent, source string) []plugin.Warning {
+	if agent == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	add := func(field string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline has no subagent primitive; agent %q field %s dropped.", agent.Name, field),
+		})
+	}
+	if agent.SystemPrompt != "" {
+		add("SystemPrompt")
+	}
+	if agent.Model != "" {
+		add("Model")
+	}
+	if len(agent.Tools) > 0 {
+		add("Tools")
+	}
+	if len(agent.DisallowedTools) > 0 {
+		add("DisallowedTools")
+	}
+	if agent.ReadOnly != nil {
+		add("ReadOnly")
+	}
+	if agent.Background != nil {
+		add("Background")
+	}
+	if agent.MaxTurns != nil {
+		add("MaxTurns")
+	}
+	if agent.Temperature != nil {
+		add("Temperature")
+	}
+	if len(agent.MCPServers) > 0 {
+		add("MCPServers")
+	}
+	if len(agent.AllowedSubagents) > 0 {
+		add("AllowedSubagents")
+	}
+	if agent.UserInvocable != nil {
+		add("UserInvocable")
+	}
+	if agent.ModelInvocable != nil {
+		add("ModelInvocable")
+	}
+	if agent.InitialPrompt != "" {
+		add("InitialPrompt")
+	}
+	if agent.ScopePath != "" {
+		add("ScopePath")
+	}
+	return warns
+}
+
+// clineSkillFieldWarnings emits per-field degradation / drop warnings for
+// a Skill per SPEC §12 Skill table, cli column. Skills project to rule
+// files (no dedicated primitive), so Description / WhenToUse degrade
+// (info) and AllowedTools / Arguments / References / Model / Subagent /
+// ScopePath / Activation.ContentRegex drop (warn).
+func clineSkillFieldWarnings(sk *model.Skill, source string) []plugin.Warning {
+	if sk == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	addInfo := func(field, hint string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "info",
+			Message:  fmt.Sprintf("Cline skill %q: %s %s.", sk.Name, field, hint),
+		})
+	}
+	addWarn := func(field string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline skill %q: %s unsupported and dropped.", sk.Name, field),
+		})
+	}
+	if sk.Description != "" {
+		addInfo("Description", "approximated via rule-file frontmatter description")
+	}
+	if sk.WhenToUse != "" {
+		addInfo("WhenToUse", "merged into the rule body as a hint (no dedicated trigger)")
+	}
+	if len(sk.AllowedTools) > 0 {
+		addWarn("AllowedTools")
+	}
+	if len(sk.Arguments) > 0 {
+		addWarn("Arguments")
+	}
+	if len(sk.References) > 0 {
+		addWarn("References")
+	}
+	if sk.Model != "" {
+		addWarn("Model")
+	}
+	if sk.Subagent != "" {
+		addWarn("Subagent")
+	}
+	if sk.ScopePath != "" {
+		addWarn("ScopePath")
+	}
+	if sk.Activation.ContentRegex != "" {
+		addWarn("Activation.ContentRegex")
+	}
+	return warns
+}
+
+// clineCommandFieldWarnings emits per-field warnings for a Command per
+// SPEC §12 Command table, cli column. Workflows are native, but
+// Description / Arguments / Agent / ScopePath degrade and Model / Tools
+// drop entirely.
+func clineCommandFieldWarnings(cmd *model.Command, source string) []plugin.Warning {
+	if cmd == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	addInfo := func(field, hint string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "info",
+			Message:  fmt.Sprintf("Cline command %q: %s %s.", cmd.Name, field, hint),
+		})
+	}
+	addWarn := func(field string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline command %q: %s unsupported and dropped.", cmd.Name, field),
+		})
+	}
+	if cmd.Description != "" {
+		addInfo("Description", "rendered as a markdown blockquote (no native description surface)")
+	}
+	if len(cmd.Arguments) > 0 {
+		addInfo("Arguments", "Cline workflows have no native argument schema; preserved in body only")
+	}
+	if cmd.Agent != "" {
+		addInfo("Agent", "Cline has no subagent primitive; agent name mentioned in body only")
+	}
+	// ScopePath already emits its own info warning in the workflow loop
+	// above; we add a second mention with the field name verbatim so the
+	// capability contract can match on "ScopePath".
+	if cmd.ScopePath != "" {
+		addInfo("ScopePath", "Cline workflows are global; path enforcement degraded")
+	}
+	if cmd.Model != "" {
+		addWarn("Model")
+	}
+	if len(cmd.Tools) > 0 {
+		addWarn("Tools")
+	}
+	return warns
+}
+
+// clineHookFieldWarnings emits per-field warnings for a Hook per SPEC
+// §12 Hook table, cli column. Cline's filename-dispatch hook engine
+// cannot pass per-handler env vars or honor a FailClosed semantic; both
+// are dropped with warnings.
+func clineHookFieldWarnings(h *model.Hook, source string) []plugin.Warning {
+	if h == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	hookName := h.Name
+	if hookName == "" {
+		hookName = strings.TrimSuffix(filepath.Base(h.ScriptPath), filepath.Ext(h.ScriptPath))
+	}
+	for _, hd := range h.Handlers {
+		if len(hd.Env) > 0 {
+			warns = append(warns, plugin.Warning{
+				Source:   source,
+				Severity: "warn",
+				Message:  fmt.Sprintf("Cline hook %q: handler Env unsupported (Cline dispatcher cannot inject per-handler env); drop or wrap in a shell script.", hookName),
+			})
+		}
+		if hd.FailClosed {
+			warns = append(warns, plugin.Warning{
+				Source:   source,
+				Severity: "warn",
+				Message:  fmt.Sprintf("Cline hook %q: handler FailClosed unsupported (Cline treats non-block exits as fail-open).", hookName),
+			})
+		}
+	}
+	return warns
+}
+
+// clineMCPFieldWarnings emits per-field warnings for an MCPServer per
+// SPEC §12 MCPServer table, cli column. Trust / IncludeTools /
+// ExcludeTools drop (warn); ScopePath degrades to project-wide (info).
+func clineMCPFieldWarnings(srv *model.MCPServer, source string) []plugin.Warning {
+	if srv == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	addWarn := func(field string) {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline MCP server %q: %s unsupported and dropped.", srv.Name, field),
+		})
+	}
+	if srv.Trust {
+		addWarn("Trust")
+	}
+	if len(srv.IncludeTools) > 0 {
+		addWarn("IncludeTools")
+	}
+	if len(srv.ExcludeTools) > 0 {
+		addWarn("ExcludeTools")
+	}
+	if srv.ScopePath != "" {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "info",
+			Message:  fmt.Sprintf("Cline MCP server %q: ScopePath degraded — applied project-wide (no per-scope MCP).", srv.Name),
+		})
+	}
+	return warns
+}
+
+// clineScopeFieldWarnings emits per-field warnings for a Scope per SPEC
+// §12 Scope table, cli column. IsOverride is unsupported (Cline has no
+// override semantic at the rule-file layer); cascade-path semantics are
+// approximated and surfaced as info elsewhere.
+func clineScopeFieldWarnings(sc *model.Scope, source string) []plugin.Warning {
+	if sc == nil {
+		return nil
+	}
+	var warns []plugin.Warning
+	if sc.IsOverride {
+		warns = append(warns, plugin.Warning{
+			Source:   source,
+			Severity: "warn",
+			Message:  fmt.Sprintf("Cline scope %q: IsOverride unsupported (no native override semantic at the rule-file layer).", sc.Path),
+		})
+	}
+	return warns
 }
 
 // clineHookSection holds one (matcher, handler-list) bundle inside an event
@@ -1076,12 +1396,17 @@ func shellQuoteRegex(r string) string {
 
 // clineMCPServerJSON is the schema Cline expects for entries under
 // `cline_mcp_settings.json`'s `mcpServers` map. Identical to Claude's
-// .mcp.json shape, by convention.
+// .mcp.json shape, by convention, with Cline-specific richness for
+// Headers, TimeoutMs, and AutoApprove (per SPEC §12 cli column).
 type clineMCPServerJSON struct {
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`
+	Command     string            `json:"command,omitempty"`
+	Args        []string          `json:"args,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	TimeoutMs   int               `json:"timeoutMs,omitempty"`
+	AutoApprove []string          `json:"autoApprove,omitempty"`
+	Disabled    bool              `json:"disabled,omitempty"`
 }
 
 // buildClineMCPOp emits an OpMerge for .cline/cline_mcp_settings.json.
@@ -1119,9 +1444,13 @@ func buildClineMCPOp(proj *model.Project) (plugin.Operation, error) {
 				continue
 			}
 			entry := clineMCPServerJSON{
-				Command: srv.Command,
-				Args:    srv.Args,
-				Env:     srv.Env,
+				Command:     srv.Command,
+				Args:        srv.Args,
+				Env:         srv.Env,
+				Headers:     srv.Headers,
+				TimeoutMs:   srv.TimeoutMs,
+				AutoApprove: srv.AutoApprove,
+				Disabled:    srv.Disabled,
 			}
 			if srv.Command == "" && srv.URL != "" {
 				entry.URL = srv.URL
@@ -1136,9 +1465,19 @@ func buildClineMCPOp(proj *model.Project) (plugin.Operation, error) {
 		return string(content) + "\n", nil
 	}
 
+	// Pre-render Content for the empty-existing case so static inspection
+	// (tests, dry-run reporting) sees the projected JSON without having to
+	// invoke Merger. The engine still calls Merger at apply time to merge
+	// onto any existing file.
+	initial, err := merger(nil)
+	if err != nil {
+		return plugin.Operation{}, err
+	}
+
 	return plugin.Operation{
 		Kind:     plugin.OpMerge,
 		Path:     mcpRel,
+		Content:  initial,
 		Mode:     plugin.ModeWrite,
 		Sources:  []string{"mcp.yaml"},
 		Plugin:   "cline",
@@ -1155,6 +1494,9 @@ func buildClineMCPOp(proj *model.Project) (plugin.Operation, error) {
 func renderClineScope(scope *model.Scope, body string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
+	if scope.Name != "" {
+		fmt.Fprintf(&b, "name: %s\n", renderYAMLScalar(scope.Name))
+	}
 	if scope.Description != "" {
 		fmt.Fprintf(&b, "description: %s\n", renderYAMLScalar(scope.Description))
 	}

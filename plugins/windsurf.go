@@ -338,6 +338,7 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 			Trigger:     "glob",
 			Globs:       globs,
 			Description: sc.Description,
+			Name:        sc.Name,
 			Extensions:  pluginExtensions(sc.Extensions, "windsurf"),
 		}
 		ops = append(ops, plugin.Operation{
@@ -521,55 +522,385 @@ func (p *WindsurfPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 	}
 
 	// Collect un-attached warnings for capability types we do not project.
-	// These attach to the first emitted op below.
+	// These attach to the first emitted op below (or to a synthesized
+	// no-op when no other op was produced — the warning-only path is the
+	// permissions/scope-IsOverride case where we still need to surface
+	// per-field info/warn warnings).
 	var warnings []plugin.Warning
 	warnings = append(warnings, hooksWarnings...)
-	for _, agent := range proj.Agents {
-		if agent == nil {
+	warnings = append(warnings, windsurfAgentWarnings(proj)...)
+	warnings = append(warnings, windsurfSkillWarnings(proj)...)
+	warnings = append(warnings, windsurfCommandWarnings(proj)...)
+	warnings = append(warnings, windsurfHookFieldWarnings(proj)...)
+	warnings = append(warnings, windsurfMCPFieldWarnings(proj)...)
+	warnings = append(warnings, windsurfPermissionsWarnings(proj)...)
+	warnings = append(warnings, windsurfScopeWarnings(proj)...)
+
+	if len(warnings) == 0 {
+		return ops, nil
+	}
+	if len(ops) == 0 {
+		// Synthesize a no-content carrier op so warnings surface to the
+		// caller even when no rules / hooks / MCP files would otherwise
+		// be emitted (e.g. permissions-only or scope-IsOverride-only
+		// inputs). The warning-only op has Kind=OpWrite + empty Content,
+		// which the engine no-ops on while still propagating warnings.
+		ops = append(ops, plugin.Operation{
+			Kind:   plugin.OpWrite,
+			Path:   ".windsurf/.warnings",
+			Mode:   plugin.ModeWrite,
+			Plugin: p.Name(),
+		})
+	}
+	ops[0].Warnings = append(ops[0].Warnings, warnings...)
+
+	return ops, nil
+}
+
+// windsurfAgentWarnings emits one Warning per (agent × field) cell. Every
+// Agent field is unsupported on Windsurf (no subagent primitive); we
+// surface a `warn`-level warning naming the specific field so callers can
+// detect which fields would have round-tripped on other targets.
+func windsurfAgentWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, ag := range proj.Agents {
+		if ag == nil {
 			continue
 		}
 		src := ""
-		if agent.Document != nil {
-			src = proj.SourceTag(agent.Document.SourcePath)
+		if ag.Document != nil {
+			src = proj.SourceTag(ag.Document.SourcePath)
 		}
-		msg := fmt.Sprintf("Windsurf has no subagent primitive; %s not projected.", agent.Name)
-		if agent.ScopePath != "" {
-			msg = fmt.Sprintf("Windsurf has no subagent primitive; scoped agent %s (scope: %s) not projected.", agent.Name, agent.ScopePath)
+		warn := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf has no subagent primitive; agent %q field %s %s.", ag.Name, field, detail),
+				Severity: "warn",
+			})
 		}
-		warnings = append(warnings, plugin.Warning{
+		// Per SPEC §12 win column, every Agent field is U. The Name +
+		// Description warnings double as the legacy "agent not projected"
+		// info so we keep one info-severity carrier for the agent itself.
+		out = append(out, plugin.Warning{
 			Source:   src,
-			Message:  msg,
+			Message:  fmt.Sprintf("Windsurf has no subagent primitive; agent %s not projected.", ag.Name),
 			Severity: "info",
+		})
+		if ag.SystemPrompt != "" {
+			warn("SystemPrompt", "dropped")
+		}
+		if ag.Model != "" {
+			warn("Model", "dropped")
+		}
+		if len(ag.Tools) > 0 {
+			warn("Tools", "dropped")
+		}
+		if len(ag.DisallowedTools) > 0 {
+			warn("DisallowedTools", "dropped")
+		}
+		if ag.ReadOnly != nil {
+			warn("ReadOnly", "dropped")
+		}
+		if ag.Background != nil {
+			warn("Background", "dropped")
+		}
+		if ag.MaxTurns != nil {
+			warn("MaxTurns", "dropped")
+		}
+		if ag.Temperature != nil {
+			warn("Temperature", "dropped")
+		}
+		if len(ag.MCPServers) > 0 {
+			warn("MCPServers", "dropped")
+		}
+		if len(ag.AllowedSubagents) > 0 {
+			warn("AllowedSubagents", "dropped")
+		}
+		if ag.UserInvocable != nil {
+			warn("UserInvocable", "dropped")
+		}
+		if ag.ModelInvocable != nil {
+			warn("ModelInvocable", "dropped")
+		}
+		if ag.InitialPrompt != "" {
+			warn("InitialPrompt", "dropped")
+		}
+		if ag.ScopePath != "" {
+			warn("ScopePath", "dropped")
+		}
+	}
+	return out
+}
+
+// windsurfSkillWarnings emits one Warning per (skill × field) cell for
+// fields that Windsurf does not natively support on the rules-file
+// projection (degraded WhenToUse, unsupported AllowedTools / Arguments /
+// References / Model / Subagent / ScopePath / Activation.ContentRegex).
+func windsurfSkillWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, sk := range proj.Skills {
+		if sk == nil {
+			continue
+		}
+		src := ""
+		if sk.Document != nil {
+			src = proj.SourceTag(sk.Document.SourcePath)
+		}
+		info := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf rule projection for skill %q: %s %s.", sk.Name, field, detail),
+				Severity: "info",
+			})
+		}
+		warn := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf rule projection for skill %q: %s %s.", sk.Name, field, detail),
+				Severity: "warn",
+			})
+		}
+		if sk.WhenToUse != "" {
+			info("WhenToUse", "merged into the model_decision description (degraded)")
+		}
+		if len(sk.AllowedTools) > 0 {
+			warn("AllowedTools", "unsupported (Windsurf rules have no allowed-tools filter); dropped")
+		}
+		if len(sk.Arguments) > 0 {
+			warn("Arguments", "unsupported (Windsurf rules cannot accept arguments); dropped")
+		}
+		if len(sk.References) > 0 {
+			warn("References", "unsupported (Windsurf rules have no reference file mechanism); dropped")
+		}
+		if sk.Model != "" {
+			warn("Model", "unsupported (Windsurf rules cannot pin a model); dropped")
+		}
+		if sk.Subagent != "" {
+			warn("Subagent", "unsupported (Windsurf has no subagent primitive); dropped")
+		}
+		if sk.ScopePath != "" {
+			warn("ScopePath", "unsupported as a scope filter (rule emitted globally); scope encoded only in filename")
+		}
+		if sk.Activation.ContentRegex != "" {
+			warn("Activation.ContentRegex", "unsupported (Windsurf rules cannot gate on content regex); dropped")
+		}
+	}
+	return out
+}
+
+// windsurfCommandWarnings emits one Warning per (command × field) cell
+// for fields that Windsurf cannot honor on the degraded
+// command-as-rule projection (Description dropped per SPEC §12 win
+// column; Arguments/Agent/ScopePath degraded; Model/Tools unsupported).
+//
+// The base "documented as a rule" info warning is emitted in the command
+// loop above; this function adds per-field warnings on top, leaving the
+// base warning intact.
+func windsurfCommandWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, cmd := range proj.Commands {
+		if cmd == nil {
+			continue
+		}
+		src := sourceFromCommand(proj, cmd)
+		info := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf rule projection for command %q: %s %s.", cmd.Name, field, detail),
+				Severity: "info",
+			})
+		}
+		warn := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf rule projection for command %q: %s %s.", cmd.Name, field, detail),
+				Severity: "warn",
+			})
+		}
+		if cmd.Description != "" {
+			warn("Description", "dropped (Windsurf rules have no description-as-command surface)")
+		}
+		if len(cmd.Arguments) > 0 {
+			info("Arguments", "documented in body only (degraded; Windsurf rules cannot bind arguments)")
+		}
+		if cmd.Model != "" {
+			warn("Model", "unsupported (Windsurf rules cannot pin a model); dropped")
+		}
+		if len(cmd.Tools) > 0 {
+			warn("Tools", "unsupported (Windsurf rules have no allowed-tools filter); dropped")
+		}
+		if cmd.Agent != "" {
+			info("Agent", "documented in body only (degraded; Windsurf has no subagent primitive)")
+		}
+		if cmd.ScopePath != "" {
+			info("ScopePath", "documented in description only (degraded; Windsurf rules have no scope filter)")
+		}
+	}
+	return out
+}
+
+// windsurfHookFieldWarnings emits per-handler field warnings for Hook
+// fields that Windsurf does not honor natively: Env, FailClosed, TimeoutMs
+// (unsupported), ScopePath (degraded). Cwd is natively honored via the
+// `cd && exec` envelope in buildWindsurfHookEntries, so no warning fires.
+func windsurfHookFieldWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, h := range proj.Hooks {
+		if h == nil {
+			continue
+		}
+		src := h.ScriptPath
+		hookName := h.Name
+		if hookName == "" {
+			hookName = "(unnamed)"
+		}
+		info := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf hook %q: %s %s.", hookName, field, detail),
+				Severity: "info",
+			})
+		}
+		warn := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf hook %q: %s %s.", hookName, field, detail),
+				Severity: "warn",
+			})
+		}
+		if h.ScopePath != "" {
+			info("ScopePath", "projected via __scope-guard__ wrapper (degraded; Windsurf has no per-scope hooks)")
+		}
+		for _, hd := range h.Handlers {
+			if len(hd.Env) > 0 {
+				warn("Env", "unsupported (Windsurf hooks have no env field); merge into your shell command if required")
+			}
+			if hd.FailClosed {
+				warn("FailClosed", "unsupported (Windsurf hooks always fail-open on non-zero exit beyond pre_*); wrap as needed")
+			}
+			if hd.TimeoutMs > 0 {
+				warn("TimeoutMs", "unsupported (Windsurf hooks have no timeout field); dropped")
+			}
+		}
+	}
+	return out
+}
+
+// windsurfMCPFieldWarnings emits per-server field warnings for MCP fields
+// Windsurf does not honor: AutoApprove / Trust / IncludeTools /
+// ExcludeTools / TimeoutMs (unsupported, warn), ScopePath (degraded,
+// info — supplements the existing "applied project-wide" warning so the
+// per-field warning mentions "ScopePath" explicitly for the contract).
+func windsurfMCPFieldWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, srv := range proj.MCP {
+		if srv == nil {
+			continue
+		}
+		src := "mcp.yaml"
+		if srv.ScopePath != "" {
+			src = filepath.ToSlash(filepath.Join(srv.ScopePath, "mcp.yaml"))
+		}
+		warn := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf MCP server %q: %s %s.", srv.Name, field, detail),
+				Severity: "warn",
+			})
+		}
+		info := func(field, detail string) {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf MCP server %q: %s %s.", srv.Name, field, detail),
+				Severity: "info",
+			})
+		}
+		if len(srv.AutoApprove) > 0 {
+			warn("AutoApprove", "unsupported (Windsurf has no auto-approve list); dropped")
+		}
+		if srv.Trust {
+			warn("Trust", "unsupported (Windsurf has no trust flag); dropped")
+		}
+		if len(srv.IncludeTools) > 0 {
+			warn("IncludeTools", "unsupported (Windsurf has no include-tools filter); dropped")
+		}
+		if len(srv.ExcludeTools) > 0 {
+			warn("ExcludeTools", "unsupported (Windsurf has no exclude-tools filter); dropped")
+		}
+		if srv.TimeoutMs > 0 {
+			warn("TimeoutMs", "unsupported (Windsurf has no per-server timeout); dropped")
+		}
+		if srv.ScopePath != "" {
+			info("ScopePath", "applied project-wide (degraded; Windsurf has no per-scope MCP)")
+		}
+	}
+	return out
+}
+
+// windsurfPermissionsWarnings emits one warn-level warning per permission
+// bucket per source (global vs scoped) naming the field. Per SPEC §12 win
+// column every permissions row is U.
+func windsurfPermissionsWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	emit := func(src, field string) {
+		out = append(out, plugin.Warning{
+			Source:   src,
+			Message:  fmt.Sprintf("Windsurf has no permissions primitive; %s entries dropped.", field),
+			Severity: "warn",
 		})
 	}
 	if proj.Permissions != nil {
-		if len(proj.Permissions.Allow) > 0 || len(proj.Permissions.Deny) > 0 || len(proj.Permissions.Ask) > 0 {
-			warnings = append(warnings, plugin.Warning{
-				Source:   "",
-				Message:  "Windsurf has no permissions primitive; permissions not projected.",
-				Severity: "info",
-			})
+		if len(proj.Permissions.Allow) > 0 {
+			emit("permissions.yaml", "Allow")
+		}
+		if len(proj.Permissions.Ask) > 0 {
+			emit("permissions.yaml", "Ask")
+		}
+		if len(proj.Permissions.Deny) > 0 {
+			emit("permissions.yaml", "Deny")
 		}
 	}
 	for _, sp := range proj.ScopedPermissions {
 		if sp == nil {
 			continue
 		}
-		if len(sp.Allow) == 0 && len(sp.Deny) == 0 && len(sp.Ask) == 0 {
+		src := filepath.ToSlash(filepath.Join(sp.ScopePath, "permissions.yaml"))
+		if len(sp.Allow) > 0 {
+			emit(src, "Allow (scoped)")
+		}
+		if len(sp.Ask) > 0 {
+			emit(src, "Ask (scoped)")
+		}
+		if len(sp.Deny) > 0 {
+			emit(src, "Deny (scoped)")
+		}
+	}
+	return out
+}
+
+// windsurfScopeWarnings emits per-field warnings for Scope fields that
+// Windsurf does not natively honor. Only IsOverride is U today (SPEC §12
+// win column row); every other scope field is N or D and handled by the
+// per-scope rule emission above.
+func windsurfScopeWarnings(proj *model.Project) []plugin.Warning {
+	var out []plugin.Warning
+	for _, sc := range proj.Scopes {
+		if sc == nil {
 			continue
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "",
-			Message:  fmt.Sprintf("Windsurf has no permissions primitive; scoped permissions (scope: %s) not projected.", sp.ScopePath),
-			Severity: "info",
-		})
+		src := ""
+		if sc.Document != nil {
+			src = proj.SourceTag(sc.Document.SourcePath)
+		}
+		if sc.IsOverride {
+			out = append(out, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Windsurf scope %q: IsOverride unsupported (no AGENTS.override semantic); flag dropped.", sc.Path),
+				Severity: "warn",
+			})
+		}
 	}
-
-	if len(warnings) > 0 && len(ops) > 0 {
-		ops[0].Warnings = append(ops[0].Warnings, warnings...)
-	}
-
-	return ops, nil
+	return out
 }
 
 // sourceFromCommand returns the .agents/-relative source path for a Command
@@ -584,9 +915,11 @@ func sourceFromCommand(proj *model.Project, cmd *model.Command) string {
 // windsurfFrontmatter holds the fields renderWindsurfRule emits. Trigger is
 // required for every rule; Globs is required when Trigger == "glob";
 // Description is required when Trigger == "model_decision" and optional
-// otherwise. Extensions carries the v2 `extensions.windsurf.*` pass-through
-// payload (SPEC §4.x); when non-empty it is rendered verbatim into the
-// frontmatter under sorted keys.
+// otherwise. Name surfaces Scope.Name for downstream introspection (not
+// part of Windsurf's wire schema but emitted as a comment-style key for
+// round-trip parity). Extensions carries the v2 `extensions.windsurf.*`
+// pass-through payload (SPEC §4.x); when non-empty it is rendered verbatim
+// into the frontmatter under sorted keys.
 //
 // TODO(v0.9, SPEC §2): Windsurf has a 12,000 char per-workflow / per-scope
 // cap on rule bodies (see windsurf.com docs). Phase 2a does not enforce
@@ -596,6 +929,7 @@ type windsurfFrontmatter struct {
 	Trigger     string
 	Globs       []string
 	Description string
+	Name        string
 	Extensions  map[string]any
 }
 
@@ -618,6 +952,11 @@ func renderWindsurfRule(fm windsurfFrontmatter, body string) string {
 	if fm.Description != "" {
 		b.WriteString("description: ")
 		b.WriteString(renderYAMLScalar(fm.Description))
+		b.WriteString("\n")
+	}
+	if fm.Name != "" {
+		b.WriteString("name: ")
+		b.WriteString(renderYAMLScalar(fm.Name))
 		b.WriteString("\n")
 	}
 	if len(fm.Extensions) > 0 {
@@ -805,7 +1144,7 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 	}
 
 	for _, h := range proj.Hooks {
-		if h == nil || h.ScriptPath == "" {
+		if h == nil {
 			continue
 		}
 		// v2 read (additive, SPEC §4.4.2): fall back to EventCanonical
@@ -816,6 +1155,17 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 		eventName := h.Event
 		if eventName == "" && h.EventCanonical != "" {
 			eventName = strings.TrimPrefix(string(h.EventCanonical), "native:")
+		}
+		// Map prism canonical events (pre_tool_use, post_tool_use) onto
+		// Claude-shape names so mapWindsurfEvent's switch lands on the
+		// right branch. Direct windsurf event names already pass through.
+		switch strings.ToLower(eventName) {
+		case "pre_tool_use":
+			eventName = "PreToolUse"
+		case "post_tool_use":
+			eventName = "PostToolUse"
+		case "user_prompt_submit":
+			eventName = "UserPromptSubmit"
 		}
 		if eventName == "" {
 			continue
@@ -834,22 +1184,22 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 			continue
 		}
 
-		cmdPath := h.ScriptPath
-		if w, ok := wrapperPaths[h]; ok {
-			cmdPath = w
-		}
-		// Wrap the script path in `bash` so users authoring shell hooks
-		// don't need to mark them executable. shellQuote keeps paths
-		// with spaces / quotes safe.
-		entry := windsurfHookEntry{
-			Command:    "bash " + shellQuote(cmdPath),
-			ShowOutput: false,
+		// Build the command string. v0.8 callers populate Hook.ScriptPath
+		// directly; v2 callers populate Handlers[] with typed command
+		// handlers. We render one Cascade entry per command handler (plus
+		// a single entry for ScriptPath when set), so direct-API tests
+		// that only seed Handlers still produce wire output.
+		entries := buildWindsurfHookEntries(h, wrapperPaths)
+		if len(entries) == 0 {
+			continue
 		}
 		if _, seen := buckets[wsEvent]; !seen {
 			eventOrder = append(eventOrder, wsEvent)
 		}
-		buckets[wsEvent] = append(buckets[wsEvent], entry)
-		addSource(proj.SourceTag(h.ScriptPath))
+		buckets[wsEvent] = append(buckets[wsEvent], entries...)
+		if h.ScriptPath != "" {
+			addSource(proj.SourceTag(h.ScriptPath))
+		}
 	}
 
 	// Sort event names so output is deterministic regardless of input
@@ -895,10 +1245,18 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 		return string(raw) + "\n", nil
 	}
 
+	// Pre-render Content from the merger over empty bytes so plan-time
+	// inspection (capability contract test, dry-run preview) can see the
+	// projected output without invoking the engine merge pipeline. The
+	// engine itself ignores Content when Merger is non-nil (per
+	// plugin.Operation contract).
+	preview, _ := merger(nil)
+
 	op := plugin.Operation{
 		Kind:    plugin.OpMerge,
 		Path:    relPath,
 		Mode:    plugin.ModeWrite,
+		Content: preview,
 		Sources: append(append([]string{}, "hooks.yaml"), sources...),
 		Plugin:  "windsurf",
 		Merger:  merger,
@@ -906,15 +1264,76 @@ func buildWindsurfHooksOp(proj *model.Project, wrapperPaths map[*model.Hook]stri
 	return &op, warnings, nil
 }
 
+// buildWindsurfHookEntries returns one or more Cascade hook entries for
+// a Hook. Per-handler command paths (including the optional handler Cwd)
+// are baked into the rendered command so Windsurf's shell-level hook
+// invocation honors them; the wrapper-path map overrides the raw script
+// path with the scope-guard wrapper when present.
+func buildWindsurfHookEntries(h *model.Hook, wrapperPaths map[*model.Hook]string) []windsurfHookEntry {
+	var out []windsurfHookEntry
+	wrap := wrapperPaths[h]
+
+	// v2 typed handlers — emit one entry per Command handler.
+	for _, hd := range h.Handlers {
+		if hd.Kind != "" && hd.Kind != model.HookHandlerCommand {
+			// non-command handler kinds are unsupported on Windsurf;
+			// the field-level warnings loop surfaces them separately.
+			continue
+		}
+		if hd.Command == "" && wrap == "" && h.ScriptPath == "" {
+			continue
+		}
+		cmd := hd.Command
+		if cmd == "" && h.ScriptPath != "" {
+			cmd = h.ScriptPath
+		}
+		if wrap != "" {
+			cmd = wrap
+		}
+		full := "bash " + shellQuote(cmd)
+		if len(hd.Args) > 0 {
+			for _, a := range hd.Args {
+				full += " " + shellQuote(a)
+			}
+		}
+		if hd.Cwd != "" {
+			// Windsurf has no native cwd field on the hook entry, so we
+			// bake the directory change into the shell command. This
+			// keeps the projected output authoritative for Cwd (the
+			// FieldNative contract checks the projected file content).
+			full = fmt.Sprintf("cd %s && %s", shellQuote(hd.Cwd), full)
+		}
+		out = append(out, windsurfHookEntry{Command: full, ShowOutput: false})
+	}
+	if len(out) > 0 {
+		return out
+	}
+
+	// v0.8 fall-through: ScriptPath only.
+	if h.ScriptPath == "" {
+		return nil
+	}
+	cmdPath := h.ScriptPath
+	if wrap != "" {
+		cmdPath = wrap
+	}
+	out = append(out, windsurfHookEntry{
+		Command:    "bash " + shellQuote(cmdPath),
+		ShowOutput: false,
+	})
+	return out
+}
+
 // windsurfMCPServerJSON mirrors the entry schema under mcpServers in
 // Windsurf's mcp_config.json. The schema matches Claude Code's .mcp.json
 // (command + args + env, optional url for SSE servers), so we reuse the
-// same shape.
+// same shape. Headers are emitted alongside URL for http/sse transports.
 type windsurfMCPServerJSON struct {
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // windsurfMCPCanonicalPathWarning is the info-severity message attached
@@ -976,6 +1395,7 @@ func buildWindsurfMCPOp(proj *model.Project) (plugin.Operation, error) {
 			Command: srv.Command,
 			Args:    srv.Args,
 			Env:     srv.Env,
+			Headers: srv.Headers,
 		}
 		if srv.Command == "" && srv.URL != "" {
 			entry.URL = srv.URL
@@ -1021,10 +1441,17 @@ func buildWindsurfMCPOp(proj *model.Project) (plugin.Operation, error) {
 		return string(raw) + "\n", nil
 	}
 
+	// Pre-render Content via the merger over empty bytes so plan-time
+	// inspection (capability contract test, dry-run preview) reflects the
+	// projected mcp_config.json. The engine ignores Content when Merger
+	// is set, so production behavior is unchanged.
+	preview, _ := merger(nil)
+
 	return plugin.Operation{
 		Kind:     plugin.OpMerge,
 		Path:     relPath,
 		Mode:     plugin.ModeWrite,
+		Content:  preview,
 		Sources:  sources,
 		Plugin:   "windsurf",
 		Warnings: warnings,

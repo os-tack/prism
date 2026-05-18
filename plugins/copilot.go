@@ -165,7 +165,16 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 
 	// Hook — entire primitive only flips Supported=true on the
 	// preview-hooks opt-in. The field overrides describe what the
-	// preview surface CAN'T express even when on.
+	// preview surface CAN'T express even when on. When the opt-in is
+	// off, Plan() emits one info warning per hook saying it was not
+	// projected; ScopePath falls back to FieldDegraded since the
+	// scope-guard wrapper isn't synthesized in that path. FailClosed
+	// stays FieldUnsupported either way (no preview-hook semantic for
+	// it even with the opt-in on).
+	scopePathSupport := plugin.FieldDegraded
+	if p.EnablePreviewHooks {
+		scopePathSupport = plugin.FieldNative // scope-guard wrapper
+	}
 	hookFields := plugin.FieldCapabilities{
 		Supported: p.EnablePreviewHooks,
 		Fields: map[string]plugin.FieldSupport{
@@ -181,7 +190,7 @@ func (p *CopilotPlugin) Capabilities() plugin.Capabilities {
 			"FailClosed":          plugin.FieldUnsupported,
 			"Once":                plugin.FieldUnsupported,
 			"If":                  plugin.FieldUnsupported,
-			"ScopePath":           plugin.FieldNative, // scope-guard wrapper
+			"ScopePath":           scopePathSupport,
 		},
 		Extensions: []string{"copilot"},
 	}
@@ -349,6 +358,17 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		if scopeWarn != nil {
 			op.Warnings = append(op.Warnings, *scopeWarn)
 		}
+		if sc.IsOverride {
+			src := ""
+			if sc.Document != nil {
+				src = proj.SourceTag(sc.Document.SourcePath)
+			}
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("scope %q IsOverride unsupported on Copilot: applyTo files cascade additively with no AGENTS.override semantic; flag dropped", sc.Path),
+				Severity: "warn",
+			})
+		}
 		ops = append(ops, op)
 	}
 
@@ -386,16 +406,37 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			Plugin:  p.Name(),
 			Sources: sources,
 		}
+		skillSrc := ""
+		if skill.Document != nil {
+			skillSrc = proj.SourceTag(skill.Document.SourcePath)
+		}
 		if globWarn != nil {
 			op.Warnings = append(op.Warnings, *globWarn)
 		}
-		if len(skill.Scripts) > 0 {
-			src := ""
-			if skill.Document != nil {
-				src = proj.SourceTag(skill.Document.SourcePath)
-			}
+		if skill.WhenToUse != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
-				Source:   src,
+				Source:   skillSrc,
+				Message:  fmt.Sprintf("skill %q WhenToUse degraded on Copilot: instruction files have no model-trigger field; content folded into the markdown body only", skill.Name),
+				Severity: "info",
+			})
+		}
+		if skill.Activation.ContentRegex != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   skillSrc,
+				Message:  fmt.Sprintf("skill %q Activation.ContentRegex unsupported on Copilot: applyTo accepts only glob patterns; regex %q dropped", skill.Name, skill.Activation.ContentRegex),
+				Severity: "warn",
+			})
+		}
+		if skill.ScopePath != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   skillSrc,
+				Message:  fmt.Sprintf("skill %q ScopePath %q degraded on Copilot: scope binding collapsed into applyTo glob and filename prefix; cross-scope inheritance not preserved", skill.Name, skill.ScopePath),
+				Severity: "info",
+			})
+		}
+		if len(skill.Scripts) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   skillSrc,
 				Message:  fmt.Sprintf("Copilot has no script execution; scripts ignored: %s", strings.Join(skill.Scripts, ", ")),
 				Severity: "info",
 			})
@@ -440,7 +481,7 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			}
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   src,
-				Message:  fmt.Sprintf("Copilot prompts have no path scoping; scoped command %q (scope: %s) projected without applyTo", cmd.Name, cmd.ScopePath),
+				Message:  fmt.Sprintf("command %q ScopePath %q degraded on Copilot: prompts have no path scoping; projected without applyTo (filename prefix only)", cmd.Name, cmd.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -512,8 +553,29 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 		if agent.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   srcTag,
-				Message:  fmt.Sprintf("Copilot agents have no path scoping; scoped agent %q (scope: %s) projected without applyTo", agent.Name, agent.ScopePath),
+				Message:  fmt.Sprintf("agent %q ScopePath %q degraded on Copilot: agent files have no path scoping; projected without applyTo", agent.Name, agent.ScopePath),
 				Severity: "info",
+			})
+		}
+		if len(agent.DisallowedTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q DisallowedTools degraded on Copilot: agent frontmatter has no native deny-list; tools listed (%s) are ignored at runtime", agent.Name, strings.Join(agent.DisallowedTools, ", ")),
+				Severity: "info",
+			})
+		}
+		if agent.ReadOnly != nil && *agent.ReadOnly {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q ReadOnly degraded on Copilot: no native readonly flag in agent frontmatter; enforce via perms-guard sidecar", agent.Name),
+				Severity: "info",
+			})
+		}
+		if agent.InitialPrompt != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("agent %q InitialPrompt unsupported on Copilot: agent frontmatter has no seed-prompt field; value dropped", agent.Name),
+				Severity: "warn",
 			})
 		}
 		ops = append(ops, op)
@@ -556,13 +618,27 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 			eventName := copilotHookEventName(hook)
 			msg := fmt.Sprintf("Copilot hooks are in preview and not emitted; %s:%s not projected (pass --enable-preview-hooks to opt in).", eventName, hook.Matcher)
 			if hook.ScopePath != "" {
-				msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s (scope: %s) not projected (pass --enable-preview-hooks to opt in).", eventName, hook.Matcher, hook.ScopePath)
+				msg = fmt.Sprintf("Copilot hooks are in preview and not emitted; scoped hook %s:%s ScopePath=%s not projected (pass --enable-preview-hooks to opt in).", eventName, hook.Matcher, hook.ScopePath)
 			}
 			warnings = append(warnings, plugin.Warning{
 				Source:   hook.ScriptPath,
 				Message:  msg,
 				Severity: "info",
 			})
+			// FailClosed has no Copilot counterpart even when preview
+			// hooks are on; surface a warn-level warning whenever the
+			// canonical model carries it so callers know enforcement
+			// won't be honored.
+			for _, h := range hook.Handlers {
+				if h.FailClosed {
+					warnings = append(warnings, plugin.Warning{
+						Source:   hook.ScriptPath,
+						Message:  fmt.Sprintf("hook %q FailClosed unsupported on Copilot: preview hook schema has no fail-closed flag; non-zero exit will not block the tool call", hook.Name),
+						Severity: "warn",
+					})
+					break
+				}
+			}
 		}
 
 		// Emit the perms-guard sidecar even without preview hooks so users
@@ -613,10 +689,23 @@ func (p *CopilotPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]pl
 	}
 
 	// Attach warnings without a host op to the first emitted op. If no op
-	// exists, the warnings have nowhere to land — drop them rather than
-	// invent a synthetic op.
-	if len(warnings) > 0 && len(ops) > 0 {
-		ops[0].Warnings = append(ops[0].Warnings, warnings...)
+	// exists but warnings do, synthesize a no-content carrier op so the
+	// degradation notes still surface in `agents which` and the capability
+	// contract test — this is the hook-only project case (preview off,
+	// no Context / Scopes / Skills / Commands / Agents / MCP).
+	if len(warnings) > 0 {
+		if len(ops) > 0 {
+			ops[0].Warnings = append(ops[0].Warnings, warnings...)
+		} else {
+			ops = append(ops, plugin.Operation{
+				Kind:     plugin.OpWrite,
+				Path:     filepath.Join(".github", "hooks", ".prism-warnings"),
+				Content:  "",
+				Mode:     plugin.ModeWrite,
+				Plugin:   p.Name(),
+				Warnings: warnings,
+			})
+		}
 	}
 
 	return ops, nil
@@ -886,14 +975,53 @@ func buildCopilotMCPOp(proj *model.Project) plugin.Operation {
 
 	var warnings []plugin.Warning
 	for _, srv := range servers {
-		if srv == nil || srv.ScopePath == "" {
+		if srv == nil {
 			continue
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   srv.ScopePath + "/mcp.yaml",
-			Message:  fmt.Sprintf("scoped MCP server %q from %s/mcp.yaml applied project-wide; Copilot has no per-scope MCP", srv.Name, srv.ScopePath),
-			Severity: "info",
-		})
+		srcTag := "mcp.yaml"
+		if srv.ScopePath != "" {
+			srcTag = srv.ScopePath + "/mcp.yaml"
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q ScopePath %q degraded on Copilot: per-scope MCP is not supported; entry merged project-wide", srv.Name, srv.ScopePath),
+				Severity: "info",
+			})
+		}
+		if srv.TimeoutMs > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q TimeoutMs=%d unsupported on Copilot: mcp.json has no timeout field; value dropped", srv.Name, srv.TimeoutMs),
+				Severity: "warn",
+			})
+		}
+		if len(srv.AutoApprove) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q AutoApprove unsupported on Copilot: mcp.json has no auto-approve list; entries (%s) dropped", srv.Name, strings.Join(srv.AutoApprove, ", ")),
+				Severity: "warn",
+			})
+		}
+		if srv.Trust {
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q Trust=true unsupported on Copilot: mcp.json has no trust flag; value dropped", srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.IncludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q IncludeTools unsupported on Copilot: mcp.json has no tool-allowlist; entries (%s) dropped", srv.Name, strings.Join(srv.IncludeTools, ", ")),
+				Severity: "warn",
+			})
+		}
+		if len(srv.ExcludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   srcTag,
+				Message:  fmt.Sprintf("MCP server %q ExcludeTools unsupported on Copilot: mcp.json has no tool-denylist; entries (%s) dropped", srv.Name, strings.Join(srv.ExcludeTools, ", ")),
+				Severity: "warn",
+			})
+		}
 	}
 
 	merger := func(existing []byte) (string, error) {

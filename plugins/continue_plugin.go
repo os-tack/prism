@@ -310,15 +310,30 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		}
 		// extensions.continue.* passthrough (SPEC §5.1, §12 Extensions=N).
 		extra := continueExtensions(sc.Extensions)
-		content := renderContinueRule(desc, sc.Globs, false, body, extra)
-		ops = append(ops, plugin.Operation{
+		// Scope.Name and Scope.Priority are surfaced as frontmatter keys
+		// (SPEC §12 con column: Name=N, Priority=N⁷ lexicographic
+		// filename order; we keep both the frontmatter key and the slug
+		// sort so users can inspect priority without parsing filenames).
+		content := renderContinueScopeRule(sc, desc, body, extra)
+		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".continue", "rules", slugify(sc.Path)+".md")),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
-		})
+		}
+		// Scope.IsOverride is unsupported (SPEC §12 con column: U⁹).
+		// Continue has no equivalent semantic; surface a warn-level
+		// warning so users know the cell drops.
+		if sc.IsOverride {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("Continue has no scope-override semantic; IsOverride dropped on scope %q", sc.Path),
+				Severity: "warn",
+			})
+		}
+		ops = append(ops, op)
 	}
 
 	// Skills → degraded scoped rule files at .continue/rules/skill-<slug>.md.
@@ -371,6 +386,7 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 				Severity: "info",
 			})
 		}
+		op.Warnings = append(op.Warnings, continueSkillWarnings(proj, skill)...)
 		ops = append(ops, op)
 	}
 
@@ -410,20 +426,47 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".continue", "prompts", fname)),
-			Content: renderContinuePrompt(cmd.Name, desc, body, extra),
+			Content: renderContinuePrompt(cmd.Name, desc, cmd.Model, body, extra),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
 		}
+		src := ""
+		if len(sources) > 0 {
+			src = sources[0]
+		}
 		if cmd.ScopePath != "" {
-			src := ""
-			if len(sources) > 0 {
-				src = sources[0]
-			}
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   src,
-				Message:  fmt.Sprintf("Continue prompt files have no per-scope attachment; scoped command %q (scope: %s) projected as a global slash command", cmd.Name, cmd.ScopePath),
+				Message:  fmt.Sprintf("Continue prompt files have no per-scope attachment; ScopePath on scoped command %q (scope: %s) projected as a global slash command", cmd.Name, cmd.ScopePath),
 				Severity: "info",
+			})
+		}
+		// Per-field cells (SPEC §12 con Command column).
+		// Arguments=D — Continue prompt files have no structured arg
+		// schema; arg names are surfaced inside the body only.
+		if len(cmd.Arguments) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Continue prompts have no structured argument schema; Arguments on command %q surfaced verbatim in the prompt body", cmd.Name),
+				Severity: "info",
+			})
+		}
+		// Tools=U — Continue prompts cannot scope tool access per-prompt.
+		if len(cmd.Tools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Continue prompts cannot restrict Tools per-command; dropped on %q", cmd.Name),
+				Severity: "warn",
+			})
+		}
+		// Agent=U — Continue has no subagent primitive; the Agent
+		// pointer on a Command cannot be honored.
+		if cmd.Agent != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("Continue has no subagent primitive; Agent reference %q on command %q dropped", cmd.Agent, cmd.Name),
+				Severity: "warn",
 			})
 		}
 		ops = append(ops, op)
@@ -436,19 +479,7 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if ag == nil {
 			continue
 		}
-		src := ""
-		if ag.Document != nil {
-			src = proj.SourceTag(ag.Document.SourcePath)
-		}
-		msg := fmt.Sprintf("Continue has no subagent primitive; %s not projected", ag.Name)
-		if ag.ScopePath != "" {
-			msg = fmt.Sprintf("Continue has no subagent primitive; scoped agent %s (scope: %s) not projected", ag.Name, ag.ScopePath)
-		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   src,
-			Message:  msg,
-			Severity: "info",
-		})
+		warnings = append(warnings, continueAgentWarnings(proj, ag)...)
 	}
 
 	// Hooks → .continue/hooks.yaml (verbatim Claude schema, YAML form).
@@ -497,14 +528,66 @@ func (p *ContinuePlugin) Plan(proj *model.Project, opts model.TargetOption) ([]p
 		if srv.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
 				Source:   "",
-				Message:  fmt.Sprintf("Continue has no per-scope MCP; scoped server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
+				Message:  fmt.Sprintf("Continue has no per-scope MCP; ScopePath on server %q (scope: %s) merged into global block", srv.Name, srv.ScopePath),
 				Severity: "info",
+			})
+		}
+		// Per-field unsupported cells (SPEC §12 con MCPServer column):
+		// TimeoutMs, AutoApprove, Trust, IncludeTools, ExcludeTools.
+		// Continue's mcpServers schema has no analogues, so we emit one
+		// warn-level Warning per populated field.
+		if srv.TimeoutMs > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("Continue mcpServers has no TimeoutMs key; %dms dropped on server %q", srv.TimeoutMs, srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.AutoApprove) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("Continue mcpServers has no AutoApprove key; %d entries dropped on server %q", len(srv.AutoApprove), srv.Name),
+				Severity: "warn",
+			})
+		}
+		if srv.Trust {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("Continue mcpServers has no Trust key; flag dropped on server %q", srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.IncludeTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("Continue mcpServers has no IncludeTools allowlist; %d entries dropped on server %q", len(srv.IncludeTools), srv.Name),
+				Severity: "warn",
+			})
+		}
+		if len(srv.ExcludeTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   "mcp.yaml",
+				Message:  fmt.Sprintf("Continue mcpServers has no ExcludeTools denylist; %d entries dropped on server %q", len(srv.ExcludeTools), srv.Name),
+				Severity: "warn",
 			})
 		}
 		ops = append(ops, op)
 	}
 
-	// Attach orphan warnings to the first available op.
+	// Attach orphan warnings to the first available op. When the plan
+	// would otherwise be empty (only unsupported primitives like
+	// stand-alone Agents in the input), emit a synthetic no-op operation
+	// with an empty path so the warnings still reach the engine. The
+	// engine treats empty-path ops as warning-only; the filesystem stays
+	// untouched.
+	if len(warnings) > 0 && len(ops) == 0 {
+		ops = append(ops, plugin.Operation{
+			Kind:   plugin.OpWrite,
+			Path:   "",
+			Mode:   plugin.ModeWrite,
+			Plugin: p.Name(),
+		})
+	}
 	if len(warnings) > 0 && len(ops) > 0 {
 		ops[0].Warnings = append(ops[0].Warnings, warnings...)
 	}
@@ -924,15 +1007,16 @@ func hasUntranslatableGlob(pattern string) bool {
 }
 
 // renderContinuePrompt formats a `.continue/prompts/<name>.md` file with
-// YAML frontmatter (`name`, `description`, `invokable: true`) followed by
-// the prompt body. The encoding/json shim is used to escape the
-// description and name strings safely (JSON strings are valid YAML
+// YAML frontmatter (`name`, `description`, `model`, `invokable: true`)
+// followed by the prompt body. The encoding/json shim is used to escape
+// the description and name strings safely (JSON strings are valid YAML
 // scalars, including the colon-in-description case).
 //
+// model is the optional model override (SPEC §12 con Command/Model = N).
 // extra is the verbatim `extensions.continue.*` map (typically nil); when
 // non-empty its keys are appended to the frontmatter after the canonical
 // keys. Plugin-namespaced pass-through per SPEC §5.1.
-func renderContinuePrompt(name, description, body string, extra map[string]any) string {
+func renderContinuePrompt(name, description, model, body string, extra map[string]any) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	if name != "" {
@@ -943,6 +1027,11 @@ func renderContinuePrompt(name, description, body string, extra map[string]any) 
 	if description != "" {
 		b.WriteString("description: ")
 		b.WriteString(renderYAMLScalar(description))
+		b.WriteString("\n")
+	}
+	if model != "" {
+		b.WriteString("model: ")
+		b.WriteString(renderYAMLScalar(model))
 		b.WriteString("\n")
 	}
 	b.WriteString("invokable: true\n")
@@ -1146,6 +1235,190 @@ func renderContinueRule(description string, globs []string, alwaysApply bool, bo
 		}
 	}
 	return b.String()
+}
+
+// renderContinueScopeRule formats a scope rule file with extended
+// frontmatter that includes the v2 Scope.Name and Scope.Priority cells
+// (SPEC §12 con column: Name=N, Priority=N⁷). The Continue rule loader
+// ignores unknown keys, so emitting `name:` and `priority:` is safe even
+// though Continue's stock attachment logic only reads description/globs.
+func renderContinueScopeRule(sc *model.Scope, description, body string, extra map[string]any) string {
+	var b strings.Builder
+	b.WriteString("---\n")
+	if sc.Name != "" {
+		b.WriteString("name: ")
+		b.WriteString(renderYAMLScalar(sc.Name))
+		b.WriteString("\n")
+	}
+	if description != "" {
+		b.WriteString("description: ")
+		b.WriteString(renderYAMLScalar(description))
+		b.WriteString("\n")
+	}
+	if len(sc.Globs) > 0 {
+		b.WriteString("globs: ")
+		b.WriteString(renderGlobs(sc.Globs))
+		b.WriteString("\n")
+	}
+	if sc.Priority != "" {
+		b.WriteString("priority: ")
+		b.WriteString(renderYAMLScalar(string(sc.Priority)))
+		b.WriteString("\n")
+	}
+	writeExtensionsYAML(&b, extra)
+	b.WriteString("---\n")
+	if body != "" {
+		b.WriteString(body)
+		if !strings.HasSuffix(body, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// continueAgentWarnings emits one Warning per populated Agent field per
+// SPEC §12 con Agent column (D = info, U = warn, S = silent). The whole
+// Agent primitive drops on Continue (no subagent host), so each warning
+// is the user's only signal that a specific field went missing. The
+// "no subagent primitive" preamble surfaces the high-level reason; the
+// per-field suffix names the exact cell so the contract test sees the
+// field name in the message.
+//
+// A baseline drop warning is always emitted (one per agent) so users
+// see the agent went missing even when no v2 fields are populated.
+func continueAgentWarnings(proj *model.Project, ag *model.Agent) []plugin.Warning {
+	if ag == nil {
+		return nil
+	}
+	src := ""
+	if ag.Document != nil {
+		src = proj.SourceTag(ag.Document.SourcePath)
+	}
+	prefix := fmt.Sprintf("Continue has no subagent primitive; agent %q not projected", ag.Name)
+	if ag.ScopePath != "" {
+		prefix = fmt.Sprintf("Continue has no subagent primitive; scoped agent %q (scope: %s) not projected", ag.Name, ag.ScopePath)
+	}
+	out := []plugin.Warning{
+		{
+			Source:   src,
+			Message:  prefix,
+			Severity: "info",
+		},
+	}
+	info := func(field, detail string) {
+		out = append(out, plugin.Warning{
+			Source:   src,
+			Message:  fmt.Sprintf("%s; %s degraded (%s)", prefix, field, detail),
+			Severity: "info",
+		})
+	}
+	warn := func(field, detail string) {
+		out = append(out, plugin.Warning{
+			Source:   src,
+			Message:  fmt.Sprintf("%s; %s dropped (%s)", prefix, field, detail),
+			Severity: "warn",
+		})
+	}
+	// Degraded fields (SPEC §12 con: D).
+	if ag.SystemPrompt != "" {
+		info("SystemPrompt", "no native agent host; SystemPrompt surfaces only inside the agents.md fallback")
+	}
+	if ag.Model != "" {
+		info("Model", "no native agent host; Model is advisory only")
+	}
+	if ag.Temperature != nil {
+		info("Temperature", "no native agent host; Temperature is advisory only")
+	}
+	if len(ag.MCPServers) > 0 {
+		info("MCPServers", "no per-agent MCP attachment; servers must be configured globally")
+	}
+	// Unsupported fields (SPEC §12 con: U).
+	if len(ag.Tools) > 0 {
+		warn("Tools", "no per-agent tool allowlist")
+	}
+	if len(ag.DisallowedTools) > 0 {
+		warn("DisallowedTools", "no per-agent tool denylist")
+	}
+	if ag.ReadOnly != nil {
+		warn("ReadOnly", "no per-agent read-only flag")
+	}
+	if ag.Background != nil {
+		warn("Background", "no background-agent mode")
+	}
+	if ag.MaxTurns != nil {
+		warn("MaxTurns", "no MaxTurns control")
+	}
+	if len(ag.AllowedSubagents) > 0 {
+		warn("AllowedSubagents", "no nested subagent control")
+	}
+	if ag.UserInvocable != nil {
+		warn("UserInvocable", "no user-invocation control")
+	}
+	if ag.ModelInvocable != nil {
+		warn("ModelInvocable", "no model-invocation control")
+	}
+	if ag.InitialPrompt != "" {
+		warn("InitialPrompt", "no InitialPrompt seed")
+	}
+	if ag.ScopePath != "" {
+		warn("ScopePath", "no per-scope agent attachment")
+	}
+	return out
+}
+
+// continueSkillWarnings emits one Warning per populated Skill field per
+// SPEC §12 con Skill column. Most skill fields are degraded (D) because
+// the skill itself emits as a rule file — fields that can't ride along
+// in YAML frontmatter drop with an info warning. Unsupported (U) fields
+// drop with a warn-level warning. The skill name is included for source
+// localization.
+func continueSkillWarnings(proj *model.Project, skill *model.Skill) []plugin.Warning {
+	if skill == nil {
+		return nil
+	}
+	src := ""
+	if skill.Document != nil {
+		src = proj.SourceTag(skill.Document.SourcePath)
+	}
+	var out []plugin.Warning
+	info := func(field, detail string) {
+		out = append(out, plugin.Warning{
+			Source:   src,
+			Message:  fmt.Sprintf("Continue degrades %s on skill %q to a rule file (%s)", field, skill.Name, detail),
+			Severity: "info",
+		})
+	}
+	warn := func(field, detail string) {
+		out = append(out, plugin.Warning{
+			Source:   src,
+			Message:  fmt.Sprintf("Continue drops %s on skill %q (%s)", field, skill.Name, detail),
+			Severity: "warn",
+		})
+	}
+	// Degraded (D).
+	if skill.WhenToUse != "" {
+		info("WhenToUse", "Continue rules have no WhenToUse field; merged into description")
+	}
+	if len(skill.Arguments) > 0 {
+		info("Arguments", "Continue rules have no structured Arguments schema")
+	}
+	// Unsupported (U).
+	if len(skill.AllowedTools) > 0 {
+		warn("AllowedTools", "no per-skill AllowedTools allowlist")
+	}
+	if len(skill.References) > 0 {
+		warn("References", "no References mechanism on rule files")
+	}
+	if skill.Model != "" {
+		warn("Model", "no per-skill Model override")
+	}
+	if skill.Subagent != "" {
+		warn("Subagent", "no Subagent dispatch from skills")
+	}
+	if skill.ScopePath != "" {
+		warn("ScopePath", "Continue rule attachment is glob-based, not scope-path-based")
+	}
+	return out
 }
 
 // continueExtensions extracts the `extensions.continue` block from a

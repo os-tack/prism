@@ -292,14 +292,36 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			sources = []string{proj.SourceTag(sc.Document.SourcePath)}
 		}
 		content := renderMDC(desc, sc.Globs, false, body, cursorExtensionKVs(sc.Extensions))
-		ops = append(ops, plugin.Operation{
+		op := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    filepath.ToSlash(filepath.Join(".cursor", "rules", slugify(sc.Path)+".mdc")),
 			Content: content,
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: sources,
-		})
+		}
+		src := ""
+		if sc.Document != nil {
+			src = proj.SourceTag(sc.Document.SourcePath)
+		}
+		// Scope/Priority (degraded — synthesized as filename prefix, but the
+		// canonical Priority enum is not preserved; emit info warning).
+		if sc.Priority != "" && sc.Priority != model.PriorityNormal {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("scope %q: Scope.Priority %q degraded to filename-prefix ordering only (Cursor has no priority field).", sc.Path, sc.Priority),
+				Severity: "info",
+			})
+		}
+		// Scope/IsOverride (unsupported — Cursor has no override semantic).
+		if sc.IsOverride {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("scope %q: Scope.IsOverride dropped (Cursor has no override semantic).", sc.Path),
+				Severity: "warn",
+			})
+		}
+		ops = append(ops, op)
 	}
 
 	// Skills → `.cursor/skills/<dirname>/SKILL.md` (native, Cursor 2.4+).
@@ -311,14 +333,75 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		}
 		dirName := scopedName(sk.ScopePath, skillSlug(sk.Name))
 		skillPath := filepath.ToSlash(filepath.Join(".cursor", "skills", dirName, "SKILL.md"))
-		ops = append(ops, plugin.Operation{
+		skillOp := plugin.Operation{
 			Kind:    plugin.OpWrite,
 			Path:    skillPath,
 			Content: renderCursorSkillBody(sk),
 			Mode:    plugin.ModeWrite,
 			Plugin:  p.Name(),
 			Sources: []string{proj.SourceTag(sk.Document.SourcePath)},
-		})
+		}
+		src := proj.SourceTag(sk.Document.SourcePath)
+		// Skill/WhenToUse (degraded — Cursor SKILL.md has no when_to_use
+		// frontmatter key; surface as part of description only).
+		if sk.WhenToUse != "" {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.WhenToUse degraded — Cursor has no when_to_use frontmatter key; content folded into description.", sk.Name),
+				Severity: "info",
+			})
+		}
+		// Skill/AllowedTools (degraded — Cursor skills don't gate tools).
+		if len(sk.AllowedTools) > 0 {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.AllowedTools degraded — Cursor skills inherit ambient tool permissions; allowlist not enforced.", sk.Name),
+				Severity: "info",
+			})
+		}
+		// Skill/Arguments (degraded — no native arguments contract).
+		if len(sk.Arguments) > 0 {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.Arguments degraded — Cursor has no structured Arguments contract; document them in the body.", sk.Name),
+				Severity: "info",
+			})
+		}
+		// Skill/Subagent (degraded — pinning a subagent is not supported,
+		// invocation falls back to the active model).
+		if sk.Subagent != "" {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.Subagent %q degraded — Cursor skills cannot pin a specific subagent.", sk.Name, sk.Subagent),
+				Severity: "info",
+			})
+		}
+		// Skill/Model (unsupported — Cursor skills have no model pin).
+		if sk.Model != "" {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.Model %q dropped (Cursor has no per-skill model pin).", sk.Name, sk.Model),
+				Severity: "warn",
+			})
+		}
+		// Skill/Activation.ContentRegex (unsupported).
+		if sk.Activation.ContentRegex != "" {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("skill %q: Skill.Activation.ContentRegex dropped (Cursor has no content-regex trigger).", sk.Name),
+				Severity: "warn",
+			})
+		}
+		// Skill/ScopePath (degraded — Cursor skills are global, scope is
+		// only preserved via filename prefix).
+		if sk.ScopePath != "" {
+			skillOp.Warnings = append(skillOp.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("scoped skill %q (scopepath %s) projected without path enforcement (Cursor skills are global).", sk.Name, sk.ScopePath),
+				Severity: "info",
+			})
+		}
+		ops = append(ops, skillOp)
 
 		// Scripts are co-located under scripts/<basename>; since Plan is
 		// pure (no file I/O) we emit symlinks pointing back at the source
@@ -354,10 +437,53 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Plugin:  p.Name(),
 			Sources: []string{proj.SourceTag(cmd.Document.SourcePath)},
 		}
+		src := proj.SourceTag(cmd.Document.SourcePath)
+		// Command/Description (unsupported — Cursor command files have NO
+		// frontmatter, so any Description is dropped).
+		if cmd.Description != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("command %q: Command.Description dropped (Cursor commands have no frontmatter and cannot carry a description).", cmd.Name),
+				Severity: "warn",
+			})
+		}
+		// Command/Arguments (degraded — no native arguments schema).
+		if len(cmd.Arguments) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("command %q: Command.Arguments degraded — Cursor has no structured Arguments schema; document them in the body.", cmd.Name),
+				Severity: "info",
+			})
+		}
+		// Command/Model (unsupported — no model pin).
+		if cmd.Model != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("command %q: Command.Model %q dropped (Cursor commands cannot pin a model).", cmd.Name, cmd.Model),
+				Severity: "warn",
+			})
+		}
+		// Command/Tools (unsupported — no per-command tool gating).
+		if len(cmd.Tools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("command %q: Command.Tools dropped (Cursor commands inherit ambient tools).", cmd.Name),
+				Severity: "warn",
+			})
+		}
+		// Command/Agent (degraded — no native agent pin).
+		if cmd.Agent != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("command %q: Command.Agent %q degraded — Cursor commands cannot pin a subagent.", cmd.Name, cmd.Agent),
+				Severity: "info",
+			})
+		}
+		// Command/ScopePath (degraded — Cursor commands are global).
 		if cmd.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
-				Source:   proj.SourceTag(cmd.Document.SourcePath),
-				Message:  fmt.Sprintf("scoped command %q projected without path enforcement (Cursor commands are global)", cmd.Name),
+				Source:   src,
+				Message:  fmt.Sprintf("scoped command %q (scopepath %s) projected without path enforcement (Cursor commands are global)", cmd.Name, cmd.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -392,10 +518,48 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 			Plugin:  p.Name(),
 			Sources: []string{proj.SourceTag(ag.Document.SourcePath)},
 		}
+		src := proj.SourceTag(ag.Document.SourcePath)
+		// Agent/DisallowedTools (degraded — Cursor agents have no native
+		// disallowed-tools list; the body must encode any restrictions).
+		if len(ag.DisallowedTools) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("agent %q: Agent.DisallowedTools degraded — Cursor agents have no native disallowed-tools list; describe restrictions in the body.", ag.Name),
+				Severity: "info",
+			})
+		}
+		// Agent/MCPServers (unsupported — Cursor agents inherit the global
+		// MCP set; per-agent MCP pinning is not honored).
+		if len(ag.MCPServers) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("agent %q: Agent.MCPServers dropped (Cursor agents inherit the project's MCP set; per-agent MCPServers is unsupported).", ag.Name),
+				Severity: "warn",
+			})
+		}
+		// Agent/AllowedSubagents (unsupported — Cursor has no nested-agent
+		// allowlist).
+		if len(ag.AllowedSubagents) > 0 {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("agent %q: Agent.AllowedSubagents dropped (Cursor has no nested-agent allowlist).", ag.Name),
+				Severity: "warn",
+			})
+		}
+		// Agent/InitialPrompt (unsupported — Cursor agents do not accept
+		// an initial-prompt boot directive).
+		if ag.InitialPrompt != "" {
+			op.Warnings = append(op.Warnings, plugin.Warning{
+				Source:   src,
+				Message:  fmt.Sprintf("agent %q: Agent.InitialPrompt dropped (Cursor agents do not honor an InitialPrompt boot directive).", ag.Name),
+				Severity: "warn",
+			})
+		}
+		// Agent/ScopePath (degraded — Cursor agents are global).
 		if ag.ScopePath != "" {
 			op.Warnings = append(op.Warnings, plugin.Warning{
-				Source:   proj.SourceTag(ag.Document.SourcePath),
-				Message:  fmt.Sprintf("scoped agent %q projected without path enforcement (Cursor agents are global)", ag.Name),
+				Source:   src,
+				Message:  fmt.Sprintf("scoped agent %q (scopepath %s) projected without path enforcement (Cursor agents are global)", ag.Name, ag.ScopePath),
 				Severity: "info",
 			})
 		}
@@ -450,14 +614,59 @@ func (p *CursorPlugin) Plan(proj *model.Project, opts model.TargetOption) ([]plu
 		ops = append(ops, mcpOp)
 	}
 	for _, srv := range proj.MCP {
-		if srv == nil || srv.ScopePath == "" {
+		if srv == nil {
 			continue
 		}
-		warnings = append(warnings, plugin.Warning{
-			Source:   "",
-			Message:  fmt.Sprintf("Cursor has no per-scope MCP; scoped server %q (scope: %s) merged into global block.", srv.Name, srv.ScopePath),
-			Severity: "info",
-		})
+		// MCPServer/ScopePath (degraded — Cursor has no per-scope MCP
+		// block; scoped servers merge into the global one).
+		if srv.ScopePath != "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("Cursor has no per-scope MCP; scoped server %q (scopepath %s) merged into global block.", srv.Name, srv.ScopePath),
+				Severity: "info",
+			})
+		}
+		// MCPServer/TimeoutMs (unsupported — no timeout field in
+		// .cursor/mcp.json).
+		if srv.TimeoutMs != 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("mcp server %q: TimeoutMs dropped (Cursor mcp.json has no timeout field).", srv.Name),
+				Severity: "warn",
+			})
+		}
+		// MCPServer/AutoApprove (unsupported — Cursor has no auto-approve list).
+		if len(srv.AutoApprove) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("mcp server %q: AutoApprove dropped (Cursor has no per-server auto-approve list).", srv.Name),
+				Severity: "warn",
+			})
+		}
+		// MCPServer/Trust (unsupported — no trust toggle).
+		if srv.Trust {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("mcp server %q: Trust flag dropped (Cursor mcp.json has no trust toggle).", srv.Name),
+				Severity: "warn",
+			})
+		}
+		// MCPServer/IncludeTools (unsupported — no tool allowlist).
+		if len(srv.IncludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("mcp server %q: IncludeTools dropped (Cursor has no per-server tool allowlist).", srv.Name),
+				Severity: "warn",
+			})
+		}
+		// MCPServer/ExcludeTools (unsupported — no tool denylist).
+		if len(srv.ExcludeTools) > 0 {
+			warnings = append(warnings, plugin.Warning{
+				Source:   "",
+				Message:  fmt.Sprintf("mcp server %q: ExcludeTools dropped (Cursor has no per-server tool denylist).", srv.Name),
+				Severity: "warn",
+			})
+		}
 	}
 
 	if proj.Permissions != nil {
@@ -640,6 +849,29 @@ func (p *CursorPlugin) buildHooksOp(proj *model.Project, wrapperPaths map[*model
 		if tag != "" && !seenSource[tag] {
 			seenSource[tag] = true
 			sources = append(sources, tag)
+		}
+
+		// Field-level degrade / unsupported warnings (SPEC §12 Hook cur
+		// column). Hook/ScopePath is degraded (Cursor has no per-scope
+		// hooks; the scope-guard wrapper enforces at runtime instead).
+		if h.ScopePath != "" {
+			warnings = append(warnings, plugin.Warning{
+				Source:   tag,
+				Message:  fmt.Sprintf("scoped hook %q (scopepath %s) projected via scope-guard wrapper; Cursor has no per-scope Hook.ScopePath field.", h.Name, h.ScopePath),
+				Severity: "info",
+			})
+		}
+		// Hook/Env (unsupported — Cursor hooks have no env-injection
+		// contract; environment variables on the handler are dropped).
+		for _, hh := range h.Handlers {
+			if len(hh.Env) > 0 {
+				warnings = append(warnings, plugin.Warning{
+					Source:   tag,
+					Message:  fmt.Sprintf("hook %q: HookHandler.Env dropped (Cursor has no per-hook environment-variable injection).", h.Name),
+					Severity: "warn",
+				})
+				break
+			}
 		}
 	}
 
