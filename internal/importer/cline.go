@@ -152,15 +152,27 @@ func (c *ClineImporter) Import(root string) (*model.Project, []Warning, error) {
 					Severity: "warn",
 				})
 			}
+			globs := clineGlobsFromFrontmatter(fm)
+			desc, _ := stringFromFM(fm, "description")
+			// v2 additive (SPEC §4.7.2): Activation defaults to Cascade for
+			// path-set scopes; flips to Glob when explicit globs are present
+			// via the frontmatter `paths:`/`globs:` array.
+			activation := model.ScopeActivationCascade
+			if len(globs) > 0 {
+				activation = model.ScopeActivationGlob
+			}
 			scopesByPath[scopePath] = &model.Scope{
-				Path:     scopePath,
-				Globs:    clineGlobsFromFrontmatter(fm),
-				Priority: model.PriorityNormal,
+				Path:        scopePath,
+				Globs:       globs,
+				Description: desc,
+				Priority:    model.PriorityNormal,
 				Document: &model.Document{
 					SourcePath:  full,
 					Frontmatter: fm,
 					Body:        provenanceComment(clineTool, full) + body,
 				},
+				Activation: activation,
+				Extensions: clineExtensionsFromFrontmatter(fm),
 			}
 
 		case strings.HasPrefix(lower, "20-skill-"):
@@ -168,7 +180,7 @@ func (c *ClineImporter) Import(root string) (*model.Project, []Warning, error) {
 			desc, _ := stringFromFM(fm, "description")
 			trig, _ := stringFromFM(fm, "trigger")
 			globs := clineGlobsFromFrontmatter(fm)
-			skillsByName[skillName] = &model.Skill{
+			sk := &model.Skill{
 				Name:        skillName,
 				Description: desc,
 				Trigger:     trig,
@@ -178,7 +190,17 @@ func (c *ClineImporter) Import(root string) (*model.Project, []Warning, error) {
 					Frontmatter: fm,
 					Body:        provenanceComment(clineTool, full) + body,
 				},
+				Extensions: clineExtensionsFromFrontmatter(fm),
 			}
+			// v2 additive (SPEC §4.2.2): mirror v0.8 Globs into the typed
+			// Activation block. Modes flips to Glob when explicit globs are
+			// present; otherwise Modes is left empty so the v0.8
+			// fall-through (no activation declaration) is preserved.
+			sk.Activation.Globs = globs
+			if len(globs) > 0 {
+				sk.Activation.Modes = []model.SkillActivationMode{model.SkillActivationGlob}
+			}
+			skillsByName[skillName] = sk
 
 		case strings.HasPrefix(lower, "30-command-"):
 			cmdName := base[len("30-command-"):]
@@ -191,6 +213,7 @@ func (c *ClineImporter) Import(root string) (*model.Project, []Warning, error) {
 					Frontmatter: fm,
 					Body:        provenanceComment(clineTool, full) + body,
 				},
+				Extensions: clineExtensionsFromFrontmatter(fm),
 			}
 
 		default:
@@ -335,6 +358,7 @@ func readClineWorkflows(root string) ([]*model.Command, error) {
 				Frontmatter: fm,
 				Body:        provenanceComment(clineTool, full) + body,
 			},
+			Extensions: clineExtensionsFromFrontmatter(fm),
 		})
 	}
 	return out, nil
@@ -374,23 +398,51 @@ func readClineHooks(root string) ([]*model.Hook, error) {
 				Hooks   []struct {
 					Type    string `json:"type"`
 					Command string `json:"command"`
+					// Cline's native hook JSON carries `timeout` in seconds
+					// per hook entry (vs. Claude's milliseconds). We accept
+					// either an integer or a float here and convert to
+					// canonical milliseconds in Handlers[].TimeoutMs below.
+					Timeout float64 `json:"timeout"`
 				} `json:"hooks"`
 			} `json:"hooks"`
+			Extensions map[string]any `json:"extensions"`
 		}
 		if jerr := json.Unmarshal(data, &doc); jerr != nil {
 			return nil, fmt.Errorf("cline: parse %s: %w", full, jerr)
 		}
 		event := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		// v2 additive (SPEC §4.4.2): Cline's event names are PascalCase
+		// (matching Claude), so EventCanonical is the verbatim string.
+		eventCanonical := model.HookEvent(event)
 		for _, grp := range doc.Hooks {
 			for _, entry := range grp.Hooks {
 				if strings.Contains(entry.Command, "__scope-guard__") {
 					continue
 				}
-				out = append(out, &model.Hook{
+				h := &model.Hook{
 					Event:      event,
 					Matcher:    grp.Matcher,
 					ScriptPath: entry.Command,
-				})
+					// v2 additive (SPEC §4.4.2).
+					EventCanonical: eventCanonical,
+					Handlers: []model.HookHandler{{
+						Kind:      model.HookHandlerCommand,
+						Command:   entry.Command,
+						TimeoutMs: int(entry.Timeout * 1000),
+					}},
+				}
+				if grp.Matcher != "" {
+					h.MatcherV2 = model.HookMatcher{
+						Kind:     "exact",
+						Patterns: []string{grp.Matcher},
+					}
+				}
+				// extensions are a file-level pass-through; the cline-namespaced
+				// block is preserved verbatim per SPEC §5.1.
+				if ext, ok := doc.Extensions["cline"].(map[string]any); ok && len(ext) > 0 {
+					h.Extensions = map[string]any{"cline": ext}
+				}
+				out = append(out, h)
 			}
 		}
 	}
@@ -412,10 +464,17 @@ func readClineMCP(path string) ([]*model.MCPServer, error) {
 	}
 	var raw struct {
 		MCPServers map[string]struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			Env     map[string]string `json:"env"`
-			URL     string            `json:"url"`
+			Command     string            `json:"command"`
+			Args        []string          `json:"args"`
+			Env         map[string]string `json:"env"`
+			URL         string            `json:"url"`
+			Type        string            `json:"type"`
+			Transport   string            `json:"transport"`
+			Headers     map[string]string `json:"headers"`
+			Timeout     float64           `json:"timeout"`
+			AutoApprove []string          `json:"autoApprove"`
+			Disabled    bool              `json:"disabled"`
+			Extensions  map[string]any    `json:"extensions"`
 		} `json:"mcpServers"`
 	}
 	if jerr := json.Unmarshal(data, &raw); jerr != nil {
@@ -429,13 +488,38 @@ func readClineMCP(path string) ([]*model.MCPServer, error) {
 	out := make([]*model.MCPServer, 0, len(names))
 	for _, n := range names {
 		s := raw.MCPServers[n]
-		out = append(out, &model.MCPServer{
+		srv := &model.MCPServer{
 			Name:    n,
 			Command: s.Command,
 			Args:    s.Args,
 			Env:     s.Env,
 			URL:     s.URL,
-		})
+		}
+		// v2 additive (SPEC §4.5.2). Cline's `type:` field carries the
+		// transport hint; `streamableHttp` maps to canonical "http" and
+		// `stdio` passes through verbatim. The fallback `transport:` key
+		// (rarely seen in the wild) is accepted as a synonym.
+		transport := s.Type
+		if transport == "" {
+			transport = s.Transport
+		}
+		switch transport {
+		case "streamableHttp", "http":
+			srv.Transport = "http"
+		case "stdio":
+			srv.Transport = "stdio"
+		case "sse":
+			srv.Transport = "sse"
+		}
+		srv.Headers = s.Headers
+		// Cline's `timeout:` is in seconds; canonical TimeoutMs is in ms.
+		srv.TimeoutMs = int(s.Timeout * 1000)
+		srv.AutoApprove = s.AutoApprove
+		srv.Disabled = s.Disabled
+		if ext, ok := s.Extensions["cline"].(map[string]any); ok && len(ext) > 0 {
+			srv.Extensions = map[string]any{"cline": ext}
+		}
+		out = append(out, srv)
 	}
 	return out, nil
 }
@@ -491,6 +575,34 @@ func stringFromFM(fm map[string]any, key string) (string, bool) {
 		return v, true
 	}
 	return "", false
+}
+
+// clineExtensionsFromFrontmatter extracts the `extensions.cline` block
+// from a rule file's YAML frontmatter and returns it as the canonical
+// `Extensions["cline"]` map (SPEC §5.1, plugin-namespaced opaque
+// pass-through). Returns nil when no such block exists.
+//
+// The emit side (renderClineExtensions in plugins/cline.go) writes the
+// inner `extensions.cline.*` map's keys flat into the frontmatter — but
+// readers can also receive a fully-nested `extensions: { cline: {...} }`
+// shape from hand-authored files, so we accept both layouts. When only
+// flat cline-specific keys are present without an `extensions:` wrapper,
+// we cannot disambiguate them from canonical fields and leave them
+// untouched (round-trip fidelity is best-effort for hand-authored
+// frontmatter).
+func clineExtensionsFromFrontmatter(fm map[string]any) map[string]any {
+	if fm == nil {
+		return nil
+	}
+	ext, ok := fm["extensions"].(map[string]any)
+	if !ok || len(ext) == 0 {
+		return nil
+	}
+	cline, ok := ext["cline"].(map[string]any)
+	if !ok || len(cline) == 0 {
+		return nil
+	}
+	return map[string]any{"cline": cline}
 }
 
 // Compile-time interface check.

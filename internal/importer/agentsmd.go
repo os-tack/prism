@@ -92,7 +92,19 @@ func (i *AgentsMDImporter) Import(root string) (*model.Project, []Warning, error
 			}
 			return nil
 		}
-		if d.Name() != "AGENTS.md" {
+		// v2 additive: also recognize AGENTS.override.md so the importer
+		// can round-trip the IsOverride flag (SPEC §4.7.2). Filename match
+		// is exact; both forms are nested-only (root override is not
+		// surfaced as a Scope — it would belong in proj.Context, which we
+		// leave to the canonical AGENTS.md for now).
+		name := d.Name()
+		isOverride := false
+		switch name {
+		case "AGENTS.md":
+			// canonical, IsOverride stays false
+		case "AGENTS.override.md":
+			isOverride = true
+		default:
 			return nil
 		}
 		if filepath.Dir(path) == root {
@@ -110,12 +122,25 @@ func (i *AgentsMDImporter) Import(root string) (*model.Project, []Warning, error
 		}
 		if hasGeneratedHeader(data) {
 			warnings = append(warnings, Warning{
-				SourcePath: relSlash + "/AGENTS.md",
+				SourcePath: relSlash + "/" + name,
 				Heuristic:  "file starts with the agents.dev generated-header marker; skipping to prevent self-import loop",
 				Severity:   "info",
 			})
 			return nil
 		}
+		// v2 additive (SPEC §4.7.2):
+		//   - Name: slug derived from the scope path so downstream tools
+		//     have a stable identifier even when Path contains slashes.
+		//   - Activation: Cascade for nested AGENTS.md (the only mode this
+		//     plugin natively expresses — SPEC §12 marks Cascade=N for agm
+		//     and other modes Unsupported/Degraded).
+		//   - IsOverride: true when the source filename is
+		//     AGENTS.override.md (read-only round-trip; emission still
+		//     consolidates into a single AGENTS.md per the Phase 2a note
+		//     in plugins/agentsmd.go).
+		//   - Extensions["agentsmd"]: opaque per-plugin namespace; empty
+		//     for now (AGENTS.md has no frontmatter), reserved for v1.1
+		//     when Tags/Description frontmatter lands.
 		proj.Scopes = append(proj.Scopes, &model.Scope{
 			Path:     relSlash,
 			Globs:    scope.DefaultGlobs(relSlash),
@@ -124,6 +149,10 @@ func (i *AgentsMDImporter) Import(root string) (*model.Project, []Warning, error
 				SourcePath: path,
 				Body:       provenanceComment("agents-md", path) + string(data),
 			},
+			Name:       slugifyName(relSlash),
+			Activation: model.ScopeActivationCascade,
+			IsOverride: isOverride,
+			Extensions: map[string]any{"agentsmd": map[string]any{}},
 		})
 		return nil
 	})

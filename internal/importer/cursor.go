@@ -133,15 +133,15 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 
 		case len(globs) == 0:
 			// No globs, no alwaysApply → skill (model-decision trigger).
-			i.addSkill(proj, e.Name(), description, body, mdcPath, nil)
+			i.addSkill(proj, e.Name(), description, body, mdcPath, nil, fm)
 
 		default:
 			classification := classifyGlobs(globs)
 			switch classification {
 			case globKindExtension:
-				i.addSkill(proj, e.Name(), description, body, mdcPath, globs)
+				i.addSkill(proj, e.Name(), description, body, mdcPath, globs, fm)
 			case globKindPath:
-				i.addScope(scopeByPath, globs, description, bodyWithProv, mdcPath)
+				i.addScope(scopeByPath, globs, description, bodyWithProv, mdcPath, fm, alwaysApply)
 			case globKindMixed:
 				warnings = append(warnings, Warning{
 					SourcePath: relTo(root, mdcPath),
@@ -149,7 +149,7 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 						"imported as scope (path prefix wins) — split into separate .mdc files for clean import",
 					Severity: "warn",
 				})
-				i.addScope(scopeByPath, globs, description, bodyWithProv, mdcPath)
+				i.addScope(scopeByPath, globs, description, bodyWithProv, mdcPath, fm, alwaysApply)
 			}
 		}
 	}
@@ -205,7 +205,8 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 		desc, _ := fm["description"].(string)
 		trig, _ := fm["trigger"].(string)
 		globs := stringSliceAny(fm["globs"])
-		proj.Skills = append(proj.Skills, &model.Skill{
+		alwaysApply, _ := fm["alwaysApply"].(bool)
+		sk := &model.Skill{
 			Name:        name,
 			Description: desc,
 			Trigger:     trig,
@@ -215,7 +216,13 @@ func (i *CursorImporter) Import(root string) (*model.Project, []Warning, error) 
 				Frontmatter: fm,
 				Body:        provenanceComment("cursor", skillMD) + body,
 			},
-		})
+		}
+		// v2 additive: SkillActivation (Modes + Globs) + Extensions.
+		sk.Activation = cursorSkillActivation(alwaysApply, globs)
+		if exts := cursorExtensionsFromFM(fm, cursorSkillKnownKeys); exts != nil {
+			sk.Extensions = map[string]any{"cursor": exts}
+		}
+		proj.Skills = append(proj.Skills, sk)
 	}
 
 	// .cursor/agents/<n>.md (Cursor 2.4+ subagents).
@@ -279,7 +286,7 @@ func readCursorAgents(root string) ([]*model.Agent, error) {
 		}
 		name := strings.TrimSuffix(e.Name(), ".md")
 		desc, _ := fm["description"].(string)
-		out = append(out, &model.Agent{
+		ag := &model.Agent{
 			Name:        name,
 			Description: desc,
 			Document: &model.Document{
@@ -287,7 +294,25 @@ func readCursorAgents(root string) ([]*model.Agent, error) {
 				Frontmatter: fm,
 				Body:        provenanceComment("cursor", full) + body,
 			},
-		})
+		}
+		// v2 additive: SystemPrompt = body verbatim (no provenance prefix);
+		// pull Model / ReadOnly / Background from frontmatter when present.
+		ag.SystemPrompt = body
+		if model, ok := fm["model"].(string); ok {
+			ag.Model = model
+		}
+		if ro, ok := fm["readonly"].(bool); ok {
+			b := ro
+			ag.ReadOnly = &b
+		}
+		if bg, ok := fm["is_background"].(bool); ok {
+			b := bg
+			ag.Background = &b
+		}
+		if exts := cursorExtensionsFromFM(fm, cursorAgentKnownKeys); exts != nil {
+			ag.Extensions = map[string]any{"cursor": exts}
+		}
+		out = append(out, ag)
 	}
 	return out, nil
 }
@@ -350,34 +375,101 @@ func readCursorHooks(root string) ([]*model.Hook, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
-	var raw struct {
-		Hooks map[string][]struct {
-			Matcher string `json:"matcher"`
-			Command string `json:"command"`
-		} `json:"hooks"`
+	// Decode loosely so unknown keys (e.g. failClosed, timeout) can flow
+	// into Extensions["cursor"]. The first decode pulls typed fields out
+	// of each entry; the second pass keeps the raw map for ext capture.
+	var rawRich struct {
+		Hooks map[string][]map[string]any `json:"hooks"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(data, &rawRich); err != nil {
 		return nil, fmt.Errorf("cursor: parse %s: %w", path, err)
 	}
-	events := make([]string, 0, len(raw.Hooks))
-	for ev := range raw.Hooks {
+	events := make([]string, 0, len(rawRich.Hooks))
+	for ev := range rawRich.Hooks {
 		events = append(events, ev)
 	}
 	sort.Strings(events)
 	var out []*model.Hook
 	for _, ev := range events {
-		for _, entry := range raw.Hooks[ev] {
-			if strings.Contains(entry.Command, "__scope-guard__") {
+		for _, entry := range rawRich.Hooks[ev] {
+			cmd, _ := entry["command"].(string)
+			matcher, _ := entry["matcher"].(string)
+			if strings.Contains(cmd, "__scope-guard__") {
 				continue
 			}
-			out = append(out, &model.Hook{
+			h := &model.Hook{
 				Event:      ev,
-				Matcher:    entry.Matcher,
-				ScriptPath: entry.Command,
-			})
+				Matcher:    matcher,
+				ScriptPath: cmd,
+			}
+			// v2 additive populations.
+			h.EventCanonical = cursorEventToCanonical(ev)
+			if matcher != "" {
+				h.MatcherV2 = model.HookMatcher{Kind: "regex", Patterns: []string{matcher}}
+			}
+			handler := model.HookHandler{
+				Kind:    model.HookHandlerCommand,
+				Command: cmd,
+			}
+			if t, ok := entry["timeout"]; ok {
+				handler.TimeoutMs = cursorTimeoutSecondsToMs(t)
+			}
+			if fc, ok := entry["failClosed"].(bool); ok {
+				handler.FailClosed = fc
+			}
+			h.Handlers = []model.HookHandler{handler}
+			if exts := cursorExtensionsFromFM(entry, cursorHookEntryKnownKeys); exts != nil {
+				h.Extensions = map[string]any{"cursor": exts}
+			}
+			out = append(out, h)
 		}
 	}
 	return out, nil
+}
+
+// cursorEventToCanonical maps a Cursor 2.4+ wire event name back to the
+// canonical prism HookEvent. Unknown / Cursor-native-only events return
+// "" (caller leaves EventCanonical zero so v0.8 readers keep the
+// passthrough string in Event).
+func cursorEventToCanonical(ev string) model.HookEvent {
+	switch ev {
+	case "preToolUse":
+		return model.EventPreToolUse
+	case "postToolUse":
+		return model.EventPostToolUse
+	case "sessionStart":
+		return model.EventSessionStart
+	case "sessionEnd":
+		return model.EventSessionEnd
+	case "beforeSubmitPrompt":
+		return model.EventUserPromptSubmit
+	case "stop":
+		return model.EventStop
+	case "beforeShellExecution":
+		return model.EventPreShell
+	case "afterShellExecution":
+		return model.EventPostShell
+	case "beforeTabFileRead":
+		return model.EventPreFileRead
+	case "afterFileEdit", "afterTabFileEdit":
+		return model.EventPostFileEdit
+	}
+	return ""
+}
+
+// cursorTimeoutSecondsToMs converts a numeric `timeout:` (seconds, per
+// Cursor's hooks.json schema) into milliseconds. Accepts the typical
+// JSON number kinds yaml/json unmarshalers emit (float64, int).
+func cursorTimeoutSecondsToMs(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n * 1000)
+	case int:
+		return n * 1000
+	case int64:
+		return int(n) * 1000
+	}
+	return 0
 }
 
 // addSkill appends a Skill derived from one .mdc file.
@@ -385,7 +477,11 @@ func readCursorHooks(root string) ([]*model.Hook, error) {
 // Skill.Name is derived from the .mdc basename (without the extension);
 // the skill body is prefixed with the provenance comment via the
 // caller-passed body bytes wrapped into a synthetic Document.
-func (i *CursorImporter) addSkill(proj *model.Project, mdcBase, description, body, source string, globs []string) {
+//
+// v0.9.0 (Phase 2a): additionally populates SkillActivation (Modes +
+// Globs) and Extensions["cursor"] for any non-canonical .mdc
+// frontmatter keys.
+func (i *CursorImporter) addSkill(proj *model.Project, mdcBase, description, body, source string, globs []string, fm map[string]any) {
 	name := slugifyName(strings.TrimSuffix(mdcBase, ".mdc"))
 	if name == "" {
 		name = "rule"
@@ -408,12 +504,18 @@ func (i *CursorImporter) addSkill(proj *model.Project, mdcBase, description, bod
 		// (provenance-prefixed) markdown text.
 		Body: provenanceComment("cursor", source) + body,
 	}
-	proj.Skills = append(proj.Skills, &model.Skill{
+	alwaysApply, _ := fm["alwaysApply"].(bool)
+	sk := &model.Skill{
 		Name:        name,
 		Description: description,
 		Globs:       globs,
 		Document:    doc,
-	})
+		Activation:  cursorSkillActivation(alwaysApply, globs),
+	}
+	if exts := cursorExtensionsFromFM(fm, cursorSkillKnownKeys); exts != nil {
+		sk.Extensions = map[string]any{"cursor": exts}
+	}
+	proj.Skills = append(proj.Skills, sk)
 }
 
 // addScope merges the .mdc into a scope keyed by the longest common
@@ -421,7 +523,11 @@ func (i *CursorImporter) addSkill(proj *model.Project, mdcBase, description, bod
 // (e.g. globs all start with `**`), the scope is placed at the root —
 // but that case is already filtered upstream (the classifier returns
 // globKindExtension in that situation).
-func (i *CursorImporter) addScope(scopeByPath map[string]*model.Scope, globs []string, description, body, source string) {
+//
+// v0.9.0 (Phase 2a): populates Activation (Always | Cascade |
+// ModelDecision) and merges Extensions["cursor"] from non-canonical
+// frontmatter keys.
+func (i *CursorImporter) addScope(scopeByPath map[string]*model.Scope, globs []string, description, body, source string, fm map[string]any, alwaysApply bool) {
 	scopePath := inferScopePathFromGlobs(globs)
 	sc, ok := scopeByPath[scopePath]
 	if !ok {
@@ -430,6 +536,7 @@ func (i *CursorImporter) addScope(scopeByPath map[string]*model.Scope, globs []s
 			Globs:       append([]string(nil), globs...),
 			Description: description,
 			Priority:    model.PriorityNormal,
+			Activation:  cursorScopeActivation(alwaysApply, scopePath),
 			Document: &model.Document{
 				SourcePath: source,
 				Body:       body,
@@ -443,6 +550,9 @@ func (i *CursorImporter) addScope(scopeByPath map[string]*model.Scope, globs []s
 		if len(sc.Globs) == 0 {
 			sc.Globs = scope.DefaultGlobs(scopePath)
 		}
+		if exts := cursorExtensionsFromFM(fm, cursorScopeKnownKeys); exts != nil {
+			sc.Extensions = map[string]any{"cursor": exts}
+		}
 		scopeByPath[scopePath] = sc
 		return
 	}
@@ -452,6 +562,28 @@ func (i *CursorImporter) addScope(scopeByPath map[string]*model.Scope, globs []s
 	sc.Globs = unionStrings(sc.Globs, globs)
 	if sc.Description == "" {
 		sc.Description = description
+	}
+	// v2: upgrade Activation only if previously unset (preserve the
+	// stronger Always over a later Cascade).
+	if sc.Activation == "" {
+		sc.Activation = cursorScopeActivation(alwaysApply, sc.Path)
+	} else if alwaysApply && sc.Activation != model.ScopeActivationAlways {
+		sc.Activation = model.ScopeActivationAlways
+	}
+	// v2: merge Extensions["cursor"] from this additional .mdc into the
+	// existing scope's extension map. Newer keys win on collision.
+	if exts := cursorExtensionsFromFM(fm, cursorScopeKnownKeys); exts != nil {
+		if sc.Extensions == nil {
+			sc.Extensions = map[string]any{}
+		}
+		existing, _ := sc.Extensions["cursor"].(map[string]any)
+		if existing == nil {
+			existing = map[string]any{}
+		}
+		for k, v := range exts {
+			existing[k] = v
+		}
+		sc.Extensions["cursor"] = existing
 	}
 }
 
@@ -468,32 +600,58 @@ func readCursorMCP(path string) ([]*model.MCPServer, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
-	var raw struct {
-		MCPServers map[string]struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			Env     map[string]string `json:"env"`
-			URL     string            `json:"url"`
-		} `json:"mcpServers"`
+	// Loose decode to capture v2 fields (transport, headers) and any
+	// unknown keys for Extensions["cursor"] pass-through.
+	var rich struct {
+		MCPServers map[string]map[string]any `json:"mcpServers"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(data, &rich); err != nil {
 		return nil, fmt.Errorf("cursor: parse %s: %w", path, err)
 	}
-	names := make([]string, 0, len(raw.MCPServers))
-	for n := range raw.MCPServers {
+	names := make([]string, 0, len(rich.MCPServers))
+	for n := range rich.MCPServers {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	out := make([]*model.MCPServer, 0, len(names))
 	for _, n := range names {
-		s := raw.MCPServers[n]
-		out = append(out, &model.MCPServer{
-			Name:    n,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-			URL:     s.URL,
-		})
+		entry := rich.MCPServers[n]
+		srv := &model.MCPServer{Name: n}
+		if cmd, ok := entry["command"].(string); ok {
+			srv.Command = cmd
+		}
+		if args := stringSliceAny(entry["args"]); len(args) > 0 {
+			srv.Args = args
+		}
+		if envMap, ok := entry["env"].(map[string]any); ok && len(envMap) > 0 {
+			env := make(map[string]string, len(envMap))
+			for k, v := range envMap {
+				if s, ok := v.(string); ok {
+					env[k] = s
+				}
+			}
+			srv.Env = env
+		}
+		if u, ok := entry["url"].(string); ok {
+			srv.URL = u
+		}
+		// v2 additive: transport, headers.
+		if t, ok := entry["transport"].(string); ok {
+			srv.Transport = t
+		}
+		if h, ok := entry["headers"].(map[string]any); ok && len(h) > 0 {
+			hdrs := make(map[string]string, len(h))
+			for k, v := range h {
+				if s, ok := v.(string); ok {
+					hdrs[k] = s
+				}
+			}
+			srv.Headers = hdrs
+		}
+		if exts := cursorExtensionsFromFM(entry, cursorMCPKnownKeys); exts != nil {
+			srv.Extensions = map[string]any{"cursor": exts}
+		}
+		out = append(out, srv)
 	}
 	return out, nil
 }
@@ -645,6 +803,87 @@ func relTo(root, path string) string {
 		return filepath.ToSlash(rel)
 	}
 	return path
+}
+
+// --- v0.9.0 / Phase 2a helpers (additive v2 field population) ----------
+
+// Canonical-key sets per primitive: anything in the frontmatter that's
+// NOT in the set is captured into extensions.cursor.* verbatim so the
+// emit side (plugins/cursor.go) can round-trip it.
+var (
+	cursorSkillKnownKeys = map[string]struct{}{
+		"description": {}, "trigger": {}, "globs": {}, "alwaysApply": {},
+	}
+	cursorScopeKnownKeys = map[string]struct{}{
+		"description": {}, "globs": {}, "alwaysApply": {},
+	}
+	cursorAgentKnownKeys = map[string]struct{}{
+		"description": {}, "model": {}, "readonly": {}, "is_background": {},
+	}
+	cursorHookEntryKnownKeys = map[string]struct{}{
+		"matcher": {}, "command": {}, "timeout": {}, "failClosed": {},
+	}
+	cursorMCPKnownKeys = map[string]struct{}{
+		"command": {}, "args": {}, "env": {}, "url": {},
+		"transport": {}, "headers": {},
+	}
+)
+
+// cursorExtensionsFromFM returns the subset of fm whose keys are NOT in
+// the canonical-key set, or nil when no such keys exist. Used to fill
+// Extensions["cursor"] on each primitive for verbatim round-trip.
+func cursorExtensionsFromFM(fm map[string]any, known map[string]struct{}) map[string]any {
+	if len(fm) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for k, v := range fm {
+		if _, isKnown := known[k]; isKnown {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// cursorSkillActivation derives the SkillActivation block from the
+// alwaysApply flag and globs list:
+//   - alwaysApply: true            → Always
+//   - else if len(globs) > 0       → Glob
+//   - else                         → ModelDecision
+//
+// Globs are always copied through so v2 readers see them under
+// Activation.Globs even when the top-level Skill.Globs slice is also
+// populated.
+func cursorSkillActivation(alwaysApply bool, globs []string) model.SkillActivation {
+	a := model.SkillActivation{Globs: append([]string(nil), globs...)}
+	switch {
+	case alwaysApply:
+		a.Modes = []model.SkillActivationMode{model.SkillActivationAlways}
+	case len(globs) > 0:
+		a.Modes = []model.SkillActivationMode{model.SkillActivationGlob}
+	default:
+		a.Modes = []model.SkillActivationMode{model.SkillActivationModelDecision}
+	}
+	return a
+}
+
+// cursorScopeActivation picks the ScopeActivation for an imported scope:
+//   - alwaysApply: true            → Always
+//   - else if scopePath != ""      → Cascade (path-rooted scope)
+//   - else                         → ModelDecision
+func cursorScopeActivation(alwaysApply bool, scopePath string) model.ScopeActivation {
+	switch {
+	case alwaysApply:
+		return model.ScopeActivationAlways
+	case scopePath != "":
+		return model.ScopeActivationCascade
+	default:
+		return model.ScopeActivationModelDecision
+	}
 }
 
 // Compile-time check that *CursorImporter implements Importer.

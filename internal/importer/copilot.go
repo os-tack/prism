@@ -31,12 +31,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"agents.dev/agents/internal/model"
 	"agents.dev/agents/internal/scope"
 )
+
+// copilotInputArgRE matches `${input:NAME}` substitutions in Copilot prompt
+// and instruction bodies. The importer uses captured names to populate the
+// canonical Arguments slots on Skill and Command (SPEC §4.2.5 / §4.3.5 —
+// "Arguments" column for the Copilot target).
+var copilotInputArgRE = regexp.MustCompile(`\$\{input:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 const copilotTool = "copilot"
 
@@ -149,14 +156,16 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 			if skillName == "" {
 				skillName = "instructions"
 			}
-			proj.Skills = append(proj.Skills, &model.Skill{
+			sk := &model.Skill{
 				Name: skillName,
 				Document: &model.Document{
 					SourcePath:  full,
 					Frontmatter: fm,
 					Body:        bodyWithProv,
 				},
-			})
+			}
+			copilotApplyV2Skill(sk, fm, nil, body)
+			proj.Skills = append(proj.Skills, sk)
 		default:
 			switch classifyGlobs(applyTo) {
 			case globKindExtension:
@@ -164,7 +173,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 				if skillName == "" {
 					skillName = "instructions"
 				}
-				proj.Skills = append(proj.Skills, &model.Skill{
+				sk := &model.Skill{
 					Name:  skillName,
 					Globs: applyTo,
 					Document: &model.Document{
@@ -172,7 +181,9 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 						Frontmatter: fm,
 						Body:        bodyWithProv,
 					},
-				})
+				}
+				copilotApplyV2Skill(sk, fm, applyTo, body)
+				proj.Skills = append(proj.Skills, sk)
 			case globKindPath:
 				scopePath := inferScopePathFromGlobs(applyTo)
 				if scopePath == "" {
@@ -186,7 +197,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 					if skillName == "" {
 						skillName = "instructions"
 					}
-					proj.Skills = append(proj.Skills, &model.Skill{
+					sk := &model.Skill{
 						Name:  skillName,
 						Globs: applyTo,
 						Document: &model.Document{
@@ -194,7 +205,9 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 							Frontmatter: fm,
 							Body:        bodyWithProv,
 						},
-					})
+					}
+					copilotApplyV2Skill(sk, fm, applyTo, body)
+					proj.Skills = append(proj.Skills, sk)
 					continue
 				}
 				copilotAddScope(scopeByPath, scopePath, applyTo, "", bodyWithProv, full)
@@ -259,7 +272,7 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 			cmdName = "prompt"
 		}
 		cmdName = uniqueName("copilot", cmdName, commandExists)
-		proj.Commands = append(proj.Commands, &model.Command{
+		cmd := &model.Command{
 			Name:        cmdName,
 			Description: description,
 			Document: &model.Document{
@@ -267,7 +280,9 @@ func (c *CopilotImporter) Import(root string) (*model.Project, []Warning, error)
 				Frontmatter: fm,
 				Body:        provenanceComment(copilotTool, full) + body,
 			},
-		})
+		}
+		copilotApplyV2Command(cmd, fm, body)
+		proj.Commands = append(proj.Commands, cmd)
 	}
 
 	// Flush scopes in stable order.
@@ -347,12 +362,20 @@ func readCopilotPreviewHooks(root string) ([]*model.Hook, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
+	// Extended Copilot preview hook schema (SPEC §12 — Copilot natively
+	// supports `bash` + `powershell` platform-override script keys plus
+	// optional `timeout` (seconds), `cwd`, and `env`).
 	var doc struct {
 		Hooks map[string][]struct {
 			Matcher string `json:"matcher"`
 			Hooks   []struct {
-				Type    string `json:"type"`
-				Command string `json:"command"`
+				Type       string            `json:"type"`
+				Command    string            `json:"command"`
+				Bash       string            `json:"bash"`
+				Powershell string            `json:"powershell"`
+				Timeout    *float64          `json:"timeout"`
+				Cwd        string            `json:"cwd"`
+				Env        map[string]string `json:"env"`
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
@@ -362,7 +385,10 @@ func readCopilotPreviewHooks(root string) ([]*model.Hook, error) {
 	// Reverse the canonical→Copilot event-name mapping. Anything we don't
 	// recognize keeps its name verbatim; users targeting other tools can
 	// still re-emit (mapClineEvent / mapGeminiHookEvent already accept
-	// pass-through events).
+	// pass-through events). Copilot uses both PascalCase (Claude-shaped)
+	// and camelCase event names in the wild; we normalize either to the
+	// canonical v0.8 Event string AND fill EventCanonical (SPEC §4.4.2
+	// snake_case enum) at the same time.
 	reverse := map[string]string{
 		"preToolUse":          "PreToolUse",
 		"postToolUse":         "PostToolUse",
@@ -372,6 +398,16 @@ func readCopilotPreviewHooks(root string) ([]*model.Hook, error) {
 		"agentStop":           "Stop",
 		"subagentStop":        "SubagentStop",
 		"errorOccurred":       "Notification",
+		// PascalCase pass-through — Copilot accepts the Claude-style
+		// event names directly per the preview docs.
+		"PreToolUse":       "PreToolUse",
+		"PostToolUse":      "PostToolUse",
+		"SessionStart":     "SessionStart",
+		"SessionEnd":       "SessionEnd",
+		"UserPromptSubmit": "UserPromptSubmit",
+		"Stop":             "Stop",
+		"SubagentStop":     "SubagentStop",
+		"Notification":     "Notification",
 	}
 	events := make([]string, 0, len(doc.Hooks))
 	for k := range doc.Hooks {
@@ -387,14 +423,19 @@ func readCopilotPreviewHooks(root string) ([]*model.Hook, error) {
 		for _, grp := range doc.Hooks[event] {
 			for _, entry := range grp.Hooks {
 				cmd := entry.Command
+				if entry.Bash != "" && cmd == "" {
+					cmd = entry.Bash
+				}
 				if strings.Contains(cmd, "__scope-guard__") || strings.Contains(cmd, "__perms-guard__") {
 					continue
 				}
-				out = append(out, &model.Hook{
+				h := &model.Hook{
 					Event:      canonical,
 					Matcher:    grp.Matcher,
 					ScriptPath: cmd,
-				})
+				}
+				copilotApplyV2Hook(h, canonical, grp.Matcher, entry.Command, entry.Bash, entry.Powershell, entry.Timeout, entry.Cwd, entry.Env)
+				out = append(out, h)
 			}
 		}
 	}
@@ -438,7 +479,7 @@ func readCopilotAgents(root string) ([]*model.Agent, error) {
 			name = n
 		}
 		desc, _ := fm["description"].(string)
-		out = append(out, &model.Agent{
+		ag := &model.Agent{
 			Name:        name,
 			Description: desc,
 			Document: &model.Document{
@@ -446,7 +487,9 @@ func readCopilotAgents(root string) ([]*model.Agent, error) {
 				Frontmatter: fm,
 				Body:        provenanceComment(copilotTool, full) + body,
 			},
-		})
+		}
+		copilotApplyV2Agent(ag, fm, body)
+		out = append(out, ag)
 	}
 	return out, nil
 }
@@ -466,15 +509,26 @@ func readCopilotMCPFile(path string) ([]*model.MCPServer, error) {
 	}
 	var raw struct {
 		MCPServers map[string]struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			Env     map[string]string `json:"env"`
-			URL     string            `json:"url"`
+			Command   string            `json:"command"`
+			Args      []string          `json:"args"`
+			Env       map[string]string `json:"env"`
+			URL       string            `json:"url"`
+			Type      string            `json:"type"`
+			Transport string            `json:"transport"`
+			Headers   map[string]string `json:"headers"`
 		} `json:"mcpServers"`
 	}
 	if jerr := json.Unmarshal(data, &raw); jerr != nil {
 		return nil, fmt.Errorf("copilot: parse %s: %w", path, jerr)
 	}
+	// Second-pass parse to capture pass-through extension keys (any field the
+	// canonical model does not name) so we can park them under
+	// Extensions["copilot"] for round-trip.
+	var rawMap struct {
+		MCPServers map[string]map[string]any `json:"mcpServers"`
+	}
+	_ = json.Unmarshal(data, &rawMap)
+
 	names := make([]string, 0, len(raw.MCPServers))
 	for n := range raw.MCPServers {
 		names = append(names, n)
@@ -483,15 +537,67 @@ func readCopilotMCPFile(path string) ([]*model.MCPServer, error) {
 	out := make([]*model.MCPServer, 0, len(names))
 	for _, n := range names {
 		s := raw.MCPServers[n]
-		out = append(out, &model.MCPServer{
-			Name:    n,
-			Command: s.Command,
-			Args:    s.Args,
-			Env:     s.Env,
-			URL:     s.URL,
-		})
+		// v2-additive Transport: prefer explicit `transport`/`type` keys; fall
+		// back to URL-vs-Command heuristic (SPEC §4.5.2 — http when URL set,
+		// stdio when Command set).
+		transport := s.Transport
+		if transport == "" {
+			transport = s.Type
+		}
+		if transport == "" {
+			if s.URL != "" {
+				transport = "http"
+			} else if s.Command != "" {
+				transport = "stdio"
+			}
+		}
+		srv := &model.MCPServer{
+			Name:      n,
+			Command:   s.Command,
+			Args:      s.Args,
+			Env:       s.Env,
+			URL:       s.URL,
+			Transport: transport,
+			Headers:   s.Headers,
+		}
+		if entry, ok := rawMap.MCPServers[n]; ok {
+			ext := copilotMCPExtensionPassthrough(entry)
+			if len(ext) > 0 {
+				srv.Extensions = map[string]any{"copilot": ext}
+			}
+		}
+		out = append(out, srv)
 	}
 	return out, nil
+}
+
+// copilotMCPExtensionPassthrough returns a copy of the raw mcp.json server
+// entry stripped of keys the canonical MCPServer model already names. The
+// residue is parked under Extensions["copilot"] for round-trip fidelity.
+func copilotMCPExtensionPassthrough(raw map[string]any) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	known := map[string]struct{}{
+		"command":   {},
+		"args":      {},
+		"env":       {},
+		"url":       {},
+		"type":      {},
+		"transport": {},
+		"headers":   {},
+	}
+	out := map[string]any{}
+	for k, v := range raw {
+		if _, ok := known[k]; ok {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // mergeCopilotMCP combines two MCP server slices, with later entries
@@ -580,3 +686,284 @@ func copilotIsZero(v any) bool {
 
 // Compile-time interface check.
 var _ Importer = (*CopilotImporter)(nil)
+
+// -----------------------------------------------------------------------------
+// v0.9 / schema-v2 additive population helpers.
+//
+// These helpers populate the v2 fields described in SPEC §4 alongside the
+// existing v0.8 fields the rest of this file fills in. They are STRICTLY
+// additive — every v0.8 field still gets its existing value, so existing
+// plugin / engine code that reads only v0.8 names keeps working untouched.
+//
+// The mirror invariant matches the emit side in plugins/copilot.go: the
+// canonical (v0.8) frontmatter keys are kept, AND the full frontmatter is
+// parked under Extensions["copilot"] for verbatim round-trip on the next
+// emit pass. Reserved canonical keys (name, description) are filtered out
+// of the extension copy so an extension can never override the parser-
+// computed canonical fields (matches copilotExtensionKeys in plugins/).
+// -----------------------------------------------------------------------------
+
+// copilotExtensionMap returns a shallow copy of fm with reserved keys
+// stripped. Used to seed Extensions["copilot"] for every primitive the
+// Copilot importer produces from a frontmatter source.
+func copilotExtensionMap(fm map[string]any, reserved ...string) map[string]any {
+	if len(fm) == 0 {
+		return nil
+	}
+	skip := map[string]struct{}{}
+	for _, k := range reserved {
+		skip[k] = struct{}{}
+	}
+	out := make(map[string]any, len(fm))
+	for k, v := range fm {
+		if _, ok := skip[k]; ok {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// copilotExtractInputArgNames pulls unique `${input:NAME}` capture names
+// from body in first-seen order. The result drives Skill.Arguments and
+// Command.Arguments per SPEC §4.2.5 / §4.3.5.
+func copilotExtractInputArgNames(body string) []string {
+	matches := copilotInputArgRE.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		name := m[1]
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+// copilotApplyV2Skill fills the v2-additive Skill fields from Copilot
+// instructions-file frontmatter. applyTo is the canonical applyTo slice
+// (may be nil); body is the raw markdown body (used to recover argument
+// names from `${input:NAME}` placeholders).
+//
+// Activation.Modes follows SPEC §4.2.5 Copilot column:
+//   - `applyTo: "**"` → Always
+//   - any other applyTo  → Glob (with Activation.Globs populated)
+//   - missing applyTo    → ModelDecision (the model picks based on description)
+func copilotApplyV2Skill(sk *model.Skill, fm map[string]any, applyTo []string, body string) {
+	if sk == nil {
+		return
+	}
+	// Activation.Modes + Activation.Globs.
+	switch {
+	case len(applyTo) == 1 && applyTo[0] == "**":
+		sk.Activation.Modes = []model.SkillActivationMode{model.SkillActivationAlways}
+	case len(applyTo) > 0:
+		sk.Activation.Modes = []model.SkillActivationMode{model.SkillActivationGlob}
+		sk.Activation.Globs = append([]string(nil), applyTo...)
+	default:
+		sk.Activation.Modes = []model.SkillActivationMode{model.SkillActivationModelDecision}
+	}
+
+	// AllowedTools — Copilot's `tools:` list.
+	if tools := stringSliceAny(fm["tools"]); len(tools) > 0 {
+		sk.AllowedTools = tools
+	}
+
+	// Model — bare string `model:` slot.
+	if m, ok := fm["model"].(string); ok && m != "" {
+		sk.Model = m
+	}
+
+	// Subagent — Copilot prompts reference an agent via `agent:`. Skills
+	// rarely carry this but we mirror the same key for parity.
+	if a, ok := fm["agent"].(string); ok && a != "" {
+		sk.Subagent = a
+	}
+
+	// Description / WhenToUse pass-through if the source carried them.
+	if d, ok := fm["description"].(string); ok && d != "" && sk.Description == "" {
+		sk.Description = d
+	}
+
+	// Arguments — recover `${input:NAME}` names from the body. Names only,
+	// per SPEC §4.2.5 (Copilot Arguments column) and the Phase 2a plan.
+	for _, name := range copilotExtractInputArgNames(body) {
+		sk.Arguments = append(sk.Arguments, model.SkillArgument{Name: name})
+	}
+
+	// Extensions["copilot"] — full frontmatter passthrough, sans canonical
+	// keys that the v2 fields already cover. The emit side's
+	// renderCopilotInstructions strips Skill.Extensions["copilot"] onto
+	// frontmatter alongside applyTo for round-trip parity.
+	if ext := copilotExtensionMap(fm, "applyTo", "description"); len(ext) > 0 {
+		if sk.Extensions == nil {
+			sk.Extensions = map[string]any{}
+		}
+		sk.Extensions["copilot"] = ext
+	}
+}
+
+// copilotApplyV2Command fills the v2-additive Command fields from Copilot
+// prompt-file frontmatter. Mirrors the renderCopilotPrompt emit shape.
+func copilotApplyV2Command(cmd *model.Command, fm map[string]any, body string) {
+	if cmd == nil {
+		return
+	}
+	if m, ok := fm["model"].(string); ok && m != "" {
+		cmd.Model = m
+	}
+	if tools := stringSliceAny(fm["tools"]); len(tools) > 0 {
+		cmd.Tools = tools
+	}
+	if a, ok := fm["agent"].(string); ok && a != "" {
+		cmd.Agent = a
+	}
+	if hint, ok := fm["argument-hint"].(string); ok && hint != "" {
+		cmd.ArgumentHint = hint
+	}
+	// Arguments — names only, recovered from `${input:NAME}` substitutions
+	// in the body (SPEC §4.3.5 Copilot column).
+	cmd.Arguments = copilotExtractInputArgNames(body)
+
+	if ext := copilotExtensionMap(fm, "description"); len(ext) > 0 {
+		if cmd.Extensions == nil {
+			cmd.Extensions = map[string]any{}
+		}
+		cmd.Extensions["copilot"] = ext
+	}
+}
+
+// copilotApplyV2Agent fills the v2-additive Agent fields from Copilot
+// `.agent.md` frontmatter. The v0.8 emit side (renderCopilotAgent) writes
+// every non-reserved frontmatter key verbatim; we round-trip everything
+// the canonical model names and park the rest under Extensions["copilot"].
+//
+// Model handling: Copilot's `model:` can be a single string OR a list
+// (model fallbacks). We populate Model with the first entry and
+// ModelFallbacks with the remainder so v2 consumers can re-emit a list.
+// ModelInvocable is the inverse of `disable-model-invocation:`.
+func copilotApplyV2Agent(ag *model.Agent, fm map[string]any, body string) {
+	if ag == nil {
+		return
+	}
+	ag.SystemPrompt = body
+
+	switch m := fm["model"].(type) {
+	case string:
+		if m != "" {
+			ag.Model = m
+		}
+	case []any, []string:
+		models := stringSliceAny(m)
+		if len(models) > 0 {
+			ag.Model = models[0]
+			if len(models) > 1 {
+				ag.ModelFallbacks = append([]string(nil), models[1:]...)
+			}
+		}
+	}
+
+	if tools := stringSliceAny(fm["tools"]); len(tools) > 0 {
+		ag.Tools = tools
+	}
+	if subs := stringSliceAny(fm["agents"]); len(subs) > 0 {
+		ag.AllowedSubagents = subs
+	}
+	if b, ok := fm["user-invocable"].(bool); ok {
+		bb := b
+		ag.UserInvocable = &bb
+	}
+	if b, ok := fm["disable-model-invocation"].(bool); ok {
+		inv := !b
+		ag.ModelInvocable = &inv
+	}
+
+	if ext := copilotExtensionMap(fm, "name", "description"); len(ext) > 0 {
+		if ag.Extensions == nil {
+			ag.Extensions = map[string]any{}
+		}
+		ag.Extensions["copilot"] = ext
+	}
+}
+
+// copilotCanonicalHookEvent maps the v0.8 PascalCase Event string used by
+// every plugin to the SPEC §4.4.2 snake_case HookEvent enum. Unknown
+// events return the empty HookEvent ("") and the caller leaves
+// EventCanonical zero (which is exactly the right "pass-through" behavior
+// for native:* events).
+var copilotCanonicalHookEvent = map[string]model.HookEvent{
+	"PreToolUse":       model.EventPreToolUse,
+	"PostToolUse":      model.EventPostToolUse,
+	"SessionStart":     model.EventSessionStart,
+	"SessionEnd":       model.EventSessionEnd,
+	"UserPromptSubmit": model.EventUserPromptSubmit,
+	"Stop":             model.EventStop,
+	"SubagentStop":     model.EventSubagentStop,
+	"Notification":     model.EventNotification,
+}
+
+// copilotApplyV2Hook fills the v2-additive Hook fields. Mirrors the
+// `{type: "command", command, bash, powershell, timeout, cwd, env}` shape
+// of the Copilot preview hooks.json schema (SPEC §12 — Copilot supports
+// `Bash + Powershell` script keys natively, so when both are present we
+// keep both on a single Handler).
+func copilotApplyV2Hook(h *model.Hook, canonicalEvent, matcher, command, bash, powershell string, timeoutSec *float64, cwd string, env map[string]string) {
+	if h == nil {
+		return
+	}
+	// EventCanonical (snake_case enum) alongside the v0.8 Event string.
+	if mapped, ok := copilotCanonicalHookEvent[canonicalEvent]; ok {
+		h.EventCanonical = mapped
+	}
+
+	// MatcherV2 — Copilot preview hooks use a single-pattern matcher field;
+	// empty matcher ≡ "all", otherwise an exact-pattern match.
+	if matcher == "" {
+		h.MatcherV2 = model.HookMatcher{Kind: "all"}
+	} else {
+		h.MatcherV2 = model.HookMatcher{Kind: "exact", Patterns: []string{matcher}}
+	}
+
+	// Handlers — single command handler. `bash` + `powershell` are
+	// platform-override script keys per SPEC §12 (Copilot row). If both
+	// are present we keep the Command empty and rely on the platform-
+	// override slots; otherwise Command holds the universal script.
+	handler := model.HookHandler{
+		Kind: model.HookHandlerCommand,
+	}
+	switch {
+	case bash != "" && powershell != "":
+		handler.Bash = bash
+		handler.Powershell = powershell
+	case bash != "":
+		handler.Command = bash
+		handler.Bash = bash
+	case powershell != "":
+		handler.Command = powershell
+		handler.Powershell = powershell
+	default:
+		handler.Command = command
+	}
+	if timeoutSec != nil {
+		handler.TimeoutMs = int(*timeoutSec * 1000)
+	}
+	if cwd != "" {
+		handler.Cwd = cwd
+	}
+	if len(env) > 0 {
+		handler.Env = env
+	}
+	h.Handlers = []model.HookHandler{handler}
+
+	// The preview JSON schema has no extension-namespace today, so
+	// Extensions["copilot"] stays unset by default. Future preview-schema
+	// keys land in this slot via the same mechanism MCP uses above.
+}
